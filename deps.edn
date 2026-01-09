@@ -3,7 +3,11 @@
  :deps    {metosin/malli              {:mvn/version "0.20.0"}
            com.fulcrologic/guardrails {:mvn/version "1.2.16"}
            org.clojure/core.async     {:mvn/version "1.8.741"}
-           com.taoensso/timbre        {:mvn/version "6.8.0"}}
+           com.taoensso/timbre        {:mvn/version "6.8.0"}
+           ;; PostgreSQL persistence layer dependencies (optional - only needed if using pg backend)
+           com.github.igrishaev/pg2-core  {:mvn/version "0.1.22"}
+           com.github.igrishaev/pg2-honey {:mvn/version "0.1.22"}
+           com.taoensso/nippy             {:mvn/version "3.4.2"}}
 
  :aliases {:test             {:extra-paths ["src/test"]
                               :extra-deps  {lambdaisland/kaocha     {:mvn/version "1.91.1392"}
@@ -20,7 +24,8 @@
 
            :clj-tests        {:extra-paths ["src/test"]
                               :main-opts   ["-m" "kaocha.runner"]
-                              :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
+                              :extra-deps  {lambdaisland/kaocha     {:mvn/version "1.91.1392"}
+                                            fulcrologic/fulcro-spec {:mvn/version "3.2.1"}}}
 
            :dev              {:extra-paths ["src/dev" "src/examples"]
                               :extra-deps  {thheller/shadow-cljs                   {:mvn/version "3.3.4"}
