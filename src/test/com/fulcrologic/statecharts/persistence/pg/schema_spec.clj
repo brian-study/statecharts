@@ -31,10 +31,10 @@
         (assertions
           (clojure.string/includes? ddl "statechart_src") => true))
 
-      (behavior "has working_memory JSONB column"
+      (behavior "has working_memory BYTEA column"
         (assertions
           (clojure.string/includes? ddl "working_memory") => true
-          (clojure.string/includes? ddl "JSONB") => true))
+          (clojure.string/includes? ddl "BYTEA") => true))
 
       (behavior "has version column for optimistic locking"
         (assertions
@@ -100,10 +100,10 @@
         (assertions
           (clojure.string/includes? ddl "event_type") => true))
 
-      (behavior "has event_data JSONB column"
+      (behavior "has event_data BYTEA column"
         (assertions
           (clojure.string/includes? ddl "event_data") => true
-          (clojure.string/includes? ddl "JSONB") => true))
+          (clojure.string/includes? ddl "BYTEA") => true))
 
       (behavior "has deliver_at for delayed events"
         (assertions
@@ -157,10 +157,10 @@
           (clojure.string/includes? ddl "src") => true
           (clojure.string/includes? ddl "PRIMARY KEY") => true))
 
-      (behavior "has definition JSONB column"
+      (behavior "has definition BYTEA column"
         (assertions
           (clojure.string/includes? ddl "definition") => true
-          (clojure.string/includes? ddl "JSONB") => true))
+          (clojure.string/includes? ddl "BYTEA") => true))
 
       (behavior "has version column"
         (assertions

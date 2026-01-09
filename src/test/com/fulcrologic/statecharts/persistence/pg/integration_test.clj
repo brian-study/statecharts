@@ -69,7 +69,7 @@
 ;; Working Memory Store Tests
 ;; -----------------------------------------------------------------------------
 
-(deftest working-memory-store-basic-test
+(deftest ^:integration working-memory-store-basic-test
   (let [store (pg-wms/new-store *pool*)
         session-id :test-session
         wmem {::sc/session-id session-id
@@ -100,7 +100,7 @@
       (sp/delete-working-memory! store {} session-id)
       (is (nil? (sp/get-working-memory store {} session-id))))))
 
-(deftest working-memory-store-optimistic-lock-test
+(deftest ^:integration working-memory-store-optimistic-lock-test
   (let [store (pg-wms/new-store *pool*)
         session-id :lock-test
         wmem {::sc/session-id session-id
@@ -127,7 +127,7 @@
 ;; Registry Tests
 ;; -----------------------------------------------------------------------------
 
-(deftest registry-basic-test
+(deftest ^:integration registry-basic-test
   (let [registry (pg-reg/new-registry *pool*)
         chart (chart/statechart {:initial :s1}
                                 (state {:id :s1}
@@ -157,7 +157,7 @@
 ;; Event Queue Tests
 ;; -----------------------------------------------------------------------------
 
-(deftest event-queue-basic-test
+(deftest ^:integration event-queue-basic-test
   (let [queue (pg-eq/new-queue *pool* "test-worker")
         processed (atom [])]
 
@@ -179,7 +179,7 @@
       (sp/receive-events! queue {} (fn [_ e] (swap! processed conj e)))
       (is (empty? @processed)))))
 
-(deftest event-queue-delayed-test
+(deftest ^:integration event-queue-delayed-test
   (let [queue (pg-eq/new-queue *pool* "test-worker")
         processed (atom [])]
 
@@ -211,7 +211,7 @@
 ;; Full Environment Integration Tests
 ;; -----------------------------------------------------------------------------
 
-(deftest pg-env-integration-test
+(deftest ^:integration pg-env-integration-test
   (let [env (pg-sc/pg-env {:pool *pool*})
         chart (chart/statechart {:initial :s1}
                                 (state {:id :s1}

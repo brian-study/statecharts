@@ -369,10 +369,11 @@
 
 (specification "Row to Event Conversion"
   (component "row->event basic"
+    ;; event-data must be frozen bytes (simulating what comes from DB)
     (let [row {:event-name ":test-event"
                :event-type "external"
                :target-session-id ":session-1"
-               :event-data {:foo "bar"}}
+               :event-data (core/freeze {:foo "bar"})}
           event (#'eq/row->event row)]
       (behavior "produces valid event"
         (assertions
@@ -392,7 +393,7 @@
                :source-session-id ":source"
                :send-id "send-123"
                :invoke-id "invoke-456"
-               :event-data {}}
+               :event-data (core/freeze {})}
           event (#'eq/row->event row)]
       (behavior "includes source session ID"
         (assertions
@@ -411,7 +412,7 @@
     (let [row {:event-name ":com.example/user-created"
                :event-type "external"
                :target-session-id ":session"
-               :event-data {}}
+               :event-data (core/freeze {})}
           event (#'eq/row->event row)]
       (behavior "preserves namespaced event name"
         (assertions
