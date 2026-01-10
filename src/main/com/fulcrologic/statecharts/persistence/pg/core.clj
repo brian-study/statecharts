@@ -68,6 +68,8 @@
   "Execute a HoneySQL query and return all result rows.
    Takes either a connection or a pool.
 
+   Uses binary-decode for proper bytea handling (returns byte[] directly).
+
    conn-or-pool - connection or connection pool
    hsql - HoneySQL map"
   [conn-or-pool hsql]
@@ -76,9 +78,11 @@
     (if (pool/pool? conn-or-pool)
       (pg/with-connection [c conn-or-pool]
         (pg/execute c sql {:params (vec params)
-                           :kebab-keys? true}))
+                           :kebab-keys? true
+                           :binary-decode? true}))
       (pg/execute conn-or-pool sql {:params (vec params)
-                                    :kebab-keys? true}))))
+                                    :kebab-keys? true
+                                    :binary-decode? true}))))
 
 (defn execute-one!
   "Execute a HoneySQL query and return the first result row (or nil).
