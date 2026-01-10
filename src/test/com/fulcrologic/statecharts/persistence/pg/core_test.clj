@@ -120,6 +120,28 @@
     (let [result (core/freeze {:foo :bar})]
       (is (bytes? result)))))
 
+(deftest thaw-requires-binary-protocol-test
+  "Tests that thaw requires byte[] input and rejects strings.
+   pg2 must be configured with :binary-decode? true."
+
+  (testing "thaw handles byte array"
+    (let [data {:foo :bar :baz [1 2 3] :keywords #{:a :b :c}}
+          frozen (core/freeze data)
+          thawed (core/thaw frozen)]
+      (is (= data thawed))))
+
+  (testing "thaw handles nil"
+    (is (nil? (core/thaw nil))))
+
+  (testing "thaw throws on string input (misconfigured pool)"
+    (let [base64-encoder (java.util.Base64/getEncoder)
+          data {:foo :bar}
+          frozen (core/freeze data)
+          base64-str (.encodeToString base64-encoder frozen)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"pg2 pool must have :binary-decode\?"
+                            (core/thaw base64-str))))))
+
 ;; -----------------------------------------------------------------------------
 ;; Version Metadata
 ;; -----------------------------------------------------------------------------

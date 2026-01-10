@@ -46,6 +46,12 @@
 ;; We use nippy for binary serialization of Clojure data to PostgreSQL BYTEA.
 ;; This preserves all Clojure types (sets, keywords, symbols, etc.) without
 ;; any conversion logic. Much simpler than JSONB with type tagging.
+;;
+;; IMPORTANT: The pg2 connection pool MUST be configured with:
+;;   :binary-encode? true
+;;   :binary-decode? true
+;; Without binary protocol, bytea columns return as Base64 strings which
+;; is inefficient and indicates a misconfigured connection.
 
 (defn freeze
   "Serialize Clojure data to bytes for PostgreSQL BYTEA storage.
@@ -55,10 +61,17 @@
 
 (defn thaw
   "Deserialize bytes from PostgreSQL BYTEA back to Clojure data.
-   Returns nil for nil input."
-  [bytes]
-  (when bytes
-    (nippy/thaw bytes)))
+   Returns nil for nil input.
+
+   Requires pg2 pool configured with :binary-decode? true.
+   Throws if bytea is returned as String (indicates misconfigured pool)."
+  [input]
+  (when input
+    (when-not (bytes? input)
+      (throw (ex-info "bytea column returned as String - pg2 pool must have :binary-decode? true"
+                      {:type (type input)
+                       :hint "Configure pool with (pg/pool (assoc config :binary-decode? true))"})))
+    (nippy/thaw input)))
 
 ;; -----------------------------------------------------------------------------
 ;; Query Execution
@@ -68,8 +81,6 @@
   "Execute a HoneySQL query and return all result rows.
    Takes either a connection or a pool.
 
-   Uses binary-decode for proper bytea handling (returns byte[] directly).
-
    conn-or-pool - connection or connection pool
    hsql - HoneySQL map"
   [conn-or-pool hsql]
@@ -78,11 +89,9 @@
     (if (pool/pool? conn-or-pool)
       (pg/with-connection [c conn-or-pool]
         (pg/execute c sql {:params (vec params)
-                           :kebab-keys? true
-                           :binary-decode? true}))
+                           :kebab-keys? true}))
       (pg/execute conn-or-pool sql {:params (vec params)
-                                    :kebab-keys? true
-                                    :binary-decode? true}))))
+                                    :kebab-keys? true}))))
 
 (defn execute-one!
   "Execute a HoneySQL query and return the first result row (or nil).
