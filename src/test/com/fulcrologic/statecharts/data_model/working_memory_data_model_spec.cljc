@@ -112,7 +112,7 @@
 
          (assertions
            "Places values into the correct context in working memory"
-           (::wmdm/data-model @vwmem) => {:a 1}))))
+           (::sc/data-model @vwmem) => {:a 1}))))
   (let [machine  (chart/statechart {}
                    (state {:id :A}
                      (state {:id :A/a})))
@@ -131,10 +131,10 @@
 
       (assertions
         "Places values into the root of the data model"
-        (::wmdm/data-model @vwmem) => {:x 1
-                                       :y 9})
+        (::sc/data-model @vwmem) => {:x 1
+                                     :y 9})
 
-      (vswap! vwmem dissoc ::wmdm/data-model)
+      (vswap! vwmem dissoc ::sc/data-model)
 
       (sp/update! DM (context :ROOT) {:ops [(ops/assign :x 1)]})
       (sp/update! DM (context :ROOT) {:ops [(ops/assign :y 2)]})
@@ -145,10 +145,10 @@
 
       (assertions
         "Assignments are merged into the root, but paths work as assoc-in"
-        (dissoc (::wmdm/data-model @vwmem) :z) => {:x 1 :y 42 :a {:b {:c 99}
-                                                                  :c 100}}
+        (dissoc (::sc/data-model @vwmem) :z) => {:x 1 :y 42 :a {:b {:c 99}
+                                                                :c 100}}
         "Special root paths are properly processed"
-        (select-keys (::wmdm/data-model @vwmem) [:z]) => {:z 3}))
+        (select-keys (::sc/data-model @vwmem) [:z]) => {:z 3}))
 
     (component "get-at"
       (assertions

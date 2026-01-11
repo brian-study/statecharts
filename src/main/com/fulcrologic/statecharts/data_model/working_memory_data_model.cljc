@@ -7,13 +7,13 @@
    There are two implementations: One where data is scoped to the state, and another where it is global.
    "
   (:require
-    #?(:clj
-       [clojure.edn :as edn])
-    [com.fulcrologic.statecharts :as sc]
-    [com.fulcrologic.statecharts.environment :as env]
-    [com.fulcrologic.statecharts.protocols :as sp]
-    [com.fulcrologic.statecharts.chart :as chart]
-    [taoensso.timbre :as log]))
+   #?(:clj
+      [clojure.edn :as edn])
+   [com.fulcrologic.statecharts :as sc]
+   [com.fulcrologic.statecharts.chart :as chart]
+   [com.fulcrologic.statecharts.environment :as env]
+   [com.fulcrologic.statecharts.protocols :as sp]
+   [taoensso.timbre :as log]))
 
 (defmulti run-op (fn [all-data context-id {:keys [op]}] op))
 (defmethod run-op :default [all-data context-id op]
@@ -21,46 +21,46 @@
   all-data)
 (defmethod run-op :assign [all-data context-id {:keys [data]}]
   (reduce-kv
-    (fn [acc path value]
-      (cond
-        (and context-id (keyword? path))
-        (do
-          (log/trace "Assigning" value "to" [context-id path])
-          (assoc-in acc [context-id path] value))
+   (fn [acc path value]
+     (cond
+       (and context-id (keyword? path))
+       (do
+         (log/trace "Assigning" value "to" [context-id path])
+         (assoc-in acc [context-id path] value))
 
-        (keyword? path)
-        (do
-          (log/error "Internal error: Unknown context for assignment to" path)
-          acc)
+       (keyword? path)
+       (do
+         (log/error "Internal error: Unknown context for assignment to" path)
+         acc)
 
-        (and (vector? path) (= (count path) 2))
-        (do
-          (log/trace "Assigning" value "to" path)
-          (assoc-in acc path value))
+       (and (vector? path) (= (count path) 2))
+       (do
+         (log/trace "Assigning" value "to" path)
+         (assoc-in acc path value))
 
-        :else (do
-                (log/warn "Cannot assign value. Illegal path expression" path)
-                acc)))
-    all-data
-    data))
+       :else (do
+               (log/warn "Cannot assign value. Illegal path expression" path)
+               acc)))
+   all-data
+   data))
 
 (defmethod run-op :delete [all-data context-id {:keys [paths]}]
   (reduce
-    (fn [M path]
-      (cond
-        (and context-id (keyword? path)) (update M context-id dissoc path)
-        (and (vector? path) (= (count path) 2)) (update M (first path) dissoc (second path))
-        :else (do
-                (log/warn "Cannot delete value. Illegal path expression" path)
-                M)))
-    all-data
-    paths))
+   (fn [M path]
+     (cond
+       (and context-id (keyword? path)) (update M context-id dissoc path)
+       (and (vector? path) (= (count path) 2)) (update M (first path) dissoc (second path))
+       :else (do
+               (log/warn "Cannot delete value. Illegal path expression" path)
+               M)))
+   all-data
+   paths))
 
 (deftype WorkingMemoryDataModel []
   sp/DataModel
   (load-data [provider {::sc/keys [vwmem] :as env} src]
     #?(:clj (try
-              (let [data     (edn/read-string (slurp src))
+              (let [data (edn/read-string (slurp src))
                     state-id (or (env/context-element-id env) :ROOT)]
                 (if (map? data)
                   (do
@@ -73,7 +73,7 @@
   (current-data [_ {::sc/keys [statechart vwmem] :as env}]
     (let [all-data (some-> vwmem deref ::data-model)]
       (loop [state-id (env/context-element-id env)
-             result   {}]
+             result {}]
         (let [result (merge (get all-data state-id) result)
               parent (chart/get-parent statechart state-id)]
           (if (or (nil? parent) (= :ROOT parent))
@@ -117,15 +117,15 @@
   all-data)
 (defmethod run-flat-op :assign [all-data {:keys [data]}]
   (reduce-kv
-    (fn [acc path value]
-      (cond
-        (= :ROOT path) value
-        (keyword? path) (assoc acc path value)
-        (and (vector? path) (= :ROOT (first path))) (assoc-in acc (rest path) value)
-        (vector? path) (assoc-in acc path value)
-        :else acc))
-    all-data
-    data))
+   (fn [acc path value]
+     (cond
+       (= :ROOT path) value
+       (keyword? path) (assoc acc path value)
+       (and (vector? path) (= :ROOT (first path))) (assoc-in acc (rest path) value)
+       (vector? path) (assoc-in acc path value)
+       :else acc))
+   all-data
+   data))
 
 (defn- dissoc-in [m ks]
   (cond
@@ -136,16 +136,15 @@
 
 (defmethod run-flat-op :delete [all-data {:keys [paths]}]
   (reduce
-    (fn [M path]
-      (cond
-        (= :ROOT path) {}
-        (keyword? path) (dissoc M path)
-        (and (vector? path) (= :ROOT (first path))) (dissoc-in M (rest path))
-        (vector? path) (dissoc-in M path)
-        :else M))
-    all-data
-    paths))
-
+   (fn [M path]
+     (cond
+       (= :ROOT path) {}
+       (keyword? path) (dissoc M path)
+       (and (vector? path) (= :ROOT (first path))) (dissoc-in M (rest path))
+       (vector? path) (dissoc-in M path)
+       :else M))
+   all-data
+   paths))
 
 (deftype FlatWorkingMemoryDataModel []
   sp/DataModel
@@ -155,12 +154,12 @@
                 (if (map? data)
                   (do
                     (log/trace "Loaded" data "into root data of model")
-                    (vswap! vwmem update ::data-model merge data))
+                    (vswap! vwmem update ::sc/data-model merge data))
                   (log/error "Unable to use loaded data from" src "because it is not a map.")))
               (catch #?(:clj Throwable :cljs :default) e
                 (log/error e "Unable to load data from" src)))
        :cljs (log/error "src not supported.")))
-  (current-data [_ {::sc/keys [vwmem]}] (some-> vwmem deref ::data-model))
+  (current-data [_ {::sc/keys [vwmem]}] (some-> vwmem deref ::sc/data-model))
   (get-at [provider env path]
     (let [data (sp/current-data provider env)]
       (cond
@@ -172,9 +171,9 @@
   (update! [provider {::sc/keys [statechart vwmem] :as env} {:keys [ops] :as args}]
     (when-not (map? args)
       (log/error "You forgot to wrap your operations in a map!" args))
-    (let [all-data (some-> vwmem deref ::data-model)
+    (let [all-data (some-> vwmem deref ::sc/data-model)
           new-data (reduce (fn [acc op] (run-flat-op acc op)) all-data ops)]
-      (vswap! vwmem assoc ::data-model new-data))))
+      (vswap! vwmem assoc ::sc/data-model new-data))))
 
 (defn new-flat-model
   "Creates a data model where data is stored in the working memory of the state machine.
