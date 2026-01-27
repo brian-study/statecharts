@@ -101,3 +101,17 @@
 
     :else
     (keyword (str "done.invoke." invokeid))))
+
+(defn invoke-error-event
+  "Generate the error event name for an invocation.
+   Per SCXML, error events follow the pattern error.invoke.<invokeid>."
+  [invokeid]
+  (cond
+    (qualified-keyword? invokeid)
+    (keyword (str "error.invoke." (namespace invokeid)) (name invokeid))
+
+    (keyword? invokeid)
+    (keyword (str "error.invoke." (name invokeid)))
+
+    :else
+    (keyword (str "error.invoke." invokeid))))

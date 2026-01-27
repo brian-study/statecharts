@@ -10,36 +10,45 @@
    If the invocation is cancelled (the parent state is left), then future-cancel will be called on the future.
    "
   (:require
-    [com.fulcrologic.statecharts :as sc]
-    [com.fulcrologic.statecharts.environment :as env]
-    [com.fulcrologic.statecharts.events :as evts]
-    [com.fulcrologic.statecharts.protocols :as sp]
-    [taoensso.timbre :as log]))
+   [com.fulcrologic.statecharts :as sc]
+   [com.fulcrologic.statecharts.environment :as env]
+   [com.fulcrologic.statecharts.events :as evts]
+   [com.fulcrologic.statecharts.protocols :as sp]
+   [taoensso.timbre :as log]))
 
 (defrecord FutureInvocationProcessor [active-futures]
   sp/InvocationProcessor
   (supports-invocation-type? [_this typ] (= :future typ))
   (start-invocation! [_this {::sc/keys [event-queue]
-                             :as       env} {:keys [invokeid src params]}]
+                             :as env} {:keys [invokeid src params]}]
     (log/debug "Start future " invokeid src params)
     (let [source-session-id (env/session-id env)
-          child-session-id  (str source-session-id "." invokeid)
-          done-event-name   (evts/invoke-done-event invokeid)]
+          child-session-id (str source-session-id "." invokeid)
+          done-event-name (evts/invoke-done-event invokeid)
+          error-event-name (evts/invoke-error-event invokeid)]
       (if-not (fn? src)
-        (sp/send! event-queue env {:target            source-session-id
-                                   :sendid            child-session-id
+        (sp/send! event-queue env {:target source-session-id
+                                   :sendid child-session-id
                                    :source-session-id child-session-id
-                                   :event             :error.platform
-                                   :data              {:message "Could not invoke future. No function supplied."
-                                                       :target  src}})
+                                   :event :error.platform
+                                   :data {:message "Could not invoke future. No function supplied."
+                                          :target src}})
         (let [f (future
                   (try
                     (let [result (src params)]
-                      (sp/send! event-queue env {:target            source-session-id
-                                                 :sendid            child-session-id
+                      (sp/send! event-queue env {:target source-session-id
+                                                 :sendid child-session-id
                                                  :source-session-id child-session-id
-                                                 :event             done-event-name
-                                                 :data              (if (map? result) result {})}))
+                                                 :event done-event-name
+                                                 :data (if (map? result) result {})}))
+                    (catch Throwable t
+                      (log/error t "Future invocation failed" {:invokeid invokeid})
+                      (sp/send! event-queue env {:target source-session-id
+                                                 :sendid child-session-id
+                                                 :source-session-id child-session-id
+                                                 :event error-event-name
+                                                 :data {:message (.getMessage t)
+                                                        :type (str (type t))}}))
                     (finally
                       (swap! active-futures dissoc child-session-id))))]
           (swap! active-futures assoc child-session-id f)))
@@ -47,8 +56,8 @@
   (stop-invocation! [_ env {:keys [invokeid]}]
     (log/debug "Stop future" invokeid)
     (let [source-session-id (env/session-id env)
-          child-session-id  (str source-session-id "." invokeid)
-          f                 (get @active-futures child-session-id)]
+          child-session-id (str source-session-id "." invokeid)
+          f (get @active-futures child-session-id)]
       (when f
         (log/debug "Sending cancel to future")
         (future-cancel f))
