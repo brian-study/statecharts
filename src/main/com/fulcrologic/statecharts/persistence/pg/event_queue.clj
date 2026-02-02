@@ -45,7 +45,7 @@
     {:target-session-id (core/session-id->str (or target source-session-id))
      :source-session-id (when source-session-id (core/session-id->str source-session-id))
      :send-id send-id
-     :invoke-id invoke-id
+     :invoke-id (when invoke-id (name invoke-id))
      :event-name (pr-str event)
      :event-type (name (or type :external))
      :event-data (core/freeze (or data {}))
