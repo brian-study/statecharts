@@ -24,7 +24,9 @@
                             :as       env} {:keys [invokeid src params]}]
     (log/debug "Start invocation" invokeid src params)
     (let [source-session-id (env/session-id env)
-          child-session-id  invokeid
+          ;; Scope child session-id to parent to avoid collisions across parent sessions.
+          ;; Using (str invokeid) preserves namespaced keywords like :chat/session.
+          child-session-id  (str source-session-id "." (str invokeid))
           statechart        (sp/get-statechart statechart-registry src)]
       (if-not statechart
         (do
@@ -43,15 +45,16 @@
       true))
   (stop-invocation! [this {::sc/keys [event-queue processor working-memory-store] :as env} {:keys [invokeid] :as data}]
     (log/debug "Stop invocation" invokeid)
-    (let [child-session-id invokeid
-          wmem             (sp/get-working-memory working-memory-store env child-session-id)]
+    (let [source-session-id (env/session-id env)
+          child-session-id  (str source-session-id "." (str invokeid))
+          wmem              (sp/get-working-memory working-memory-store env child-session-id)]
       (sp/exit! processor env wmem true)
       (sp/delete-working-memory! working-memory-store env child-session-id)
       true))
   (forward-event! [this {::sc/keys [event-queue] :as env} {:keys [type invokeid event]}]
     (log/debug "Forward event " invokeid event)
     (let [source-session-id (env/session-id env)
-          child-session-id  invokeid]
+          child-session-id  (str source-session-id "." (str invokeid))]
       (when event-queue
         (log/debug "sending event on event queue to" child-session-id)
         (sp/send! event-queue env {:target            child-session-id
