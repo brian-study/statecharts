@@ -393,6 +393,41 @@
         (is (.isBefore (:next-run-at row-1) (:next-run-at row-2))
             "higher attempt number has later next_run_at")))))
 
+(deftest ^:integration complete-owner-guard-noop-on-cancelled-test
+  (testing "complete! with owner guard does not clobber cancelled jobs"
+    (let [params (make-job-params)
+          job-id (sut/create-job! *pool* params)]
+      ;; Simulate worker ownership then external cancellation.
+      (set-lease! *pool* job-id "worker-1"
+                  (.plus (OffsetDateTime/now) (Duration/ofMinutes 5)))
+      (set-job-status! *pool* job-id "cancelled")
+      (is (false? (sut/complete! *pool* job-id "worker-1"
+                                 {:entity-id 42}
+                                 "done.invoke.http"
+                                 {:entity-id 42})))
+      (let [row (get-job-row *pool* job-id)]
+        (is (= "cancelled" (:status row)) "status remains cancelled")
+        (is (nil? (:terminal-event-name row))
+            "terminal event is not written on cancelled job")))))
+
+(deftest ^:integration fail-owner-guard-ignored-on-cancelled-test
+  (testing "fail! with owner guard returns :ignored when job was cancelled"
+    (let [params (make-job-params {:max-attempts 3})
+          job-id (sut/create-job! *pool* params)]
+      ;; Simulate worker ownership then external cancellation.
+      (set-lease! *pool* job-id "worker-1"
+                  (.plus (OffsetDateTime/now) (Duration/ofMinutes 5)))
+      (set-job-status! *pool* job-id "cancelled")
+      (is (= :ignored
+             (sut/fail! *pool* job-id "worker-1" 3 3
+                        {:message "boom"}
+                        "error.invoke.http"
+                        {:message "boom"})))
+      (let [row (get-job-row *pool* job-id)]
+        (is (= "cancelled" (:status row)) "status remains cancelled")
+        (is (nil? (:terminal-event-name row))
+            "terminal event is not written on cancelled job")))))
+
 ;; -----------------------------------------------------------------------------
 ;; 5. Cancellation (I7)
 ;; -----------------------------------------------------------------------------

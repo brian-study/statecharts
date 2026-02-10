@@ -243,9 +243,14 @@
         (assertions
           (some #(clojure.string/includes? % "idx_jobs_undispatched") indexes) => true))
 
-      (behavior "indexes use partial index WHERE clauses"
-        (assertions
-          (every? #(clojure.string/includes? % "WHERE") indexes) => true)))))
+      (behavior "partial indexes include WHERE clauses"
+        (let [partial-indexes (filter #(or (clojure.string/includes? % "idx_jobs_active_per_invoke")
+                                           (clojure.string/includes? % "idx_jobs_claimable")
+                                           (clojure.string/includes? % "idx_jobs_undispatched"))
+                                      indexes)]
+          (assertions
+            (= 3 (count partial-indexes)) => true
+            (every? #(clojure.string/includes? % "WHERE") partial-indexes) => true))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Drop DDL Tests

@@ -29,6 +29,19 @@
   [attempt]
   (min 60 (long (Math/pow 2 attempt))))
 
+(defn- guarded-where-clause
+  "Build a status/lease-guarded WHERE clause for terminal updates.
+   If owner-id is present, only the current lease owner may update."
+  [param-count owner-id]
+  (if owner-id
+    {:sql (str " WHERE id = $" (inc param-count)
+               " AND status = 'running'"
+               " AND lease_owner = $" (+ 2 param-count))
+     :extra-params [owner-id]}
+    {:sql (str " WHERE id = $" (inc param-count)
+               " AND status IN ('pending', 'running')")
+     :extra-params []}))
+
 ;; -----------------------------------------------------------------------------
 ;; Job CRUD
 ;; -----------------------------------------------------------------------------
@@ -135,53 +148,95 @@
 
 (defn complete!
   "Mark a job as succeeded and store the result.
-   Also stores the terminal event name and data for reconciliation."
-  [pool job-id result terminal-event-name terminal-event-data]
-  (with-conn pool
-    (fn [conn]
-      (core/execute! conn
-        {:update :statechart-jobs
-         :set {:status "succeeded"
-               :result (core/freeze result)
-               :terminal-event-name terminal-event-name
-               :terminal-event-data (core/freeze terminal-event-data)
-               :updated-at [:now]}
-         :where [:= :id job-id]}))))
+   Also stores the terminal event name and data for reconciliation.
+   Returns true when the row was updated, false otherwise."
+  ([pool job-id result terminal-event-name terminal-event-data]
+   (complete! pool job-id nil result terminal-event-name terminal-event-data))
+  ([pool job-id owner-id result terminal-event-name terminal-event-data]
+   (with-conn pool
+     (fn [conn]
+       (let [{:keys [sql extra-params]} (guarded-where-clause 3 owner-id)
+             rows (pg/execute conn
+                    (str "UPDATE statechart_jobs"
+                         " SET status = 'succeeded',"
+                         "     result = $1,"
+                         "     terminal_event_name = $2,"
+                         "     terminal_event_data = $3,"
+                         "     lease_owner = NULL,"
+                         "     lease_expires_at = NULL,"
+                         "     updated_at = now()"
+                         sql
+                         " RETURNING id")
+                    {:params (into [(core/freeze result)
+                                    terminal-event-name
+                                    (core/freeze terminal-event-data)
+                                    job-id]
+                                   extra-params)
+                     :kebab-keys? true})]
+         (pos? (count rows)))))))
 
 (defn fail!
   "Handle job failure. If attempts remain, re-enqueue with backoff.
-   If exhausted, mark failed and store the terminal event for dispatch."
-  [pool job-id attempt max-attempts error terminal-event-name terminal-event-data]
-  (with-conn pool
-    (fn [conn]
-      (if (< attempt max-attempts)
-        ;; Retryable — re-enqueue with backoff
-        (let [delay-secs (backoff-seconds attempt)
-              next-run (.plus (OffsetDateTime/now) (Duration/ofSeconds delay-secs))]
-          (log/info "Job failed, scheduling retry"
-                    {:job-id job-id :attempt attempt :max-attempts max-attempts
-                     :next-run-in-seconds delay-secs})
-          (core/execute! conn
-            {:update :statechart-jobs
-             :set {:status "pending"
-                   :next-run-at next-run
-                   :lease-owner nil
-                   :lease-expires-at nil
-                   :error (core/freeze error)
-                   :updated-at [:now]}
-             :where [:= :id job-id]}))
-        ;; Exhausted — terminal failure
-        (do
-          (log/warn "Job failed permanently"
-                    {:job-id job-id :attempt attempt :max-attempts max-attempts})
-          (core/execute! conn
-            {:update :statechart-jobs
-             :set {:status "failed"
-                   :error (core/freeze error)
-                   :terminal-event-name terminal-event-name
-                   :terminal-event-data (core/freeze terminal-event-data)
-                   :updated-at [:now]}
-             :where [:= :id job-id]}))))))
+   If exhausted, mark failed and store the terminal event for dispatch.
+   Returns one of:
+   - :retry-scheduled
+   - :failed
+   - :ignored (job no longer active/owned)."
+  ([pool job-id attempt max-attempts error terminal-event-name terminal-event-data]
+   (fail! pool job-id nil attempt max-attempts error terminal-event-name terminal-event-data))
+  ([pool job-id owner-id attempt max-attempts error terminal-event-name terminal-event-data]
+   (with-conn pool
+     (fn [conn]
+       (if (< attempt max-attempts)
+         ;; Retryable — re-enqueue with backoff
+         (let [delay-secs (backoff-seconds attempt)
+               next-run (.plus (OffsetDateTime/now) (Duration/ofSeconds delay-secs))
+               {:keys [sql extra-params]} (guarded-where-clause 2 owner-id)
+               rows (pg/execute conn
+                      (str "UPDATE statechart_jobs"
+                           " SET status = 'pending',"
+                           "     next_run_at = $1,"
+                           "     lease_owner = NULL,"
+                           "     lease_expires_at = NULL,"
+                           "     error = $2,"
+                           "     updated_at = now()"
+                           sql
+                           " RETURNING id")
+                      {:params (into [next-run (core/freeze error) job-id]
+                                     extra-params)
+                       :kebab-keys? true})]
+           (if (seq rows)
+             (do
+               (log/info "Job failed, scheduling retry"
+                         {:job-id job-id :attempt attempt :max-attempts max-attempts
+                          :next-run-in-seconds delay-secs})
+               :retry-scheduled)
+             :ignored))
+         ;; Exhausted — terminal failure
+         (let [{:keys [sql extra-params]} (guarded-where-clause 3 owner-id)
+               rows (pg/execute conn
+                      (str "UPDATE statechart_jobs"
+                           " SET status = 'failed',"
+                           "     error = $1,"
+                           "     terminal_event_name = $2,"
+                           "     terminal_event_data = $3,"
+                           "     lease_owner = NULL,"
+                           "     lease_expires_at = NULL,"
+                           "     updated_at = now()"
+                           sql
+                           " RETURNING id")
+                      {:params (into [(core/freeze error)
+                                      terminal-event-name
+                                      (core/freeze terminal-event-data)
+                                      job-id]
+                                     extra-params)
+                       :kebab-keys? true})]
+           (if (seq rows)
+             (do
+               (log/warn "Job failed permanently"
+                         {:job-id job-id :attempt attempt :max-attempts max-attempts})
+               :failed)
+             :ignored)))))))
 
 (defn cancel!
   "Cancel a job for a specific session+invokeid.

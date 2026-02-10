@@ -136,13 +136,15 @@
           (let [event-data (merge (when (map? result) result)
                                   {:job-id (str id)})]
             ;; Store terminal state + event in one write
-            (job-store/complete! pool id result done-event-name event-data)
-            ;; Try immediate dispatch
-            (when (dispatch-terminal-event! event-queue env
-                    (assoc job :terminal-event-name done-event-name
-                               :terminal-event-data event-data)
-                    get-session-state-fn)
-              (job-store/mark-terminal-event-dispatched! pool id)))
+            (if (job-store/complete! pool id owner-id result done-event-name event-data)
+              ;; Try immediate dispatch
+              (when (dispatch-terminal-event! event-queue env
+                      (assoc job :terminal-event-name done-event-name
+                                 :terminal-event-data event-data)
+                      get-session-state-fn)
+                (job-store/mark-terminal-event-dispatched! pool id))
+              (log/info "Skipping completion write; job no longer active/owned"
+                        {:job-id id :session-id session-id :owner-id owner-id})))
           (log/info "Job lease lost after execution, abandoning"
                     {:job-id id :session-id session-id})))
       (catch Exception e
@@ -152,15 +154,19 @@
         (let [error {:message (or (.getMessage e) "Unknown error")
                      :type (str (type e))}
               event-data (merge error {:job-id (str id)})]
-          (job-store/fail! pool id attempt max-attempts error
-                           error-event-name event-data)
-          ;; If permanently failed, try immediate dispatch
-          (when (>= attempt max-attempts)
+          (case (job-store/fail! pool id owner-id attempt max-attempts error
+                                 error-event-name event-data)
+            :failed
+            ;; If permanently failed, try immediate dispatch
             (when (dispatch-terminal-event! event-queue env
                     (assoc job :terminal-event-name error-event-name
                                :terminal-event-data event-data)
                     get-session-state-fn)
-              (job-store/mark-terminal-event-dispatched! pool id))))))))
+              (job-store/mark-terminal-event-dispatched! pool id))
+            :retry-scheduled nil
+            :ignored
+            (log/info "Skipping fail update; job no longer active/owned"
+                      {:job-id id :session-id session-id :owner-id owner-id})))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Reconciliation Loop
@@ -247,7 +253,8 @@
                           (doseq [job jobs]
                             (when @running
                               (let [job-type (:job-type job)
-                                    handler-fn (get handlers (keyword job-type))]
+                                    handler-fn (or (get handlers (keyword job-type))
+                                                   (get handlers job-type))]
                                 (if handler-fn
                                   (execute-job! pool event-queue env job handler-fn owner-id exec-opts)
                                   (do
@@ -257,9 +264,16 @@
                                           invokeid (:invokeid job)
                                           error-event-name (pr-str (evts/invoke-error-event (keyword invokeid)))
                                           event-data (merge error {:job-id (str (:id job))})]
-                                      (job-store/fail! pool (:id job)
-                                                       (:attempt job) 0 ;; max-attempts=0 → permanent failure
-                                                       error error-event-name event-data))))))))
+                                      (when (= :failed
+                                               (job-store/fail! pool (:id job) owner-id
+                                                                (:max-attempts job)
+                                                                (:max-attempts job)
+                                                                error error-event-name event-data))
+                                        (when (dispatch-terminal-event! event-queue env
+                                                (assoc job :terminal-event-name error-event-name
+                                                           :terminal-event-data event-data)
+                                                get-session-state-fn)
+                                          (job-store/mark-terminal-event-dispatched! pool (:id job)))))))))))
                         ;; Periodic reconciliation
                         (when (zero? (mod poll-count reconcile-interval-polls))
                           (reconcile-undispatched! pool event-queue env exec-opts))
