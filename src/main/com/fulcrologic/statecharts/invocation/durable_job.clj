@@ -16,7 +16,17 @@
    [com.fulcrologic.statecharts.protocols :as sp]
    [taoensso.timbre :as log]))
 
-(defn- invoke-data-keys
+(def invokeid->str
+  "Serialize an invokeid keyword to a string, preserving namespace.
+   See job-store/invokeid->str."
+  job-store/invokeid->str)
+
+(def str->invokeid
+  "Deserialize a string back to an invokeid keyword.
+   See job-store/str->invokeid."
+  job-store/str->invokeid)
+
+(defn invoke-data-keys
   "Returns the data model keys for tracking a durable job invoke.
    Keys are namespaced by invokeid to support multiple concurrent invokes."
   [invokeid]
@@ -24,7 +34,7 @@
     {:job-id-key  (keyword ns-str "job-id")
      :job-kind-key (keyword ns-str "job-kind")}))
 
-(defrecord DurableJobInvocationProcessor [pool]
+(defrecord DurableJobInvocationProcessor [pool wake-worker-fn]
   sp/InvocationProcessor
   (supports-invocation-type? [_ typ] (= :durable-job typ))
 
@@ -43,7 +53,11 @@
                 {:job-id job-id :session-id session-id :invokeid invokeid :job-type job-type})
       (sp/update! (::sc/data-model env) env
         {:ops [(ops/assign job-id-key (str job-id)
-                           job-kind-key job-type)]})))
+                           job-kind-key job-type)]})
+      ;; Wake the worker to pick up the new job immediately
+      (when wake-worker-fn
+        (let [f (if (instance? clojure.lang.IDeref wake-worker-fn) @wake-worker-fn wake-worker-fn)]
+          (when f (f))))))
 
   (stop-invocation! [_ env {:keys [invokeid]}]
     (let [session-id (env/session-id env)]

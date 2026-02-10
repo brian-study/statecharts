@@ -124,8 +124,8 @@
   (let [{:keys [id session-id invokeid payload attempt max-attempts]} job
         update-fn (make-update-fn update-data-by-id-fn max-update-retries)
         continue-fn (make-continue-fn pool id owner-id lease-duration-seconds)
-        done-event-name (pr-str (evts/invoke-done-event (keyword invokeid)))
-        error-event-name (pr-str (evts/invoke-error-event (keyword invokeid)))]
+        done-event-name (pr-str (evts/invoke-done-event invokeid))
+        error-event-name (pr-str (evts/invoke-error-event invokeid))]
     (try
       (let [result (handler-fn {:job-id      (str id)
                                 :params      payload
@@ -215,7 +215,7 @@
    - update-fn: (fn [session-id data-map]) - update data model with retry
    - continue-fn: (fn []) - returns true if worker should continue, false to stop
 
-   Returns a stop function."
+   Returns a map with :stop! and :wake! functions."
   [{:keys [pool event-queue env handlers owner-id
            poll-interval-ms claim-limit lease-duration-seconds
            update-data-by-id-fn get-session-state-fn wake-event-loop-fn
@@ -264,7 +264,7 @@
                                               {:job-type job-type :job-id (:id job)})
                                     (let [error {:message (str "No handler for job type: " job-type)}
                                           invokeid (:invokeid job)
-                                          error-event-name (pr-str (evts/invoke-error-event (keyword invokeid)))
+                                          error-event-name (pr-str (evts/invoke-error-event invokeid))
                                           event-data (merge error {:job-id (str (:id job))})]
                                       (when (= :failed
                                                (job-store/fail! pool (:id job) owner-id
@@ -286,11 +286,13 @@
                       (recur (inc poll-count))))
                   (log/info "Job worker stopped" {:owner-id owner-id}))]
     (future (loop-fn))
-    ;; Return stop function
-    (fn []
-      (log/info "Job worker stop requested" {:owner-id owner-id})
-      (reset! running false)
-      (.offer wake-signal :stop))))
+    ;; Return map with stop and wake functions
+    {:stop! (fn []
+              (log/info "Job worker stop requested" {:owner-id owner-id})
+              (reset! running false)
+              (.offer wake-signal :stop))
+     :wake! (fn []
+              (.offer wake-signal :wake))}))
 
 (defn wake!
   "Wake the worker to check for new jobs immediately.

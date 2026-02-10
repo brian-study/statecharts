@@ -93,7 +93,7 @@
   [pool]
   (pg-sc/pg-env
     {:pool pool
-     :invocation-processors [(durable-job/->DurableJobInvocationProcessor pool)]}))
+     :invocation-processors [(durable-job/->DurableJobInvocationProcessor pool nil)]}))
 
 (defn- get-wmem
   "Get working memory for a session."
@@ -120,18 +120,18 @@
    Returns after the worker has processed available jobs."
   [pool env handlers & [{:keys [update-data-by-id-fn]
                          :or {update-data-by-id-fn noop-update-data-by-id-fn}}]]
-  (let [stop-fn (worker/start-worker!
-                  {:pool pool
-                   :event-queue (::sc/event-queue env)
-                   :env env
-                   :handlers handlers
-                   :update-data-by-id-fn update-data-by-id-fn
-                   :poll-interval-ms 50
-                   :lease-duration-seconds 30
-                   :reconcile-interval-polls 1})]
+  (let [{:keys [stop!]} (worker/start-worker!
+                          {:pool pool
+                           :event-queue (::sc/event-queue env)
+                           :env env
+                           :handlers handlers
+                           :update-data-by-id-fn update-data-by-id-fn
+                           :poll-interval-ms 50
+                           :lease-duration-seconds 30
+                           :reconcile-interval-polls 1})]
     ;; Give worker time to claim/execute
     (Thread/sleep 300)
-    (stop-fn)
+    (stop!)
     ;; Give shutdown time
     (Thread/sleep 100)))
 
@@ -279,24 +279,24 @@
       (process-pending-events! env)
 
       ;; Start worker with a handler that pauses mid-execution
-      (let [stop-fn (worker/start-worker!
-                      {:pool pool
-                       :event-queue (::sc/event-queue env)
-                       :env env
-                       :handlers {:test-job
-                                  (fn [{:keys [continue-fn]}]
-                                    ;; Record initial continue-fn result
-                                    (swap! continue-results conj (continue-fn))
-                                    ;; Signal only after the pre-cancel check is recorded.
-                                    (deliver handler-started true)
-                                    ;; Wait for external cancellation
-                                    (deref handler-proceed 5000 :timeout)
-                                    ;; Record continue-fn after cancellation
-                                    (swap! continue-results conj (continue-fn))
-                                    {:result "should-not-matter"})}
-                       :update-data-by-id-fn noop-update-data-by-id-fn
-                       :poll-interval-ms 50
-                       :lease-duration-seconds 30})]
+      (let [{:keys [stop!]} (worker/start-worker!
+                              {:pool pool
+                               :event-queue (::sc/event-queue env)
+                               :env env
+                               :handlers {:test-job
+                                          (fn [{:keys [continue-fn]}]
+                                            ;; Record initial continue-fn result
+                                            (swap! continue-results conj (continue-fn))
+                                            ;; Signal only after the pre-cancel check is recorded.
+                                            (deliver handler-started true)
+                                            ;; Wait for external cancellation
+                                            (deref handler-proceed 5000 :timeout)
+                                            ;; Record continue-fn after cancellation
+                                            (swap! continue-results conj (continue-fn))
+                                            {:result "should-not-matter"})}
+                               :update-data-by-id-fn noop-update-data-by-id-fn
+                               :poll-interval-ms 50
+                               :lease-duration-seconds 30})]
 
         ;; Wait for handler to start
         (deref handler-started 5000 :timeout)
@@ -309,7 +309,7 @@
 
         ;; Stop worker
         (Thread/sleep 300)
-        (stop-fn)
+        (stop!)
         (Thread/sleep 100))
 
       ;; Verify continue-fn results

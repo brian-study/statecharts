@@ -95,7 +95,7 @@
 ;; -----------------------------------------------------------------------------
 
 (deftest ^:integration supports-invocation-type?-test
-  (let [processor (sut/->DurableJobInvocationProcessor *pool*)]
+  (let [processor (sut/->DurableJobInvocationProcessor *pool* nil)]
 
     (testing "returns true for :durable-job"
       (is (true? (sp/supports-invocation-type? processor :durable-job))))
@@ -111,7 +111,7 @@
 ;; -----------------------------------------------------------------------------
 
 (deftest ^:integration start-invocation-creates-job-test
-  (let [processor  (sut/->DurableJobInvocationProcessor *pool*)
+  (let [processor  (sut/->DurableJobInvocationProcessor *pool* nil)
         session-id :test-session-1
         env        (make-env session-id)
         invokeid   :invoke.gen-quiz]
@@ -145,7 +145,7 @@
             (is (= "pending" (:status job)))))))))
 
 (deftest ^:integration start-invocation-uses-session-id-test
-  (let [processor  (sut/->DurableJobInvocationProcessor *pool*)
+  (let [processor  (sut/->DurableJobInvocationProcessor *pool* nil)
         session-id (random-uuid)
         env        (make-env session-id)]
 
@@ -161,7 +161,7 @@
                (core/session-id->str session-id)))))))
 
 (deftest ^:integration start-invocation-idempotent-test
-  (let [processor  (sut/->DurableJobInvocationProcessor *pool*)
+  (let [processor  (sut/->DurableJobInvocationProcessor *pool* nil)
         session-id :test-session-idem
         env1       (make-env session-id)
         env2       (make-env session-id)
@@ -191,7 +191,7 @@
 ;; -----------------------------------------------------------------------------
 
 (deftest ^:integration stop-invocation-cancels-pending-job-test
-  (let [processor  (sut/->DurableJobInvocationProcessor *pool*)
+  (let [processor  (sut/->DurableJobInvocationProcessor *pool* nil)
         session-id :test-session-stop-pending
         env        (make-env session-id)
         invokeid   :invoke.cancel-me]
@@ -213,7 +213,7 @@
         (is (= "cancelled" (get-job-status *pool* job-id)))))))
 
 (deftest ^:integration stop-invocation-cancels-running-job-test
-  (let [processor  (sut/->DurableJobInvocationProcessor *pool*)
+  (let [processor  (sut/->DurableJobInvocationProcessor *pool* nil)
         session-id :test-session-stop-running
         env        (make-env session-id)
         invokeid   :invoke.running]
@@ -238,7 +238,7 @@
         (is (= "cancelled" (get-job-status *pool* job-id)))))))
 
 (deftest ^:integration stop-invocation-noop-on-succeeded-job-test
-  (let [processor  (sut/->DurableJobInvocationProcessor *pool*)
+  (let [processor  (sut/->DurableJobInvocationProcessor *pool* nil)
         session-id :test-session-stop-succeeded
         env        (make-env session-id)
         invokeid   :invoke.done]
@@ -261,7 +261,7 @@
             "Status should remain succeeded, not change to cancelled")))))
 
 (deftest ^:integration stop-invocation-noop-on-failed-job-test
-  (let [processor  (sut/->DurableJobInvocationProcessor *pool*)
+  (let [processor  (sut/->DurableJobInvocationProcessor *pool* nil)
         session-id :test-session-stop-failed
         env        (make-env session-id)
         invokeid   :invoke.failed]
@@ -288,7 +288,7 @@
 ;; -----------------------------------------------------------------------------
 
 (deftest ^:integration forward-event-returns-nil-test
-  (let [processor (sut/->DurableJobInvocationProcessor *pool*)]
+  (let [processor (sut/->DurableJobInvocationProcessor *pool* nil)]
 
     (testing "forward-event! returns nil (durable jobs do not support event forwarding)"
       (is (nil? (sp/forward-event! processor {} {:type :durable-job

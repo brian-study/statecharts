@@ -127,7 +127,7 @@
             handler-fn (fn [ctx]
                          (deliver received-keys (set (keys ctx)))
                          {:result "ok"})
-            stop! (worker/start-worker!
+            {stop! :stop!} (worker/start-worker!
                     {:pool *pool*
                      :event-queue queue
                      :env {}
@@ -156,7 +156,7 @@
           handler-fn (fn [ctx]
                        (deliver received-ctx ctx)
                        nil)
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -188,7 +188,7 @@
           handler-fn (fn [{:keys [continue-fn]}]
                        (deliver continue-result (continue-fn))
                        nil)
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -216,7 +216,7 @@
                        ;; Now continue-fn should detect the cancellation
                        (deliver continue-result (continue-fn))
                        nil)
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -241,7 +241,7 @@
                        (let [result {:generated-id 42 :status "complete"}]
                          (deliver handler-done true)
                          result))
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -277,7 +277,7 @@
           handler-fn (fn [_ctx]
                        (deliver handler-done true)
                        {:answer 42})
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -313,7 +313,7 @@
                          (when (= n 1)
                            (deliver first-failure-done true))
                          (throw (ex-info "Transient error" {:attempt n}))))
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -347,7 +347,7 @@
           handler-fn (fn [_ctx]
                        (deliver handler-done true)
                        (throw (ex-info "Permanent error" {:reason "bad input"})))
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -399,7 +399,7 @@
                                (swap! attempt-tracker assoc :second-next-run (:next-run-at row))
                                (deliver second-failure-done true))))
                          (throw (ex-info "Fail" {:n n}))))
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -438,7 +438,7 @@
                        (when (= 2 (count @processed-jobs))
                          (deliver done-latch true))
                        nil)
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -466,7 +466,7 @@
           handler-fn (fn [_ctx]
                        (reset! handler-called true)
                        nil)
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}
@@ -487,28 +487,30 @@
       (is (false? @handler-called)
           "No jobs should be processed after worker is stopped"))))
 
-(deftest ^:integration start-worker-returns-stop-function-test
-  (testing "start-worker! returns a function"
+(deftest ^:integration start-worker-returns-map-test
+  (testing "start-worker! returns a map with :stop! and :wake! functions"
     (let [{:keys [queue]} (make-tracking-event-queue)
-          stop! (worker/start-worker!
-                  {:pool *pool*
-                   :event-queue queue
-                   :env {}
-                   :handlers {"test-job" identity}
-                   :owner-id "test-worker-returns-fn"
-                   :poll-interval-ms 100
-                   :update-data-by-id-fn noop-update-data-by-id-fn})]
+          worker (worker/start-worker!
+                   {:pool *pool*
+                    :event-queue queue
+                    :env {}
+                    :handlers {"test-job" identity}
+                    :owner-id "test-worker-returns-map"
+                    :poll-interval-ms 100
+                    :update-data-by-id-fn noop-update-data-by-id-fn})]
       (try
-        (is (fn? stop!) "start-worker! should return a stop function")
+        (is (map? worker) "start-worker! should return a map")
+        (is (fn? (:stop! worker)) ":stop! should be a function")
+        (is (fn? (:wake! worker)) ":wake! should be a function")
         (finally
-          (stop!))))))
+          ((:stop! worker)))))))
 
 (deftest ^:integration no-handler-for-job-type-fails-permanently-test
   (testing "job with no registered handler fails permanently"
     (let [job-id (create-test-job! *pool* {:job-type "unknown-job-type"
                                            :invokeid :no-handler-invoke})
           {:keys [queue]} (make-tracking-event-queue)
-          stop! (worker/start-worker!
+          {stop! :stop!} (worker/start-worker!
                   {:pool *pool*
                    :event-queue queue
                    :env {}

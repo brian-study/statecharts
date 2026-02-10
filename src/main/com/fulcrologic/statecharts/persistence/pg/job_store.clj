@@ -13,6 +13,24 @@
    [java.time OffsetDateTime Duration]))
 
 ;; -----------------------------------------------------------------------------
+;; Invokeid Serialization
+;; -----------------------------------------------------------------------------
+
+(defn invokeid->str
+  "Serialize an invokeid keyword to a string, preserving namespace.
+   Simple keywords: :content-generation → \"content-generation\"
+   Qualified keywords: :my-ns/gen → \"my-ns/gen\""
+  [invokeid]
+  (subs (str invokeid) 1))
+
+(defn str->invokeid
+  "Deserialize a string back to an invokeid keyword.
+   \"content-generation\" → :content-generation
+   \"my-ns/gen\" → :my-ns/gen"
+  [s]
+  (keyword s))
+
+;; -----------------------------------------------------------------------------
 ;; Internal Helpers
 ;; -----------------------------------------------------------------------------
 
@@ -47,6 +65,7 @@
   [row]
   (-> row
       (update :session-id core/str->session-id)
+      (update :invokeid str->invokeid)
       (update :payload core/thaw)
       (cond->
         (:result row) (update :result core/thaw)
@@ -75,7 +94,7 @@
                           " RETURNING id")
                      {:params [id
                                (core/session-id->str session-id)
-                               (name invokeid)
+                               (invokeid->str invokeid)
                                job-type
                                (core/freeze payload)
                                max-attempts]
@@ -93,7 +112,7 @@
                                   " WHERE session_id = $1 AND invokeid = $2"
                                   " AND status IN ('pending', 'running')")
                              {:params [(core/session-id->str session-id)
-                                       (name invokeid)]
+                                       (invokeid->str invokeid)]
                               :kebab-keys? true})]
               (:id (first existing)))))))))
 
@@ -264,7 +283,7 @@
                           " AND status IN ('pending', 'running')"
                           " RETURNING id")
                      {:params [(core/session-id->str session-id)
-                               (name invokeid)]
+                               (invokeid->str invokeid)]
                       :kebab-keys? true})]
         (core/affected-row-count result)))))
 
@@ -294,7 +313,7 @@
                         " WHERE session_id = $1 AND invokeid = $2"
                         " AND status IN ('pending', 'running')")
                    {:params [(core/session-id->str session-id)
-                             (name invokeid)]
+                             (invokeid->str invokeid)]
                     :kebab-keys? true})]
         (when-let [row (first rows)]
           (hydrate-job-row row))))))
