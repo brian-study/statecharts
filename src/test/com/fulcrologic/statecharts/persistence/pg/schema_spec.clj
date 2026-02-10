@@ -166,6 +166,87 @@
         (assertions
           (clojure.string/includes? ddl "version") => true)))))
 
+(specification "Jobs Table DDL"
+  (component "table structure"
+    (let [ddl @#'schema/jobs-ddl]
+      (behavior "contains CREATE TABLE"
+        (assertions
+          (clojure.string/includes? ddl "CREATE TABLE") => true))
+
+      (behavior "creates statechart_jobs table"
+        (assertions
+          (clojure.string/includes? ddl "statechart_jobs") => true))
+
+      (behavior "has UUID primary key"
+        (assertions
+          (clojure.string/includes? ddl "UUID PRIMARY KEY") => true))
+
+      (behavior "has session_id column"
+        (assertions
+          (clojure.string/includes? ddl "session_id") => true))
+
+      (behavior "has invokeid column"
+        (assertions
+          (clojure.string/includes? ddl "invokeid") => true))
+
+      (behavior "has job_type column"
+        (assertions
+          (clojure.string/includes? ddl "job_type") => true))
+
+      (behavior "has status column with default"
+        (assertions
+          (clojure.string/includes? ddl "status") => true
+          (clojure.string/includes? ddl "'pending'") => true))
+
+      (behavior "has payload BYTEA column"
+        (assertions
+          (clojure.string/includes? ddl "payload") => true
+          (clojure.string/includes? ddl "BYTEA NOT NULL") => true))
+
+      (behavior "has attempt tracking columns"
+        (assertions
+          (clojure.string/includes? ddl "attempt") => true
+          (clojure.string/includes? ddl "max_attempts") => true))
+
+      (behavior "has lease columns"
+        (assertions
+          (clojure.string/includes? ddl "lease_owner") => true
+          (clojure.string/includes? ddl "lease_expires_at") => true))
+
+      (behavior "has terminal event columns"
+        (assertions
+          (clojure.string/includes? ddl "terminal_event_name") => true
+          (clojure.string/includes? ddl "terminal_event_data") => true
+          (clojure.string/includes? ddl "terminal_event_dispatched_at") => true))
+
+      (behavior "uses IF NOT EXISTS for idempotency"
+        (assertions
+          (clojure.string/includes? ddl "IF NOT EXISTS") => true))))
+
+  (component "indexes"
+    (let [indexes @#'schema/jobs-indexes-ddl]
+      (behavior "has partial unique index for active jobs per invoke"
+        (assertions
+          (some #(and (clojure.string/includes? % "UNIQUE")
+                      (clojure.string/includes? % "session_id")
+                      (clojure.string/includes? % "invokeid")) indexes) => true))
+
+      (behavior "has index for claimable jobs"
+        (assertions
+          (some #(clojure.string/includes? % "idx_jobs_claimable") indexes) => true))
+
+      (behavior "has index for session lookup"
+        (assertions
+          (some #(clojure.string/includes? % "idx_jobs_session") indexes) => true))
+
+      (behavior "has index for undispatched terminal events"
+        (assertions
+          (some #(clojure.string/includes? % "idx_jobs_undispatched") indexes) => true))
+
+      (behavior "indexes use partial index WHERE clauses"
+        (assertions
+          (every? #(clojure.string/includes? % "WHERE") indexes) => true)))))
+
 ;; -----------------------------------------------------------------------------
 ;; Drop DDL Tests
 ;; -----------------------------------------------------------------------------
@@ -192,7 +273,14 @@
         (assertions
           (clojure.string/includes? ddl "DROP TABLE") => true
           (clojure.string/includes? ddl "CASCADE") => true
-          (clojure.string/includes? ddl "statechart_definitions") => true)))))
+          (clojure.string/includes? ddl "statechart_definitions") => true)))
+
+    (behavior "drop jobs uses CASCADE"
+      (let [ddl @#'schema/drop-jobs-ddl]
+        (assertions
+          (clojure.string/includes? ddl "DROP TABLE") => true
+          (clojure.string/includes? ddl "CASCADE") => true
+          (clojure.string/includes? ddl "statechart_jobs") => true)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Public API Tests
