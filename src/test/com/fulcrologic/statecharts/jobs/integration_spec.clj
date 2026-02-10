@@ -138,9 +138,9 @@
 (defn- process-pending-events!
   "Process any pending events in the event queue."
   [env]
-  (let [stop-fn (pg-sc/start-event-loop! env 50)]
+  (let [{:keys [stop!]} (pg-sc/start-event-loop! env 50)]
     (Thread/sleep 300)
-    (stop-fn)
+    (stop!)
     (Thread/sleep 100)))
 
 ;; -----------------------------------------------------------------------------

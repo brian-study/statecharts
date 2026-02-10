@@ -28,11 +28,11 @@
    (pg-sc/register! env ::my-chart my-chart)
    (pg-sc/start! env ::my-chart \"session-1\")
 
-   ;; Start event loop (returns stop function)
-   (def stop! (pg-sc/start-event-loop! env 100))
+   ;; Start event loop (returns map with :stop! and :wake! fns)
+   (def event-loop (pg-sc/start-event-loop! env 100))
 
    ;; ... later, to stop
-   (stop!)
+   ((:stop! event-loop))
    ```"
   (:require
    [clojure.string :as str]
@@ -194,13 +194,15 @@
    The loop will wake up immediately when send! is called on this env for
    non-delayed events, so there's no latency for events sent by this instance.
 
-   Returns a function that stops the loop when called.
+   Returns a map with:
+   - :stop! - Function that stops the loop when called
+   - :wake! - Function that wakes the loop to process events immediately
 
    Example:
    ```clojure
-   (def stop! (start-event-loop! env 100))
+   (def event-loop (start-event-loop! env 100))
    ;; ... later
-   (stop!)
+   ((:stop! event-loop))
    ```"
   ([env] (start-event-loop! env 100))
   ([env poll-interval-ms] (start-event-loop! env poll-interval-ms {}))
@@ -228,11 +230,13 @@
                      (.poll wake-signal poll-interval-ms java.util.concurrent.TimeUnit/MILLISECONDS))
                    (log/info "Event loop stopped" {:node-id node-id}))]
      (future (loop-fn))
-     ;; Return stop function that also wakes the loop to exit quickly
-     (fn []
-       (log/debug "Event loop stop requested" {:node-id node-id})
-       (reset! running false)
-       (.offer wake-signal :stop)))))
+     ;; Return map with stop and wake functions
+     {:stop! (fn []
+               (log/debug "Event loop stop requested" {:node-id node-id})
+               (reset! running false)
+               (.offer wake-signal :stop))
+      :wake! (fn []
+               (.offer wake-signal :wake))})))
 
 ;; -----------------------------------------------------------------------------
 ;; Maintenance

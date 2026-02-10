@@ -82,17 +82,20 @@
    before dispatching (I3, I4).
 
    Returns true if dispatched, false if session not ready (will be retried by reconciler)."
-  [event-queue env job get-session-state-fn]
+  [event-queue env job {:keys [get-session-state-fn wake-event-loop-fn]}]
   (let [{:keys [id session-id invokeid terminal-event-name terminal-event-data]} job
-        event-name (clojure.edn/read-string terminal-event-name)]
+        event-name (clojure.edn/read-string terminal-event-name)
+        do-send! (fn []
+                   (sp/send! event-queue env
+                     {:event event-name
+                      :target session-id
+                      :data (or terminal-event-data {})})
+                   (when wake-event-loop-fn (wake-event-loop-fn)))]
     (if-let [check-result (when get-session-state-fn
                             (get-session-state-fn session-id invokeid (str id)))]
       (if (:ready check-result)
         (do
-          (sp/send! event-queue env
-            {:event event-name
-             :target session-id
-             :data (or terminal-event-data {})})
+          (do-send!)
           (log/info "Terminal event dispatched"
                     {:job-id id :event terminal-event-name :session-id session-id})
           true)
@@ -102,10 +105,7 @@
           false))
       ;; No session state checker — dispatch unconditionally
       (do
-        (sp/send! event-queue env
-          {:event event-name
-           :target session-id
-           :data (or terminal-event-data {})})
+        (do-send!)
         (log/info "Terminal event dispatched (no session check)"
                   {:job-id id :event terminal-event-name :session-id session-id})
         true))))
@@ -117,9 +117,10 @@
 (defn- execute-job!
   "Execute a single claimed job. Calls the handler and handles terminal event storage."
   [pool event-queue env job handler-fn owner-id
-   {:keys [lease-duration-seconds update-data-by-id-fn get-session-state-fn
+   {:keys [lease-duration-seconds update-data-by-id-fn
            max-update-retries]
-    :or {lease-duration-seconds 60 max-update-retries 5}}]
+    :or {lease-duration-seconds 60 max-update-retries 5}
+    :as exec-opts}]
   (let [{:keys [id session-id invokeid payload attempt max-attempts]} job
         update-fn (make-update-fn update-data-by-id-fn max-update-retries)
         continue-fn (make-continue-fn pool id owner-id lease-duration-seconds)
@@ -141,7 +142,7 @@
               (when (dispatch-terminal-event! event-queue env
                       (assoc job :terminal-event-name done-event-name
                                  :terminal-event-data event-data)
-                      get-session-state-fn)
+                      exec-opts)
                 (job-store/mark-terminal-event-dispatched! pool id))
               (log/info "Skipping completion write; job no longer active/owned"
                         {:job-id id :session-id session-id :owner-id owner-id})))
@@ -161,7 +162,7 @@
             (when (dispatch-terminal-event! event-queue env
                     (assoc job :terminal-event-name error-event-name
                                :terminal-event-data event-data)
-                    get-session-state-fn)
+                    exec-opts)
               (job-store/mark-terminal-event-dispatched! pool id))
             :retry-scheduled nil
             :ignored
@@ -175,13 +176,12 @@
 (defn- reconcile-undispatched!
   "Find jobs that completed/failed but whose terminal event wasn't dispatched,
    and dispatch them. Handles the complete-then-crash gap."
-  [pool event-queue env {:keys [get-session-state-fn limit]
-                         :or {limit 10}}]
+  [pool event-queue env {:keys [limit] :or {limit 10} :as exec-opts}]
   (try
     (let [jobs (job-store/get-undispatched-terminal-jobs pool limit)]
       (doseq [job jobs]
         (try
-          (when (dispatch-terminal-event! event-queue env job get-session-state-fn)
+          (when (dispatch-terminal-event! event-queue env job exec-opts)
             (job-store/mark-terminal-event-dispatched! pool (:id job)))
           (catch Exception e
             (log/warn e "Failed to reconcile terminal event"
@@ -207,6 +207,7 @@
    - :lease-duration-seconds - How long a lease lasts (default 60)
    - :update-data-by-id-fn - Function to update data model by session-id (REQUIRED)
    - :get-session-state-fn - Function to check session state for I3/I4 (optional)
+   - :wake-event-loop-fn - Function to wake event loop after terminal dispatch (optional)
    - :max-update-retries - Max retries for optimistic lock conflicts (default 5)
    - :reconcile-interval-polls - Run reconciliation every N polls (default 10)
 
@@ -217,7 +218,7 @@
    Returns a stop function."
   [{:keys [pool event-queue env handlers owner-id
            poll-interval-ms claim-limit lease-duration-seconds
-           update-data-by-id-fn get-session-state-fn
+           update-data-by-id-fn get-session-state-fn wake-event-loop-fn
            max-update-retries reconcile-interval-polls]
     :or {owner-id (str "worker-" (random-uuid))
          poll-interval-ms 1000
@@ -235,6 +236,7 @@
         exec-opts {:lease-duration-seconds lease-duration-seconds
                    :update-data-by-id-fn update-data-by-id-fn
                    :get-session-state-fn get-session-state-fn
+                   :wake-event-loop-fn wake-event-loop-fn
                    :max-update-retries max-update-retries}
         loop-fn (fn []
                   (log/info "Job worker started"
@@ -272,7 +274,7 @@
                                         (when (dispatch-terminal-event! event-queue env
                                                 (assoc job :terminal-event-name error-event-name
                                                            :terminal-event-data event-data)
-                                                get-session-state-fn)
+                                                exec-opts)
                                           (job-store/mark-terminal-event-dispatched! pool (:id job)))))))))))
                         ;; Periodic reconciliation
                         (when (zero? (mod poll-count reconcile-interval-polls))
