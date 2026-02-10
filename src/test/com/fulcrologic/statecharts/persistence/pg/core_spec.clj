@@ -196,4 +196,22 @@
   (component "execute-one!"
     (behavior "function exists"
       (assertions
-        (fn? core/execute-one!) => true))))
+        (fn? core/execute-one!) => true)))
+
+  (component "affected-row-count"
+    (behavior "handles nil and numbers"
+      (assertions
+        (core/affected-row-count nil) => 0
+        (core/affected-row-count 3) => 3))
+
+    (behavior "handles summary maps from mutation queries"
+      (assertions
+        (core/affected-row-count {:updated 2}) => 2
+        (core/affected-row-count {:deleted 5}) => 5
+        (core/affected-row-count {:inserted 1}) => 1
+        (core/affected-row-count {:next.jdbc/update-count 4}) => 4))
+
+    (behavior "handles row sequences"
+      (assertions
+        (core/affected-row-count [{:id 1} {:id 2}]) => 2
+        (core/affected-row-count []) => 0))))

@@ -42,6 +42,17 @@
                " AND status IN ('pending', 'running')")
      :extra-params []}))
 
+(defn- hydrate-job-row
+  "Decode persisted fields and restore session-id shape for runtime use."
+  [row]
+  (-> row
+      (update :session-id core/str->session-id)
+      (update :payload core/thaw)
+      (cond->
+        (:result row) (update :result core/thaw)
+        (:error row) (update :error core/thaw)
+        (:terminal-event-data row) (update :terminal-event-data core/thaw))))
+
 ;; -----------------------------------------------------------------------------
 ;; Job CRUD
 ;; -----------------------------------------------------------------------------
@@ -69,18 +80,22 @@
                                (core/freeze payload)
                                max-attempts]
                       :kebab-keys? true})]
-        (if (seq result)
-          ;; INSERT succeeded — new job
-          (:id (first result))
-          ;; Conflict — active job already exists, fetch its id
-          (let [existing (pg/execute conn
-                           (str "SELECT id FROM statechart_jobs"
-                                " WHERE session_id = $1 AND invokeid = $2"
-                                " AND status IN ('pending', 'running')")
-                           {:params [(core/session-id->str session-id)
-                                     (name invokeid)]
-                            :kebab-keys? true})]
-            (:id (first existing))))))))
+        (if-let [inserted-id (some-> (when (sequential? result) (first result)) :id)]
+          ;; INSERT succeeded — RETURNING row with id
+          inserted-id
+          ;; Some pg2 variants return summary maps for mutations.
+          ;; If we affected a row, the inserted id is the one we requested.
+          (if (pos? (core/affected-row-count result))
+            id
+            ;; Conflict — active job already exists, fetch its id
+            (let [existing (pg/execute conn
+                             (str "SELECT id FROM statechart_jobs"
+                                  " WHERE session_id = $1 AND invokeid = $2"
+                                  " AND status IN ('pending', 'running')")
+                             {:params [(core/session-id->str session-id)
+                                       (name invokeid)]
+                              :kebab-keys? true})]
+              (:id (first existing)))))))))
 
 (defn claim-jobs!
   "Claim up to `limit` claimable jobs for this worker.
@@ -118,14 +133,11 @@
                           " RETURNING *")
                      {:params [owner-id lease-until]
                       :kebab-keys? true})]
-          (mapv (fn [row]
-                  (-> row
-                      (update :payload core/thaw)
-                      (cond->
-                        (:result row) (update :result core/thaw)
-                        (:error row) (update :error core/thaw)
-                        (:terminal-event-data row) (update :terminal-event-data core/thaw))))
-                rows))))))
+          (->> rows
+               ;; UPDATE ... RETURNING does not guarantee row order in all plans.
+               ;; Re-apply deterministic ordering for predictable claims/tests.
+               (sort-by (juxt :next-run-at :id))
+               (mapv hydrate-job-row)))))))
 
 (defn heartbeat!
   "Extend the lease for a running job owned by this worker.
@@ -144,7 +156,7 @@
                           " RETURNING id")
                      {:params [lease-until job-id owner-id]
                       :kebab-keys? true})]
-        (pos? (count result))))))
+        (pos? (core/affected-row-count result))))))
 
 (defn complete!
   "Mark a job as succeeded and store the result.
@@ -173,7 +185,7 @@
                                     job-id]
                                    extra-params)
                      :kebab-keys? true})]
-         (pos? (count rows)))))))
+         (pos? (core/affected-row-count rows)))))))
 
 (defn fail!
   "Handle job failure. If attempts remain, re-enqueue with backoff.
@@ -205,7 +217,7 @@
                       {:params (into [next-run (core/freeze error) job-id]
                                      extra-params)
                        :kebab-keys? true})]
-           (if (seq rows)
+           (if (pos? (core/affected-row-count rows))
              (do
                (log/info "Job failed, scheduling retry"
                          {:job-id job-id :attempt attempt :max-attempts max-attempts
@@ -231,7 +243,7 @@
                                       job-id]
                                      extra-params)
                        :kebab-keys? true})]
-           (if (seq rows)
+           (if (pos? (core/affected-row-count rows))
              (do
                (log/warn "Job failed permanently"
                          {:job-id job-id :attempt attempt :max-attempts max-attempts})
@@ -254,7 +266,7 @@
                      {:params [(core/session-id->str session-id)
                                (name invokeid)]
                       :kebab-keys? true})]
-        (count result)))))
+        (core/affected-row-count result)))))
 
 (defn cancel-by-session!
   "Cancel all active jobs for a session (I6).
@@ -270,7 +282,7 @@
                           " RETURNING id")
                      {:params [(core/session-id->str session-id)]
                       :kebab-keys? true})]
-        (count result)))))
+        (core/affected-row-count result)))))
 
 (defn get-active-job
   "Get the active (pending/running) job for a session+invokeid, or nil."
@@ -285,11 +297,7 @@
                              (name invokeid)]
                     :kebab-keys? true})]
         (when-let [row (first rows)]
-          (-> row
-              (update :payload core/thaw)
-              (cond->
-                (:result row) (update :result core/thaw)
-                (:error row) (update :error core/thaw))))))))
+          (hydrate-job-row row))))))
 
 (defn job-cancelled?
   "Check if a job has been cancelled. Used by worker to poll during execution (I6)."
@@ -316,14 +324,7 @@
                         " ORDER BY updated_at"
                         " LIMIT " limit)
                    {:kebab-keys? true})]
-        (mapv (fn [row]
-                (-> row
-                    (update :payload core/thaw)
-                    (cond->
-                      (:result row) (update :result core/thaw)
-                      (:error row) (update :error core/thaw)
-                      (:terminal-event-data row) (update :terminal-event-data core/thaw))))
-              rows)))))
+        (mapv hydrate-job-row rows)))))
 
 (defn mark-terminal-event-dispatched!
   "Mark a job's terminal event as dispatched (reconciliation complete)."

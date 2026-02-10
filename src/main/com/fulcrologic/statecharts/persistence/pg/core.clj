@@ -101,6 +101,24 @@
   [conn-or-pool hsql]
   (first (execute! conn-or-pool hsql)))
 
+(defn affected-row-count
+  "Return the number of affected rows from execute!/pg2 results.
+
+   pg2 versions may return either:
+   - a row sequence (e.g. INSERT ... RETURNING / UPDATE ... RETURNING)
+   - a summary map (e.g. {:updated n}, {:deleted n}, {:inserted n})"
+  [result]
+  (cond
+    (nil? result) 0
+    (number? result) result
+    (map? result) (long (or (:updated result)
+                            (:deleted result)
+                            (:inserted result)
+                            (:next.jdbc/update-count result)
+                            0))
+    (sequential? result) (count result)
+    :else 0))
+
 ;; -----------------------------------------------------------------------------
 ;; Optimistic Locking Support
 ;; -----------------------------------------------------------------------------

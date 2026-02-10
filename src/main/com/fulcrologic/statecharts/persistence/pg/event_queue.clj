@@ -250,7 +250,7 @@
                   (pg/with-connection [c pool]
                     (core/execute! c sql))
                   (core/execute! pool sql))
-         recovered-count (count result)]
+         recovered-count (core/affected-row-count result)]
      (when (pos? recovered-count)
        (log/info "Recovered stale event claims"
                  {:count recovered-count
@@ -273,7 +273,7 @@
                   (pg/with-connection [c pool]
                     (core/execute! c sql))
                   (core/execute! pool sql))
-         purged-count (count result)]
+         purged-count (core/affected-row-count result)]
      (when (pos? purged-count)
        (log/info "Purged old processed events"
                  {:count purged-count

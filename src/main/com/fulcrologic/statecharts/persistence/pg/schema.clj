@@ -42,7 +42,7 @@
 
 (def ^:private events-indexes-ddl
   ["CREATE INDEX IF NOT EXISTS idx_events_target_deliver ON statechart_events(target_session_id, deliver_at) WHERE processed_at IS NULL"
-   "CREATE INDEX IF NOT EXISTS idx_events_cancel ON statechart_events(source_session_id, send_id) WHERE processed_at IS NULL AND deliver_at > now()"
+   "CREATE INDEX IF NOT EXISTS idx_events_cancel ON statechart_events(source_session_id, send_id, deliver_at) WHERE processed_at IS NULL"
    "CREATE INDEX IF NOT EXISTS idx_events_claimed ON statechart_events(claimed_at) WHERE claimed_at IS NOT NULL AND processed_at IS NULL"])
 
 (def ^:private definitions-ddl

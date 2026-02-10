@@ -20,7 +20,7 @@
   "Returns the data model keys for tracking a durable job invoke.
    Keys are namespaced by invokeid to support multiple concurrent invokes."
   [invokeid]
-  (let [ns-str (str "invoke." (name invokeid))]
+  (let [ns-str (name invokeid)]
     {:job-id-key  (keyword ns-str "job-id")
      :job-kind-key (keyword ns-str "job-kind")}))
 

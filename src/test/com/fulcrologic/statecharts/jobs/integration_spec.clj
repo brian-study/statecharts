@@ -285,9 +285,10 @@
                        :env env
                        :handlers {:test-job
                                   (fn [{:keys [continue-fn]}]
-                                    (deliver handler-started true)
                                     ;; Record initial continue-fn result
                                     (swap! continue-results conj (continue-fn))
+                                    ;; Signal only after the pre-cancel check is recorded.
+                                    (deliver handler-started true)
                                     ;; Wait for external cancellation
                                     (deref handler-proceed 5000 :timeout)
                                     ;; Record continue-fn after cancellation

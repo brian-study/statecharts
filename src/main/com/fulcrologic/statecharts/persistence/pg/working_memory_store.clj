@@ -74,7 +74,7 @@
                                :where [:and
                                        [:= :session-id (core/session-id->str session-id)]
                                        [:= :version expected-version]]})]
-    (when (zero? (count result))
+    (when (zero? (core/affected-row-count result))
       (log/warn "Optimistic lock failure"
                 {:session-id session-id
                  :expected-version expected-version})
@@ -112,7 +112,7 @@
   (let [result (core/execute! conn
                               {:delete-from :statechart-sessions
                                :where [:= :session-id (core/session-id->str session-id)]})]
-    (when (pos? (count result))
+    (when (pos? (core/affected-row-count result))
       (log/debug "Session deleted"
                  {:session-id session-id}))
     true))
