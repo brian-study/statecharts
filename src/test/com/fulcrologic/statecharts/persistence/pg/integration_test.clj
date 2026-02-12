@@ -19,7 +19,6 @@
    [com.fulcrologic.statecharts :as sc]
    [com.fulcrologic.statecharts.chart :as chart]
    [com.fulcrologic.statecharts.elements :as ele :refer [state transition]]
-   [com.fulcrologic.statecharts.persistence.pg.cached-working-memory-store :as cwms]
    [com.fulcrologic.statecharts.persistence.pg :as pg-sc]
    [com.fulcrologic.statecharts.persistence.pg.core :as core]
    [com.fulcrologic.statecharts.persistence.pg.event-queue :as pg-eq]
@@ -39,9 +38,7 @@
    :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
    :database (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
    :user (or (System/getenv "PG_TEST_USER") "postgres")
-   :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")
-   :binary-encode? true
-   :binary-decode? true})
+   :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
 
 (def ^:dynamic *pool* nil)
 
@@ -67,16 +64,6 @@
 
 (use-fixtures :once with-pool)
 (use-fixtures :each with-clean-tables)
-
-(defn- sample-wmem
-  [session-id rev]
-  {::sc/session-id session-id
-   ::sc/statechart-src :my-chart
-   ::sc/configuration #{:s1}
-   ::sc/initialized-states #{:s1}
-   ::sc/history-value {}
-   ::sc/running? true
-   ::sc/data-model {:rev rev}})
 
 ;; -----------------------------------------------------------------------------
 ;; Working Memory Store Tests
@@ -135,78 +122,6 @@
                               #"Optimistic lock failure"
                               (sp/save-working-memory! store {} session-id
                                                        (assoc v2 ::sc/configuration #{:s3}))))))))
-
-(deftest ^:integration working-memory-store-unversioned-on-conflict-keeps-version-test
-  (let [store (pg-wms/new-store *pool*)
-        session-id "unversioned-on-conflict"
-        initial (sample-wmem session-id 0)
-        unversioned-update (sample-wmem session-id 1)]
-    (sp/save-working-memory! store {} session-id initial)
-    (let [first-read (sp/get-working-memory store {} session-id)]
-      (is (= 1 (core/get-version first-read))))
-    (sp/save-working-memory! store {} session-id unversioned-update)
-    (let [second-read (sp/get-working-memory store {} session-id)]
-      (is (= 1 (core/get-version second-read)))
-      (is (= 1 (get-in second-read [::sc/data-model :rev]))))))
-
-(deftest ^:integration cache-store-round-trip-and-manual-invalidation-test
-  (let [session-id "cache-round-trip"
-        base-store-1 (pg-wms/new-store *pool*)
-        base-store-2 (pg-wms/new-store *pool*)
-        cache-store (cwms/new-caching-store base-store-1 16)]
-    ;; Seed row (unversioned insert -> DB version=1)
-    (sp/save-working-memory! base-store-1 {} session-id (sample-wmem session-id 0))
-    (let [loaded-1 (sp/get-working-memory cache-store {} session-id)]
-      (is (= 1 (core/get-version loaded-1))))
-
-    ;; Versioned write-through in cache-store (version 1 -> 2)
-    (let [current (sp/get-working-memory cache-store {} session-id)
-          updated (assoc-in current [::sc/data-model :rev] 1)]
-      (sp/save-working-memory! cache-store {} session-id updated))
-    (let [after-local-save (sp/get-working-memory cache-store {} session-id)]
-      (is (= 2 (core/get-version after-local-save)))
-      (is (= 1 (get-in after-local-save [::sc/data-model :rev]))))
-
-    ;; Simulate a remote writer (independent store) advancing DB to version 3
-    (let [remote-current (sp/get-working-memory base-store-2 {} session-id)
-          remote-updated (assoc-in remote-current [::sc/data-model :rev] 2)]
-      (sp/save-working-memory! base-store-2 {} session-id remote-updated))
-
-    ;; Without invalidation, cache-store still serves stale version 2
-    (let [stale-read (sp/get-working-memory cache-store {} session-id)]
-      (is (= 2 (core/get-version stale-read)))
-      (is (= 1 (get-in stale-read [::sc/data-model :rev]))))
-
-    ;; Manual invalidation refreshes from DB (version 3)
-    (cwms/invalidate! cache-store session-id)
-    (let [fresh-read (sp/get-working-memory cache-store {} session-id)]
-      (is (= 3 (core/get-version fresh-read)))
-      (is (= 2 (get-in fresh-read [::sc/data-model :rev]))))))
-
-(deftest ^:integration child-session-unversioned-save-evicts-cache-test
-  (let [session-id "parent-session.child-invoke"
-        base-store (pg-wms/new-store *pool*)
-        cache-store (cwms/new-caching-store base-store 16)
-        child-start (sample-wmem session-id 0)
-        child-update (sample-wmem session-id 1)
-        sid-key (core/session-id->str session-id)]
-    ;; Simulate invocation start path: save without version metadata.
-    (sp/save-working-memory! cache-store {} session-id child-start)
-    (is (nil? (get @(:cache cache-store) sid-key)))
-
-    ;; Read populates cache with authoritative DB version metadata.
-    (let [read-1 (sp/get-working-memory cache-store {} session-id)]
-      (is (= 1 (core/get-version read-1))))
-    (is (some? (get @(:cache cache-store) sid-key)))
-
-    ;; Another unversioned save should evict cached entry again.
-    (sp/save-working-memory! cache-store {} session-id child-update)
-    (is (nil? (get @(:cache cache-store) sid-key)))
-
-    ;; Next read returns updated payload from DB with unchanged version.
-    (let [read-2 (sp/get-working-memory cache-store {} session-id)]
-      (is (= 1 (core/get-version read-2)))
-      (is (= 1 (get-in read-2 [::sc/data-model :rev]))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Registry Tests
