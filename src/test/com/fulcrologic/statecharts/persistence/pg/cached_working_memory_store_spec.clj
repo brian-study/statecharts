@@ -32,14 +32,11 @@
         save-count (atom 0)
         delete-count (atom 0)
         fail-save? (atom false)
-        custom-get (atom nil)
         store
         (reify sp/WorkingMemoryStore
           (get-working-memory [_ env session-id]
             (swap! get-count inc)
-            (if-let [f @custom-get]
-              (f env session-id)
-              (sp/get-working-memory delegate env session-id)))
+            (sp/get-working-memory delegate env session-id))
           (save-working-memory! [_ env session-id wmem]
             (swap! save-count inc)
             (if @fail-save?
@@ -53,8 +50,7 @@
      :get-count get-count
      :save-count save-count
      :delete-count delete-count
-     :fail-save? fail-save?
-     :custom-get custom-get}))
+     :fail-save? fail-save?}))
 
 (deftest cache-miss-then-hit-test
   (let [{:keys [store delegate get-count]} (new-counting-delegate)

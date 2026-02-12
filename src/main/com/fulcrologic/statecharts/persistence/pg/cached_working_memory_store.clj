@@ -106,7 +106,7 @@
           (.incrementAndGet ^AtomicLong miss-counter)
           (let [loaded (sp/get-working-memory delegate env session-id)]
             (when loaded
-              (maybe-put-entry this sid loaded))
+              (maybe-put-entry this session-id loaded))
             loaded)))))
 
   (save-working-memory! [this env session-id wmem]
@@ -117,12 +117,12 @@
           (if (some? expected-version)
             (let [next-version (inc (long expected-version))
                   cached-wmem (core/attach-version wmem next-version)]
-              (put-entry this sid cached-wmem)
+              (put-entry this session-id cached-wmem)
               (.put ^ConcurrentHashMap recent-saves sid Boolean/TRUE))
-            (evict-entry! this sid))
+            (evict-entry! this session-id))
           result)
         (catch Throwable t
-          (evict-entry! this sid)
+          (evict-entry! this session-id)
           (throw t)))))
 
   (delete-working-memory! [this env session-id]
@@ -130,7 +130,7 @@
       (try
         (sp/delete-working-memory! delegate env session-id)
         (finally
-          (evict-entry! this sid)
+          (evict-entry! this session-id)
           (.remove ^ConcurrentHashMap recent-saves sid))))))
 
 (defn new-caching-store
@@ -167,10 +167,9 @@
    Returns true when an entry was removed."
   [{:keys [cache recent-saves]} session-id]
   (let [sid (session-key session-id)
-        removed? (contains? @cache sid)]
-    (swap! cache dissoc sid)
+        [before _] (swap-vals! cache dissoc sid)]
     (.remove ^ConcurrentHashMap recent-saves sid)
-    removed?))
+    (contains? before sid)))
 
 (defn invalidate-if-remote!
   "Evict session from cache unless a local recent-save token exists.
@@ -184,7 +183,7 @@
     (if local-token
       false
       (do
-        (invalidate! store sid)
+        (invalidate! store session-id)
         true))))
 
 (defn clear-cache!
