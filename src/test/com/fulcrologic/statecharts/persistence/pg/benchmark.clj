@@ -295,7 +295,7 @@
               total (+ hits misses)]
           {:hits hits
            :misses misses
-           :hit-rate (if (pos? total) (/ hits total) 0.0)
+           :hit-rate (if (pos? total) (/ (double hits) (double total)) 0.0)
            :size size
            :max-size max-size
            :instances (vec stats)})))))
@@ -479,7 +479,7 @@
                     {:hits hits
                      :misses misses
                      :hit-rate (if (pos? (+ hits misses))
-                                 (/ hits (+ hits misses))
+                                 (/ (double hits) (double (+ hits misses)))
                                  0.0)
                      :size size
                      :max-size max-size})}))

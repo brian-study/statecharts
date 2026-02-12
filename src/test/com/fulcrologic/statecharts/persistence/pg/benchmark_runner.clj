@@ -76,8 +76,7 @@
    :pool-config (cli->pool-config cli)})
 
 (defn- effective-cache-size
-  "Phase 1 safety: cache store is not implemented yet.
-   If caller requests cache-size > 0 but cache API is unavailable,
+  "If caller requests cache-size > 0 but cache API is unavailable,
    force cache-size to 0 so benchmark still runs."
   [requested]
   (if (and (pos? requested) (not (bench/cache-supported?)))
