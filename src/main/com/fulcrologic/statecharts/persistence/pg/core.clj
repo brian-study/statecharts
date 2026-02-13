@@ -86,12 +86,21 @@
   [conn-or-pool hsql]
   (let [[sql & params] (pgh/format hsql)]
     (log/debug "execute!" {:sql sql :params params})
-    (if (pool/pool? conn-or-pool)
-      (pg/with-connection [c conn-or-pool]
-        (pg/execute c sql {:params (vec params)
-                           :kebab-keys? true}))
-      (pg/execute conn-or-pool sql {:params (vec params)
-                                    :kebab-keys? true}))))
+    (try
+      (if (pool/pool? conn-or-pool)
+        (pg/with-connection [c conn-or-pool]
+          (pg/execute c sql {:params (vec params)
+                             :kebab-keys? true}))
+        (pg/execute conn-or-pool sql {:params (vec params)
+                                      :kebab-keys? true}))
+      (catch NullPointerException e
+        (log/error e "NPE in pg2 execute!"
+                   {:sql sql
+                    :param-count (count params)
+                    :param-types (mapv type params)
+                    :thread (.getName (Thread/currentThread))
+                    :conn-type (type conn-or-pool)})
+        (throw e)))))
 
 (defn execute-one!
   "Execute a HoneySQL query and return the first result row (or nil).
