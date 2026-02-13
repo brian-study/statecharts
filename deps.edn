@@ -5,12 +5,12 @@
            org.clojure/core.async     {:mvn/version "1.8.741"}
            com.taoensso/timbre        {:mvn/version "6.8.0"}
            ;; PostgreSQL persistence layer dependencies (optional - only needed if using pg backend)
-           ;; brian-study fork: 0.1.44 + sendBind null-check + hasUnreadData
+           ;; brian-study fork: 0.1.44 + sendBind null-check + pool drain-on-borrow + hasUnreadData
            com.github.igrishaev/pg2-core  {:git/url "git@github.com:brian-study/pg2.git"
-                                            :sha "24484a5931a69c313782236e9309c1c09b879e45"
+                                            :sha "c5609e3301b6e00a69e5c70ecd5bfabf3b6b8cd1"
                                             :deps/root "pg-core"}
            com.github.igrishaev/pg2-honey {:git/url "git@github.com:brian-study/pg2.git"
-                                            :sha "24484a5931a69c313782236e9309c1c09b879e45"
+                                            :sha "c5609e3301b6e00a69e5c70ecd5bfabf3b6b8cd1"
                                             :deps/root "pg-honey"}
            com.taoensso/nippy             {:mvn/version "3.4.2"}}
 
