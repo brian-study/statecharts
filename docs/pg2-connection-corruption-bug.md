@@ -1,289 +1,165 @@
-# pg2 Connection Corruption: Null ParameterDescription and Stream Misalignment
+# pg2 Pool Connection Corruption: Stale Async Messages Cause Null ParameterDescription
 
 ## Summary
 
-pg2 0.1.41 (and all versions through current master) has a connection corruption bug where `readTypesProcess()` can leave a connection's input stream misaligned. The corrupted connection is returned to the pool without validation, causing cascading failures on all subsequent operations: `NullPointerException` in `sendBind` and `PGError("Wrong parameters count")`.
+pg2 0.1.44 connection pool lacks validation on borrow and return. PostgreSQL async messages (`ParameterStatus`, `NoticeResponse`, `NotificationResponse`) that arrive while a connection sits idle in the pool accumulate in the TCP buffer, causing protocol desync on the next operation. This results in `NullPointerException` in `sendBind` and cascading permanent failure across pool connections.
 
 ## Symptoms
 
-1. **NPE in sendBind**:
-   ```
-   java.lang.NullPointerException: Cannot invoke "org.pg.msg.server.ParameterDescription.oids()"
-   because the return value of "org.pg.PreparedStatement.parameterDescription()" is null
-       at org.pg.Connection.sendBind(Connection.java:735)
-       at org.pg.Connection.execute(Connection.java:873)
-   ```
+```
+java.lang.NullPointerException: Cannot invoke "org.pg.msg.server.ParameterDescription.oids()"
+because the return value of "org.pg.PreparedStatement.parameterDescription()" is null
+    at org.pg.Connection.sendBind(Connection.java:735)
+    at org.pg.Connection.execute(Connection.java:873)
+```
 
-2. **Parameter count mismatches** — queries receive ParameterDescriptions from *different* queries:
-   ```
-   org.pg.error.PGError: Wrong parameters count: 4 (must be 2)
-   org.pg.error.PGError: Wrong parameters count: 1 (must be 4)
-   org.pg.error.PGError: Wrong parameters count: 2 (must be 1)
-   ```
+Also manifests as wrong parameter counts when stale `ParameterDescription` from a different query leaks across operations:
+```
+org.pg.error.PGError: Wrong parameters count: 4 (must be 2)
+```
 
-3. **Cascading permanent failure** — once a connection is corrupted, every subsequent operation on it fails. Multiple pool connections become corrupted over time.
+## Root Cause
 
-## Root Cause Analysis
+PostgreSQL can send async messages at **any time**, including while a connection sits idle in the pool:
+- `ParameterStatus` — when a session parameter changes (e.g., timezone)
+- `NoticeResponse` — advisory messages
+- `NotificationResponse` — from `LISTEN/NOTIFY`
 
-### 1. `readTypesProcess()` has an incomplete message handler
+The pg2 pool (`Pool.java`) has no mechanism to handle these:
+- **On return**: no check for unread data in the input stream
+- **On borrow**: no drain of stale async messages
 
-[`Connection.java:226-272`](https://github.com/igrishaev/pg2/blob/master/pg-core/src/java/org/pg/Connection.java#L226-L272)
+### Corruption cascade
+
+```
+1. Thread completes operation, interact() consumes through ReadyForQuery
+2. returnConnection: no stream validation → connection added to free queue
+3. PostgreSQL sends ParameterStatus → bytes sit in TCP buffer
+4. Thread borrows connection with stale bytes
+5. prepareUnlocked() sends Parse+Describe+Flush+Sync
+6. interact() reads stale bytes:
+   - If async message (ParameterStatus etc.): handled OK, continues normally
+   - If stale ReadyForQuery: isEnough() returns true → loop breaks early
+     → PreparedStatement created with null parameterDescription
+     → sendBind() → NPE
+7. Connection returned to pool with Parse+Describe responses still unread
+8. EVERY subsequent operation on this connection fails
+```
+
+### Trigger pattern
+
+The bug manifests most readily with rapid pool borrow/return cycles. Our statechart persistence layer does:
+```
+save-working-memory! → pg/with-connection → upsert-session! → return connection
+pg_notify            → pg/with-connection → execute          → return connection
+```
+
+With a small pool (2-4 connections), the same connection is borrowed and returned many times per second, maximizing exposure to the TCP race window where async messages arrive between return and borrow.
+
+## Evidence
+
+| pg2 version | Test suite | pg2 errors |
+|-------------|-----------|------------|
+| 0.1.44 (unpatched) | 3357 tests | **20** |
+| 0.1.44 + pool drain-on-borrow + return check | 3358 tests | **0** |
+
+All 20 errors in unpatched 0.1.44 were `Protocol desync: parameterDescription is null in sendBind` during `INSERT INTO statechart_sessions` — the operation immediately following a `pg_notify` call on the same pool.
+
+## Fix
+
+Three changes to pg2, all in `Pool.java` and `Connection.java`:
+
+### 1. `Connection.drainAsyncMessages()` — drain stale messages
 
 ```java
-private List<PGType> readTypesProcess(final String query) {
-    sendQuery(query);
-    flush();
-    // ...
-    while (true) {
-        msg = readMessage(false);
-        if (msg instanceof CopyData copyData) {
-            // ... handle binary row
-        } else if (msg instanceof CopyOutResponse
-                || msg instanceof CopyDone
-                || msg instanceof CommandComplete) {
-            // skip
-        } else if (msg instanceof ReadyForQuery) {
-            break;
-        } else if (msg instanceof ErrorResponse e) {
-            errorResponse = e;
-        } else {
-            throw new PGError("Unexpected message in readTypes: %s", msg);  // <-- HERE
+public void drainAsyncMessages() {
+    try (final TryLock ignored = lock.get()) {
+        while (IOTool.available(inStream) > 0) {
+            final IServerMessage msg = readMessage(false);
+            if (msg instanceof NoticeResponse nr) {
+                handleNoticeResponse(nr);
+            } else if (msg instanceof ParameterStatus ps) {
+                handleParameterStatus(ps);
+            } else if (msg instanceof NotificationResponse notif) {
+                handleNotificationResponse(notif);
+            } else {
+                throw new PGError(
+                    "Protocol desync: unexpected message %s found in stream " +
+                    "during drain. Connection is corrupted and will be discarded.",
+                    msg
+                );
+            }
         }
     }
-    // ...
 }
 ```
 
-This method does **NOT** handle `NoticeResponse` or `ParameterStatus`, both of which PostgreSQL can send during query processing. The main `handleMessage()` method at line 970 handles both correctly, but `readTypesProcess` has its own independent message loop.
+Handles the three async message types PostgreSQL can send at any time. Throws on anything else (true stream corruption — connection must be discarded).
 
-If a `NoticeResponse` or `ParameterStatus` arrives during the type resolution COPY query, `readTypesProcess` throws `PGError`. The exception exits the while loop **without consuming the remaining messages** (including `ReadyForQuery`). The connection's input stream now has unread data from the interrupted type resolution query.
-
-### 2. VOID type (OID 2278) is not pre-registered, triggering `readTypesProcess`
-
-[`Processors.java` static initializer](https://github.com/igrishaev/pg2/blob/master/pg-core/src/java/org/pg/processor/Processors.java)
-
-The `VOID` type (OID 2278) has no processor registered in the default `oidMap`. Common queries that return VOID trigger type resolution:
-
-```sql
-SELECT pg_notify($1, $2)    -- Connection.notify() uses this
-```
-
-When `prepareUnlocked()` processes this query:
+### 2. `Pool.validateOnBorrow()` — validate before handing to caller
 
 ```java
-// Connection.java:706-728
-private PreparedStatement prepareUnlocked(String sql, ExecuteParams executeParams) {
-    // ... sends Parse, DescribeStatement, Flush, Sync ...
-    final Result res = interact(sql);                              // consumes all responses ✓
-    final ParameterDescription pd = res.getParameterDescription();
-    final RowDescription rd = res.getRowDescription();
-    final int[] oidsRD = rd == null ? null : rd.oids();            // RowDescription has VOID OID
-    final int[] oidsPD = pd == null ? null : pd.oids();
-    final Set<Integer> oidsUnknown = unsupportedOids(oidsRD, oidsPD);  // {2278} → not empty!
-    setTypesByOids(oidsUnknown);                                   // triggers readTypesProcess()
-    return new PreparedStatement(parse, pd, rd);
-}
-```
-
-The `RowDescription` for `SELECT pg_notify($1, $2)` contains VOID (OID 2278). Since VOID is not in `Processors.isKnownOid()`, `unsupportedOids()` returns `{2278}`, triggering `setTypesByOids()` → `readTypesOids()` → `readTypesProcess()`.
-
-### 3. Pool returns corrupted connections without validation
-
-[`Pool.java:199-267`](https://github.com/igrishaev/pg2/blob/master/pg-core/src/java/org/pg/Pool.java#L199-L267)
-
-```java
-public void returnConnection(Connection conn, boolean forceClose) {
-    if (conn.isTxError()) { rollback(); closeConnection(conn); return; }
-    if (conn.isTransaction()) { rollback(); addFree(conn); return; }
-    if (conn.isClosed()) { removeUsed(conn); return; }
-    // Default: return to pool with NO stream validation
-    removeUsed(conn);
-    addFree(conn);  // corrupted connection goes back to free queue
-}
-```
-
-There is no check for:
-- Unread data in the input stream (`InputStream.available() > 0`)
-- Protocol state consistency
-- Connection health (no ping/validation query)
-
-The Clojure `with-connection` macro unconditionally returns the connection:
-
-```clojure
-;; pg/core.clj
-(defmacro with-connection [[bind src] & body]
-  `(let [~bind (src/-borrow-connection src#)]
-     (try ~@body
-       (finally (src/-return-connection src# ~bind)))))
-```
-
-For a Pool, `-return-connection` calls `Pool.returnConnection(conn)` with `forceClose=false`.
-
-### 4. Null ParameterDescription creates NPE in sendBind
-
-[`Connection.java:730-741`](https://github.com/igrishaev/pg2/blob/master/pg-core/src/java/org/pg/Connection.java#L730-L741)
-
-```java
-private void sendBind(String portal, PreparedStatement stmt, ExecuteParams executeParams) {
-    final List<Object> params = executeParams.params();
-    final int[] OIDs = stmt.parameterDescription().oids();  // NPE if parameterDescription is null
-    final int size = params.size();
-    if (size != OIDs.length) {
-        throw new PGError("Wrong parameters count: %d (must be %d)", size, OIDs.length);
-    }
-    // ...
-}
-```
-
-`PreparedStatement` is a Java record that accepts null for `parameterDescription`:
-
-```java
-public record PreparedStatement(
-    Parse parse,
-    ParameterDescription parameterDescription,  // can be null
-    RowDescription rowDescription
-)
-```
-
-When a corrupted connection's `interact()` reads stale bytes from a previous operation's response, it may never receive a `ParameterDescription` message, leaving the field null.
-
-## Corruption Cascade Mechanism
-
-```
-1. Thread borrows Connection C from Pool
-2. pg/notify → execute("select pg_notify($1, $2)") → prepareUnlocked()
-3. interact() succeeds, RowDescription has VOID OID 2278
-4. unsupportedOids({2278}) → non-empty → setTypesByOids() → readTypesProcess()
-5. readTypesProcess sends COPY query, starts reading responses
-6. Server sends NoticeResponse (or ParameterStatus) during COPY
-7. readTypesProcess throws PGError("Unexpected message in readTypes")
-8. Unread COPY response data remains in Connection's InputStream
-9. Exception propagates: readTypesProcess → setTypesByOids → prepareUnlocked → execute
-10. with-connection finally block → Pool.returnConnection(C, false)
-11. Pool checks: isTxError? NO. isTransaction? NO. isClosed? NO.
-12. Pool returns C to free queue — WITH CORRUPTED STREAM
-
-Next operation on C:
-13. Thread borrows C from pool
-14. execute() → prepareUnlocked() → sends Parse+Describe+Flush+Sync
-15. interact() reads STALE ReadyForQuery from step 5's unfinished COPY query
-16. interact() returns immediately with empty Result (no ParameterDescription)
-17. PreparedStatement created with null parameterDescription
-18. sendBind() → NPE on stmt.parameterDescription().oids()
-19. C returned to pool again, now Parse+Describe responses from step 14 are unread
-20. EVERY subsequent operation on C fails with wrong ParameterDescription or NPE
-```
-
-## Evidence from Integration Tests
-
-Test output shows the corruption pattern clearly — parameter counts from different queries leak across operations:
-
-| Error | Actual params | PD says | Likely source of stale PD |
-|-------|--------------|---------|--------------------------|
-| `Wrong parameters count: 4 (must be 2)` | update-session (4) | pg_notify (2) |
-| `Wrong parameters count: 1 (must be 4)` | fetch-session (1) | update-session (4) |
-| `Wrong parameters count: 2 (must be 1)` | pg_notify (2) | fetch-session (1) |
-| NPE | any | null | No ParameterDescription received |
-
-31 errors and 25 failures across 421 tests, all starting from a single corruption event ~5 minutes into the test run. The errors cascade as multiple pool connections become corrupted.
-
-## Proposed Fixes
-
-### Fix 1: Handle NoticeResponse and ParameterStatus in readTypesProcess (Critical)
-
-```java
-private List<PGType> readTypesProcess(final String query) {
-    sendQuery(query);
-    flush();
-    // ...
-    while (true) {
-        msg = readMessage(false);
-        if (msg instanceof CopyData copyData) {
-            // ... existing handling
-        } else if (msg instanceof CopyOutResponse
-                || msg instanceof CopyDone
-                || msg instanceof CommandComplete) {
-            // skip
-+       } else if (msg instanceof NoticeResponse) {
-+           // PostgreSQL can send notices during any query processing
-+           handleNoticeResponse((NoticeResponse) msg);
-+       } else if (msg instanceof ParameterStatus) {
-+           // PostgreSQL can send parameter status during any query processing
-+           handleParameterStatus((ParameterStatus) msg);
-        } else if (msg instanceof ReadyForQuery) {
-            break;
-        } else if (msg instanceof ErrorResponse e) {
-            errorResponse = e;
-        } else {
-            throw new PGError("Unexpected message in readTypes: %s", msg);
-        }
-    }
-    // ...
-}
-```
-
-### Fix 2: Pre-register VOID type processor (Preventive)
-
-Add VOID to the default processors to avoid triggering readTypesProcess for common operations like `pg_notify`:
-
-```java
-// In Processors.java static initializer
-oidMap.set(OID.VOID, new Void());  // Void processor that decodes to nil/null
-```
-
-### Fix 3: Validate connection on pool return (Safety net)
-
-```java
-public void returnConnection(Connection conn, boolean forceClose) {
-    // ... existing checks ...
-
-    // Check for protocol desync: if there's unread data, the connection is corrupted
+private boolean validateOnBorrow(final Connection conn) {
     try {
-        if (conn.getInputStream().available() > 0) {
-            logger.log(Level.WARNING, "Connection {0} has unread data, closing", conn.getId());
-            closeConnection(conn);
-            removeUsed(conn);
-            return;
-        }
-    } catch (IOException e) {
+        conn.drainAsyncMessages();
+        return true;
+    } catch (Exception e) {
+        logger.log(System.Logger.Level.WARNING,
+            "Connection {0} failed validation on borrow (pool {1}): {2}",
+            conn.getId(), id, e.getMessage());
         closeConnection(conn);
-        removeUsed(conn);
-        return;
+        return false;
     }
-
-    // Default: return to pool
-    removeUsed(conn);
-    addFree(conn);
 }
 ```
 
-### Fix 4: Null-check in sendBind (Defensive)
+Called in `borrowConnection()` for every connection polled from the free queue. If validation fails, the connection is discarded and the next one is tried. Newly spawned connections skip validation (no stale data possible).
+
+Applied at all three borrow sites in `borrowConnection()`:
+- Free queue poll loop
+- Timed poll (waiting for a connection)
+
+### 3. `Pool.returnConnection` hasUnreadData check — defense in depth
 
 ```java
-private void sendBind(String portal, PreparedStatement stmt, ExecuteParams executeParams) {
-    final ParameterDescription pd = stmt.parameterDescription();
-    if (pd == null) {
-        throw new PGError(
-            "ParameterDescription is null for statement '%s'. " +
-            "This indicates a corrupted connection (protocol desync).",
-            stmt.parse().sql()
-        );
-    }
-    final int[] OIDs = pd.oids();
-    // ...
+if (conn.hasUnreadData()) {
+    logger.log(System.Logger.Level.WARNING,
+        "Connection {0} has unread data in input stream on return, closing (pool {1})",
+        conn.getId(), id);
+    closeConnection(conn);
+    removeUsed(conn);
+    return;
 }
 ```
+
+Added before `addFree(conn)`. Catches obvious corruption immediately on return. Has a TCP race window (bytes may arrive after the check), which is why drain-on-borrow is the primary defense.
+
+### 4. `Connection.sendBind` null-check — clear error instead of NPE
+
+```java
+final ParameterDescription pd = stmt.parameterDescription();
+if (pd == null) {
+    throw new PGError(
+        "Protocol desync: parameterDescription is null in sendBind. " +
+        "The server did not send a ParameterDescription during prepare. " +
+        "This may indicate a corrupted connection or that an earlier query " +
+        "left unread data in the input stream. SQL: %s, params: %s",
+        stmt.parse().query(), params
+    );
+}
+```
+
+Diagnostic improvement only — with drain-on-borrow this path should never be reached.
 
 ## Environment
 
-- pg2 version: 0.1.41 (bug exists in all versions through current master 0.1.43-SNAPSHOT)
-- PostgreSQL: 17
+- pg2 base version: 0.1.44
+- PostgreSQL: 13, 16, 17
 - Java: 21+
-- Platform: Linux (Ubuntu)
-- Pool config: `{:binary-encode? true, :binary-decode? true, :ps-cache? false}`
+- Pool config: `{:binary-encode? true, :binary-decode? true}`
 
 ## Reproduction
 
-See test in `src/test/com/fulcrologic/statecharts/persistence/pg/pg2_corruption_repro_test.clj`.
+See test in `pg-core/test/pg/sendBind_null_check_test.clj`.
 
-The bug manifests most reliably under concurrent load with mixed query types (different parameter counts) and `pg_notify` calls, which trigger VOID type resolution via `readTypesProcess`.
+The bug manifests under concurrent load with mixed query types and `pg_notify` calls on a small pool. The statechart session persistence pattern (rapid sequential borrow/return with pg_notify between saves) is a reliable trigger.
