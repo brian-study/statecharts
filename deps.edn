@@ -7,10 +7,10 @@
            ;; PostgreSQL persistence layer dependencies (optional - only needed if using pg backend)
            ;; brian-study fork: 0.1.44 + sendBind null-check + pool drain-on-borrow + hasUnreadData
            com.github.igrishaev/pg2-core  {:git/url "git@github.com:brian-study/pg2.git"
-                                            :sha "c5609e3301b6e00a69e5c70ecd5bfabf3b6b8cd1"
+                                            :sha "d7187c6532bc393813639e10eb07dd9621c91196"
                                             :deps/root "pg-core"}
            com.github.igrishaev/pg2-honey {:git/url "git@github.com:brian-study/pg2.git"
-                                            :sha "c5609e3301b6e00a69e5c70ecd5bfabf3b6b8cd1"
+                                            :sha "d7187c6532bc393813639e10eb07dd9621c91196"
                                             :deps/root "pg-honey"}
            com.taoensso/nippy             {:mvn/version "3.4.2"}}
 
