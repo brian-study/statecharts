@@ -5,12 +5,8 @@
            org.clojure/core.async     {:mvn/version "1.8.741"}
            com.taoensso/timbre        {:mvn/version "6.8.0"}
            ;; PostgreSQL persistence layer dependencies (optional - only needed if using pg backend)
-           com.github.igrishaev/pg2-core  {:git/url "git@github.com:brian-study/pg2.git"
-                                            :sha "01f0cc06dd0f87fb8c948a48aebd8de264933c03"
-                                            :deps/root "pg-core"}
-           com.github.igrishaev/pg2-honey {:git/url "git@github.com:brian-study/pg2.git"
-                                            :sha "01f0cc06dd0f87fb8c948a48aebd8de264933c03"
-                                            :deps/root "pg-honey"}
+           com.github.igrishaev/pg2-core  {:mvn/version "0.1.44"}
+           com.github.igrishaev/pg2-honey {:mvn/version "0.1.44"}
            com.taoensso/nippy             {:mvn/version "3.4.2"}}
 
  :aliases {:test             {:extra-paths ["src/test"]
