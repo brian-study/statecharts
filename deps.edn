@@ -6,9 +6,8 @@
            com.taoensso/timbre        {:mvn/version "6.8.0"}
            ;; PostgreSQL persistence layer dependencies (optional - only needed if using pg backend)
            ;; brian-study fork: 0.1.44 + sendBind null-check + pool drain-on-borrow + hasUnreadData
-           com.github.igrishaev/pg2-core  {:git/url "git@github.com:brian-study/pg2.git"
-                                            :sha "d7187c6532bc393813639e10eb07dd9621c91196"
-                                            :deps/root "pg-core"}
+           ;; pg2-core comes transitively via pg2-honey (local/root "../pg-core" in pg-honey/deps.edn)
+           ;; Do NOT add pg2-core as a direct dep — it conflicts with the local/root coordinate
            com.github.igrishaev/pg2-honey {:git/url "git@github.com:brian-study/pg2.git"
                                             :sha "d7187c6532bc393813639e10eb07dd9621c91196"
                                             :deps/root "pg-honey"}
