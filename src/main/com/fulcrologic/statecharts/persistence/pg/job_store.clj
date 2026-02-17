@@ -264,7 +264,7 @@
                        :kebab-keys? true})]
            (if (pos? (core/affected-row-count rows))
              (do
-               (log/warn "Job failed permanently"
+               (log/error "Job failed permanently"
                          {:job-id job-id :attempt attempt :max-attempts max-attempts})
                :failed)
              :ignored)))))))
