@@ -50,6 +50,7 @@
    [com.fulcrologic.statecharts.protocols :as sp]
    [com.fulcrologic.statecharts.registry.local-memory-registry :as mem-reg]
    [com.fulcrologic.statecharts.util :refer [new-uuid]]
+   [pg.core :as pg]
    [taoensso.timbre :as log]))
 
 ;; -----------------------------------------------------------------------------
@@ -214,6 +215,7 @@
          env-with-signal (assoc env ::wake-signal wake-signal)
          handler (fn [env event]
                    (ep/standard-statechart-event-handler env event))
+         pool (:pool event-queue)
          loop-fn (fn []
                    (log/info "Event loop started"
                              {:node-id node-id
@@ -221,7 +223,10 @@
                               :session-filter (:session-id options)})
                    (while @running
                      (try
-                       (sp/receive-events! event-queue env-with-signal handler options)
+                       (if (and pool (pg/closed? pool))
+                         (do (log/info "Pool closed, stopping event loop" {:node-id node-id})
+                             (reset! running false))
+                         (sp/receive-events! event-queue env-with-signal handler options))
                        (catch Exception e
                          (log/error e "Event loop error"
                                     {:node-id node-id})))
