@@ -73,6 +73,7 @@ Per-worker claiming (used by Sidekiq, Faktory) is only viable with Redis, where 
 ### Negative
 - Cannot customize the execution model (e.g., Missionary, virtual threads). The ExecutorService is hardcoded. If this becomes a requirement, could add an `:executor-factory` option later
 - Slightly more complex coordinator loop than the batch version (semaphore management)
+- Loss of natural poll-interval backoff: in the batch model, the coordinator naturally paused between batches. In the demand-driven model, when jobs complete rapidly, the coordinator can spin through claim-poll-submit cycles without pause. The `poll-interval-ms` only applies when no permits are available or no jobs are found, so a sustained burst of fast jobs (completing faster than one poll interval) keeps the coordinator in a tight claim loop. This is correct behavior (filling slots as fast as possible) but increases DB query rate under load
 
 ### Neutral
 - `worker_missionary.clj` was removed — no callers existed in any repo

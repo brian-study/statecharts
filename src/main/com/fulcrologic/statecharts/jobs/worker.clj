@@ -263,7 +263,8 @@
    - update-fn: (fn [session-id data-map]) - update data model with retry
    - continue-fn: (fn []) - returns true if worker should continue, false to stop
 
-   Returns a map with :stop! and :wake! functions.
+   Returns a map with :stop!, :wake!, and :alive? functions.
+   - :alive? returns true if the coordinator loop is still running
    `stop!` blocks for up to ~4x shutdown-timeout-ms (2x for coordinator drain + 2x for executor shutdown).
 
    NOTE: Dynamic bindings active at start-worker! call time are captured via bound-fn
@@ -350,9 +351,11 @@
                                            {:owner-id owner-id
                                             :lease-duration-seconds lease-duration-seconds
                                             :limit (min available effective-claim-limit)})
-                                         (catch Exception e
+                                         (catch Throwable e
                                            ;; Restore all drained permits so the semaphore
-                                           ;; doesn't get stuck at 0 on claim failure
+                                           ;; doesn't get stuck at 0 on claim failure.
+                                           ;; Catches Throwable (not just Exception) so
+                                           ;; Errors don't leak permits either.
                                            (.release sem available)
                                            (throw e)))]
                               ;; Return permits for slots we didn't fill
@@ -375,6 +378,8 @@
                         (catch InterruptedException e
                           (.interrupt (Thread/currentThread))
                           (log/warn "Worker thread interrupted" {:owner-id owner-id}))
+                        (catch VirtualMachineError e
+                          (throw e))
                         (catch Throwable e
                           (log/error e "Job worker error" {:owner-id owner-id})
                           ;; Backoff before retrying. Without this, a flapping DB
@@ -384,30 +389,38 @@
                           (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
                       (recur (inc poll-count))))
                   (log/info "Job worker stopped" {:owner-id owner-id}))]
-    (let [worker-future (future (loop-fn))]
+    (let [worker-future (future (loop-fn))
+          stop-done (java.util.concurrent.CountDownLatch. 1)]
       {:stop! (fn []
-                (when (compare-and-set! stopping? false true)
-                  (log/info "Job worker stop requested" {:owner-id owner-id})
-                  (reset! running false)
-                  (.offer wake-signal :stop)
-                  ;; Wait for coordinator loop to finish before shutting down
-                  ;; executor. This ensures any in-flight claim-jobs! completes
-                  ;; and submits its jobs before the executor rejects new work.
-                  ;; Timeout prevents stop! from hanging if the coordinator is
-                  ;; stuck in a hung DB query (connection pool exhaustion, etc.).
+                (if (compare-and-set! stopping? false true)
                   (try
-                    (deref worker-future (* 2 shutdown-timeout-ms) nil)
-                    (catch Exception e
-                      (log/warn e "Worker loop ended with error"
-                                {:owner-id owner-id})))
-                  (when-not (future-done? worker-future)
-                    (log/warn "Coordinator did not exit in time, cancelling"
-                              {:owner-id owner-id
-                               :timeout-ms (* 2 shutdown-timeout-ms)})
-                    (future-cancel worker-future))
-                  (shutdown-executor! executor owner-id shutdown-timeout-ms)))
+                    (log/info "Job worker stop requested" {:owner-id owner-id})
+                    (reset! running false)
+                    (.offer wake-signal :stop)
+                    ;; Wait for coordinator loop to finish before shutting down
+                    ;; executor. This ensures any in-flight claim-jobs! completes
+                    ;; and submits its jobs before the executor rejects new work.
+                    ;; Timeout prevents stop! from hanging if the coordinator is
+                    ;; stuck in a hung DB query (connection pool exhaustion, etc.).
+                    (try
+                      (deref worker-future (* 2 shutdown-timeout-ms) nil)
+                      (catch Exception e
+                        (log/warn e "Worker loop ended with error"
+                                  {:owner-id owner-id})))
+                    (when-not (future-done? worker-future)
+                      (log/warn "Coordinator did not exit in time, cancelling"
+                                {:owner-id owner-id
+                                 :timeout-ms (* 2 shutdown-timeout-ms)})
+                      (future-cancel worker-future))
+                    (shutdown-executor! executor owner-id shutdown-timeout-ms)
+                    (finally
+                      (.countDown stop-done)))
+                  ;; Second caller waits for the first stop! to complete
+                  (.await stop-done)))
        :wake! (fn []
-                (.offer wake-signal :wake))})))
+                (.offer wake-signal :wake))
+       :alive? (fn []
+                 (and @running (not (future-done? worker-future))))})))
 
 (defn wake!
   "Wake the worker to check for new jobs immediately.

@@ -300,30 +300,33 @@
           job-count 5
           tracker (th/new-handler-tracker)
           job-ids (th/create-n-jobs! th/*pool* job-count {:session-prefix "bench"})
-          {:keys [queue]} (th/make-tracking-event-queue)
-          worker (with-redefs [job-store/claim-jobs!
-                               (fn [pool opts]
-                                 (if (= 1 (swap! call-count inc))
-                                   (throw (ex-info "Simulated claim-jobs! failure" {}))
-                                   (original-claim-jobs! pool opts)))]
-                   (worker/start-worker!
-                     {:pool th/*pool*
-                      :event-queue queue
-                      :env {}
-                      :handlers {"test-job" (th/make-delay-handler 30 {:tracker tracker})}
-                      :owner-id (str "permit-leak-" (random-uuid))
-                      :poll-interval-ms 20
-                      :claim-limit 2
-                      :concurrency 2
-                      :lease-duration-seconds 30
-                      :update-data-by-id-fn th/noop-update-data-by-id-fn}))]
-      (try
-        (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 10000)]
-          (is (every? #(= "succeeded" (:status %)) rows)
-              "All jobs should succeed despite claim-jobs! throwing on first call")
-          (is (= job-count (count (filter #(= "succeeded" (:status %)) rows)))))
-        (finally
-          ((:stop! worker)))))))
+          {:keys [queue]} (th/make-tracking-event-queue)]
+      ;; with-redefs must wrap the entire test body (not just start-worker!)
+      ;; because the coordinator polls on a future thread — if with-redefs
+      ;; only wraps start-worker!, the mock is restored before the first poll.
+      (with-redefs [job-store/claim-jobs!
+                     (fn [pool opts]
+                       (if (= 1 (swap! call-count inc))
+                         (throw (ex-info "Simulated claim-jobs! failure" {}))
+                         (original-claim-jobs! pool opts)))]
+        (let [worker (worker/start-worker!
+                       {:pool th/*pool*
+                        :event-queue queue
+                        :env {}
+                        :handlers {"test-job" (th/make-delay-handler 30 {:tracker tracker})}
+                        :owner-id (str "permit-leak-" (random-uuid))
+                        :poll-interval-ms 20
+                        :claim-limit 2
+                        :concurrency 2
+                        :lease-duration-seconds 30
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
+          (try
+            (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 10000)]
+              (is (every? #(= "succeeded" (:status %)) rows)
+                  "All jobs should succeed despite claim-jobs! throwing on first call")
+              (is (= job-count (count (filter #(= "succeeded" (:status %)) rows)))))
+            (finally
+              ((:stop! worker)))))))))
 
 (deftest ^:integration demand-driven-slot-filling-test
   (testing "freed slots are filled immediately, not after batch completes"
