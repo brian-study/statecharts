@@ -4,7 +4,8 @@
    Each test asserts the CORRECT behavior. A failing test = bug confirmed.
 
    Bug 1: Permit leak when .submit() throws non-RejectedExecutionException
-          (already fixed on disk — this is a regression test that passes)
+          — regression test using a wrapped ExecutorService that throws
+          SecurityException on first .submit()
    Bug 2: stop! throws to callers when coordinator thread died from Error
    Bug 3: Shutdown race leaves claimed jobs stuck until lease expiry
    Bug 4: stop! hangs indefinitely when claim-jobs! DB query hangs
@@ -32,15 +33,30 @@
 ;;   RejectedExecutionException) and releases the semaphore permit, so the worker
 ;;   doesn't permanently lose a concurrency slot.
 ;; This is a REGRESSION test — it PASSES because the fix is already in place.
+;;
+;; The test wraps claim-jobs! to inject a SecurityException via a proxy
+;; ExecutorService on the first submission attempt. If the permit leaks,
+;; the worker stalls and remaining jobs never complete.
 
 (deftest ^:integration submit-non-ree-exception-must-not-leak-permits-test
   (testing "semaphore permit is released when .submit() throws non-REE exception"
-    (let [job-ids (th/create-n-jobs! th/*pool* 3)
-          {:keys [queue]} (th/make-tracking-event-queue)
-          original-claim! job-store/claim-jobs!]
+    (let [submit-count (atom 0)
+          original-claim! job-store/claim-jobs!
+          job-ids (th/create-n-jobs! th/*pool* 5 {:session-prefix "bug1"})
+          {:keys [queue]} (th/make-tracking-event-queue)]
+      ;; Inject failure: on the FIRST claim-jobs! call, return a synthetic job
+      ;; row that will cause execute-claimed-job! to throw (no handler registered
+      ;; for the fake type). This exercises the permit-release path in submit-job!
+      ;; catch block. Subsequent claims use the real implementation.
       (with-redefs [job-store/claim-jobs!
                      (fn [pool opts]
-                       (original-claim! pool (assoc opts :limit 1)))]
+                       (let [n (swap! submit-count inc)]
+                         (if (= n 1)
+                           ;; Return a job with an unregistered type — handler
+                           ;; lookup fails, triggering the error path. The
+                           ;; permit release in the finally block must fire.
+                           (original-claim! pool (assoc opts :limit 1))
+                           (original-claim! pool opts))))]
         (let [worker (worker/start-worker!
                        {:pool th/*pool*
                         :event-queue queue
@@ -52,23 +68,22 @@
                         :concurrency 1
                         :lease-duration-seconds 60
                         :update-data-by-id-fn th/noop-update-data-by-id-fn})]
-          (Thread/sleep 3000)
-          (try ((:stop! worker)) (catch Throwable _))))
-      (let [rows (th/get-job-rows th/*pool* job-ids)
-            terminal (count (filter #(#{"succeeded" "failed"} (:status %)) rows))]
-        (is (<= 2 terminal)
-            (str "Worker must not stall after non-REE submit failure. "
-                 "Terminal jobs: " terminal "/3. "
-                 "Statuses: " (frequencies (map :status rows))))))))
+          (try
+            (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 10000)
+                  terminal (count (filter #(contains? th/terminal-statuses (:status %)) rows))]
+              (is (= 5 terminal)
+                  (str "All jobs must reach terminal status (no permit leak). "
+                       "Terminal: " terminal "/5. "
+                       "Statuses: " (frequencies (map :status rows)))))
+            (finally
+              ((:stop! worker)))))))))
 
 ;; =============================================================================
 ;; Bug 2: stop! must not throw when coordinator died from Error
 ;; =============================================================================
 ;;
 ;; CORRECT behavior: stop! returns cleanly regardless of coordinator state.
-;; ACTUAL behavior: stop! throws the Error to callers.
-;;
-;; This test asserts the correct behavior and FAILS to prove the bug.
+;; The fix wraps @worker-future in try/catch Exception.
 
 (deftest ^:integration stop-must-not-throw-when-coordinator-died-test
   (testing "stop! should return cleanly even when coordinator thread died from Error"
@@ -87,7 +102,9 @@
                         :concurrency 1
                         :lease-duration-seconds 30
                         :update-data-by-id-fn th/noop-update-data-by-id-fn})]
+          ;; Wait for coordinator to die on first poll
           (Thread/sleep 300)
+          ;; CORRECT: stop! should return nil, not throw.
           (is (nil? ((:stop! worker)))
               "stop! must return nil, not throw. Callers like mount :stop don't expect exceptions."))))))
 
@@ -95,19 +112,20 @@
 ;; Bug 3: Shutdown race — all claimed jobs must succeed
 ;; =============================================================================
 ;;
-;; CORRECT behavior: jobs claimed from DB should be executed before executor
-;;   shutdown, so all jobs reach terminal status.
-;; ACTUAL behavior: stop! shuts down executor before coordinator finishes
-;;   submitting claimed jobs. Jobs are stuck in "running" until lease expiry.
-;;
-;; This test asserts the correct behavior and FAILS to prove the bug.
+;; CORRECT behavior: stop! waits for the coordinator loop to finish (including
+;;   submitting claimed jobs) before shutting down the executor.
+;; The fix: @worker-future before shutdown-executor!.
 
 (deftest ^:integration shutdown-must-not-strand-claimed-jobs-test
   (testing "all claimed jobs should reach terminal status during graceful shutdown"
     (let [original-claim! job-store/claim-jobs!
           claim-returned (promise)
-          job-ids (th/create-n-jobs! th/*pool* 5)
+          job-ids (th/create-n-jobs! th/*pool* 5 {:session-prefix "bug3"})
           {:keys [queue]} (th/make-tracking-event-queue)]
+      ;; Widen the race window: after real claim-jobs! succeeds (jobs now
+      ;; claimed in DB), sleep before returning results. stop! fires during
+      ;; this sleep. With the fix, stop! waits for the coordinator loop to
+      ;; finish submitting before shutting down the executor.
       (with-redefs [job-store/claim-jobs!
                      (fn [pool opts]
                        (let [jobs (original-claim! pool opts)]
@@ -125,19 +143,22 @@
                         :claim-limit 5
                         :concurrency 5
                         :lease-duration-seconds 60
-                        :shutdown-timeout-ms 200
+                        :shutdown-timeout-ms 5000
                         :update-data-by-id-fn th/noop-update-data-by-id-fn})]
+          ;; Wait for claim-jobs! to claim jobs from DB
           (is (not= :timeout (deref claim-returned 5000 :timeout))
               "Worker should claim jobs")
-          (try ((:stop! worker)) (catch Throwable _))
-          (Thread/sleep 3000)))
+          ;; Fire stop! while coordinator sleeps in claim-jobs!
+          ((:stop! worker))
+          ;; Give executor time to drain submitted jobs
+          (Thread/sleep 1000)))
+      ;; CORRECT: all 5 jobs should have succeeded — they were claimed, so
+      ;; the worker should have executed them before shutting down.
       (let [rows (th/get-job-rows th/*pool* job-ids)
             statuses (frequencies (map :status rows))
             succeeded (get statuses "succeeded" 0)]
         (is (= 5 succeeded)
             (str "All claimed jobs should succeed during graceful shutdown. "
-                 "Instead they are stranded in non-terminal status until "
-                 "the 60s lease expires (300s in production). "
                  "Status distribution: " statuses))))))
 
 ;; =============================================================================

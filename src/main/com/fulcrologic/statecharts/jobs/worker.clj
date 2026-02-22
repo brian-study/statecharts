@@ -14,7 +14,6 @@
    - Exponential backoff for retryable failures"
   (:require
    [com.fulcrologic.statecharts.events :as evts]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
    [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
    [com.fulcrologic.statecharts.protocols :as sp]
    [taoensso.timbre :as log])
@@ -265,7 +264,11 @@
    - continue-fn: (fn []) - returns true if worker should continue, false to stop
 
    Returns a map with :stop! and :wake! functions.
-   `stop!` blocks for up to ~4x shutdown-timeout-ms (2x for coordinator drain + 2x for executor shutdown)."
+   `stop!` blocks for up to ~4x shutdown-timeout-ms (2x for coordinator drain + 2x for executor shutdown).
+
+   NOTE: Dynamic bindings active at start-worker! call time are captured via bound-fn
+   and propagated to all handler invocations on executor threads. If your handlers rely
+   on dynamic vars (e.g., *conn*, *env*), ensure they are bound when calling start-worker!."
   [{:keys [pool event-queue env handlers owner-id
            poll-interval-ms claim-limit concurrency
            lease-duration-seconds
@@ -285,7 +288,7 @@
   (assert update-data-by-id-fn "update-data-by-id-fn is required")
   (let [running (atom true)
         stopping? (atom false)
-        wake-signal (LinkedBlockingQueue.)
+        wake-signal (LinkedBlockingQueue. 1)
         concurrency (max 1 (long (or concurrency claim-limit)))
         claim-limit (max 1 (long claim-limit))
         effective-claim-limit (min claim-limit concurrency)
@@ -353,8 +356,11 @@
                                 (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
                             ;; All slots busy — wait for a job to complete or wake
                             (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
-                        ;; Periodic reconciliation (skip when all slots busy to avoid
-                        ;; unnecessary DB load — reconciliation will run on next idle cycle)
+                        ;; Periodic reconciliation. availablePermits is a racy read —
+                        ;; a job could complete between drainPermits and here — but
+                        ;; that's fine: the check is a heuristic to skip reconciliation
+                        ;; when the worker is clearly saturated. False negatives just
+                        ;; defer reconciliation to the next eligible cycle.
                         (when (and (zero? (mod poll-count reconcile-interval-polls))
                                    (pos? (.availablePermits sem)))
                           (reconcile-undispatched! pool event-queue env exec-opts))
