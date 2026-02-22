@@ -92,7 +92,7 @@
     (let [{:keys [queue]} (th/make-tracking-event-queue)]
       (with-redefs [job-store/claim-jobs!
                      (fn [_pool _opts]
-                       (throw (Error. "Simulated OOM")))]
+                       (throw (OutOfMemoryError. "Simulated OOM")))]
         (let [worker (worker/start-worker!
                        {:pool th/*pool*
                         :event-queue queue
@@ -243,7 +243,7 @@
       (with-redefs [job-store/claim-jobs!
                      (fn [pool opts]
                        (if (= 1 (swap! call-count inc))
-                         (throw (Error. "Simulated OOM"))
+                         (throw (OutOfMemoryError. "Simulated OOM"))
                          (original-claim! pool opts)))]
         (let [worker (worker/start-worker!
                        {:pool th/*pool*
