@@ -11,7 +11,7 @@
    Bug 4: stop! hangs indefinitely when claim-jobs! DB query hangs
    Bug 5: Coordinator death from Error leaves worker silently dead
    Bug 6: No backoff on claim failure — coordinator spins at CPU speed
-   Bug 7: submit failure abandons claimed job until lease expiry (code fix only)"
+   Bug 7: submit failure abandons claimed job until lease expiry"
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
    [com.fulcrologic.statecharts.jobs.test-helpers :as th]
@@ -393,13 +393,72 @@
 ;; Bug 7: submit failure abandons claimed job until lease expiry
 ;; =============================================================================
 ;;
-;; CORRECT behavior: when .submit() throws non-REE, the claimed job's lease is
+;; CORRECT behavior: when .submit() throws REE/non-REE, the claimed job's lease is
 ;;   expired so another worker can reclaim immediately.
 ;; BUG: permit is released but the job stays in "running" with this owner in DB
 ;;   until lease expiry (300s in production).
 ;;
-;; NOTE: The executor is internal, so we can't easily inject submit failures.
-;; The fix (heartbeat! with 0 duration to expire the lease) is tested
-;; indirectly — the code path is defensive and matches the same pattern used
-;; in the claim-jobs! catch block. The fix is small (3 lines) and the
-;; alternative (abandoning jobs for 300s) is clearly worse.
+(deftest ^:integration submit-ree-must-expire-lease-for-immediate-reclaim-test
+  (testing "claimed job should be immediately reclaimable when .submit throws REE"
+    (let [original-claim! job-store/claim-jobs!
+          block-return? (atom true)
+          first-claim (promise)
+          [job-id] (th/create-n-jobs! th/*pool* 1 {:session-prefix "bug7"})
+          {:keys [queue]} (th/make-tracking-event-queue)]
+      (with-redefs [job-store/claim-jobs!
+                     (fn [pool opts]
+                       (let [jobs (original-claim! pool opts)]
+                         (when (and (seq jobs) (not (realized? first-claim)))
+                           (deliver first-claim (first jobs))
+                           ;; Keep the worker in claim-jobs! until stop! times out,
+                           ;; cancels the coordinator, and shuts down the executor.
+                           ;; Then we unblock so submit-job! hits REE on .submit.
+                           (while @block-return?
+                             (try
+                               (Thread/sleep 10)
+                               (catch InterruptedException _))))
+                         jobs))]
+        (let [worker (worker/start-worker!
+                       {:pool th/*pool*
+                        :event-queue queue
+                        :env {}
+                        :handlers {"test-job" (fn [_ctx] {:result "ok"})}
+                        :owner-id (str "bug7-a-" (random-uuid))
+                        :poll-interval-ms 20
+                        :claim-limit 1
+                        :concurrency 1
+                        :lease-duration-seconds 60
+                        :shutdown-timeout-ms 100
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
+          (try
+            (is (not= :timeout (deref first-claim 5000 :timeout))
+                "Worker should claim the job before forcing submit REE")
+            (let [stop-future (future ((:stop! worker)))]
+              ;; stop! waits 2x shutdown-timeout-ms before cancel/shutdown.
+              (Thread/sleep 350)
+              (reset! block-return? false)
+              (is (not= :timeout (deref stop-future 5000 :timeout))
+                  "stop! should complete in harness")
+              (let [reclaimer-owner (str "bug7-b-" (random-uuid))
+                    reclaimed (loop [deadline (+ (System/currentTimeMillis) 1000)]
+                                (let [rows (original-claim! th/*pool*
+                                             {:owner-id reclaimer-owner
+                                              :lease-duration-seconds 30
+                                              :limit 1})]
+                                  (cond
+                                    (seq rows) rows
+                                    (>= (System/currentTimeMillis) deadline) []
+                                    :else (do
+                                            (Thread/sleep 25)
+                                            (recur deadline)))))
+                    reclaimed-ids (mapv :id reclaimed)]
+                ;; Expected-correct behavior: submit REE should expire lease so
+                ;; another worker can claim immediately (within ~1s here).
+                (is (= [job-id] reclaimed-ids)
+                    (str "Job should be reclaimable immediately after submit REE. "
+                         "Expected reclaim of " job-id ", got " reclaimed-ids ". "
+                         "Row: " (select-keys (th/get-job-row th/*pool* job-id)
+                                              [:status :lease-owner :lease-expires-at])))))
+            (finally
+              (reset! block-return? false)
+              ((:stop! worker)))))))))
