@@ -159,15 +159,7 @@
 
     (behavior "queue-depth exists"
       (assertions
-        (fn? pg/queue-depth) => true))
-
-    (behavior "preload-registry-cache! exists (no-op with in-memory registry)"
-      (assertions
-        (fn? pg/preload-registry-cache!) => true))
-
-    (behavior "clear-registry-cache! exists (no-op with in-memory registry)"
-      (assertions
-        (fn? pg/clear-registry-cache!) => true))))
+        (fn? pg/queue-depth) => true))))
 
 ;; -----------------------------------------------------------------------------
 ;; Chart Validation Tests
@@ -354,21 +346,7 @@
           "function exists with expected arity"
           (fn? pg/queue-depth) => true)))
 
-    (component "preload-registry-cache!"
-      (behavior "is a no-op with in-memory registry"
-        (assertions
-          "function exists"
-          (fn? pg/preload-registry-cache!) => true
-          "returns nil"
-          (pg/preload-registry-cache! env) => nil)))
-
-    (component "clear-registry-cache!"
-      (behavior "is a no-op with in-memory registry"
-        (assertions
-          "function exists"
-          (fn? pg/clear-registry-cache!) => true
-          "returns nil"
-          (pg/clear-registry-cache! env) => nil)))))
+))
 
 ;; -----------------------------------------------------------------------------
 ;; Wake Signal Tests

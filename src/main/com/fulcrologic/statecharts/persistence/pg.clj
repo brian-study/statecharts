@@ -273,17 +273,3 @@
   ([env] (queue-depth env {}))
   ([env options]
    (pg-eq/queue-depth (::pool env) options)))
-
-;; Note: With in-memory registry, these cache functions are no longer needed.
-;; The in-memory registry has no cache layer - charts are stored directly in memory.
-;; These functions are kept as no-ops for backwards compatibility.
-
-(defn preload-registry-cache!
-  "No-op with in-memory registry. Kept for backwards compatibility."
-  [_env]
-  nil)
-
-(defn clear-registry-cache!
-  "No-op with in-memory registry. Kept for backwards compatibility."
-  [_env]
-  nil)

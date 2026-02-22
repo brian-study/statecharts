@@ -355,10 +355,6 @@ When using `start-event-loop!`, events sent via `send!` on the same env instance
 ;; Clean up old processed events
 (pg-sc/purge-processed-events! env)      ; default 7 days retention
 (pg-sc/purge-processed-events! env 30)   ; 30 days retention
-
-;; Registry cache management
-(pg-sc/preload-registry-cache! env)      ; load all charts into memory
-(pg-sc/clear-registry-cache! env)        ; clear cache (after external DB changes)
 ```
 
 ## Environment Options

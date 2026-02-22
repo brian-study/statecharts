@@ -6,8 +6,7 @@
    the statechart session.
 
    The `src` attribute of the invoke element must be a keyword (e.g., :quiz-content-generation)
-   that maps to a handler function in the worker's registry. This is unlike :future/:missionary
-   where `src` is a resolved function."
+   that maps to a handler function in the worker's registry."
   (:require
    [com.fulcrologic.statecharts :as sc]
    [com.fulcrologic.statecharts.data-model.operations :as ops]
