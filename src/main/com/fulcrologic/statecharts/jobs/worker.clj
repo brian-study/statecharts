@@ -263,8 +263,9 @@
    - update-fn: (fn [session-id data-map]) - update data model with retry
    - continue-fn: (fn []) - returns true if worker should continue, false to stop
 
-   Returns a map with :stop!, :wake!, and :alive? functions.
+   Returns a map with :stop!, :wake!, :alive?, and :restart-count functions.
    - :alive? returns true if the coordinator loop is still running
+   - :restart-count returns the number of supervisor restarts after VirtualMachineError
    `stop!` blocks for up to ~4x shutdown-timeout-ms (2x for coordinator drain + 2x for executor shutdown).
 
    NOTE: Dynamic bindings active at start-worker! call time are captured via bound-fn
@@ -289,6 +290,7 @@
   (assert update-data-by-id-fn "update-data-by-id-fn is required")
   (let [running (atom true)
         stopping? (atom false)
+        restart-count* (atom 0)
         wake-signal (LinkedBlockingQueue. 1)
         concurrency (max 1 (long (or concurrency claim-limit)))
         claim-limit (max 1 (long claim-limit))
@@ -361,19 +363,24 @@
                               ;; Return permits for slots we didn't fill
                               (.release sem (- available (count jobs)))
                               (if (seq jobs)
-                                (doseq [job jobs]
-                                  (submit-job! job))
+                                (let [n-submitted (atom 0)]
+                                  (try
+                                    (doseq [job jobs]
+                                      (submit-job! job)
+                                      (swap! n-submitted inc))
+                                    (catch Throwable e
+                                      ;; Release permits for jobs we didn't get to submit
+                                      (.release sem (- (count jobs) @n-submitted))
+                                      (throw e))))
                                 ;; No jobs in DB — wait for wake or poll interval
                                 (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
                             ;; All slots busy — wait for a job to complete or wake
                             (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
-                        ;; Periodic reconciliation. availablePermits is a racy read —
-                        ;; a job could complete between drainPermits and here — but
-                        ;; that's fine: the check is a heuristic to skip reconciliation
-                        ;; when the worker is clearly saturated. False negatives just
-                        ;; defer reconciliation to the next eligible cycle.
-                        (when (and (zero? (mod poll-count reconcile-interval-polls))
-                                   (pos? (.availablePermits sem)))
+                        ;; Periodic reconciliation — catches terminal events that
+                        ;; weren't dispatched due to crashes. Skips first iteration
+                        ;; (poll-count 0) since no work has been done yet.
+                        (when (and (pos? poll-count)
+                                   (zero? (mod poll-count reconcile-interval-polls)))
                           (reconcile-undispatched! pool event-queue env exec-opts))
                         (catch InterruptedException e
                           (.interrupt (Thread/currentThread))
@@ -411,13 +418,15 @@
                                {:vme e :restart-count restart-count}))]
                 (if-let [e (:vme result)]
                   (if (and @running (< restart-count 3))
-                    (let [backoff-ms (* 1000 (inc restart-count))]
+                    (let [n (inc restart-count)
+                          backoff-ms (* 1000 n)]
+                      (reset! restart-count* n)
                       (log/error e "Coordinator died, restarting after backoff"
                                  {:owner-id owner-id
-                                  :restart-count (inc restart-count)
+                                  :restart-count n
                                   :backoff-ms backoff-ms})
                       (Thread/sleep backoff-ms)
-                      (recur (inc restart-count)))
+                      (recur n))
                     (do
                       (log/error e "Coordinator giving up after repeated failures"
                                  {:owner-id owner-id
@@ -450,12 +459,14 @@
                     (shutdown-executor! executor owner-id shutdown-timeout-ms)
                     (finally
                       (.countDown stop-done)))
-                  ;; Second caller waits for the first stop! to complete
-                  (.await stop-done)))
+                  ;; Second caller waits for the first stop! to complete.
+                  ;; Bounded to avoid hanging if first caller's thread dies.
+                  (.await stop-done (* 4 shutdown-timeout-ms) TimeUnit/MILLISECONDS)))
        :wake! (fn []
                 (.offer wake-signal :wake))
        :alive? (fn []
-                 (and @running (not (future-done? worker-future))))})))
+                 (and @running (not (future-done? worker-future))))
+       :restart-count (fn [] @restart-count*)})))
 
 (defn wake!
   "Wake the worker to check for new jobs immediately.
