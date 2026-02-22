@@ -397,7 +397,34 @@
                               (.interrupt (Thread/currentThread))))))
                       (recur (inc poll-count))))
                   (log/info "Job worker stopped" {:owner-id owner-id}))]
-    (let [worker-future (future (loop-fn))
+    (let [;; Supervisor: restart the coordinator after VirtualMachineError
+          ;; with exponential backoff (1s, 2s, 3s). After 3 consecutive
+          ;; failures, re-throw and let the worker die. Callers can detect
+          ;; this via :alive? and restart the entire worker.
+          supervised-loop-fn
+          (fn []
+            (loop [restart-count 0]
+              (let [result (try
+                             (loop-fn)
+                             {:exit true}
+                             (catch VirtualMachineError e
+                               {:vme e :restart-count restart-count}))]
+                (if-let [e (:vme result)]
+                  (if (and @running (< restart-count 3))
+                    (let [backoff-ms (* 1000 (inc restart-count))]
+                      (log/error e "Coordinator died, restarting after backoff"
+                                 {:owner-id owner-id
+                                  :restart-count (inc restart-count)
+                                  :backoff-ms backoff-ms})
+                      (Thread/sleep backoff-ms)
+                      (recur (inc restart-count)))
+                    (do
+                      (log/error e "Coordinator giving up after repeated failures"
+                                 {:owner-id owner-id
+                                  :restart-count restart-count})
+                      (throw e)))
+                  nil))))
+          worker-future (future (supervised-loop-fn))
           stop-done (java.util.concurrent.CountDownLatch. 1)]
       {:stop! (fn []
                 (if (compare-and-set! stopping? false true)
