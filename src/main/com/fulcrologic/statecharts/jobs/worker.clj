@@ -371,11 +371,17 @@
                   (log/info "Job worker stop requested" {:owner-id owner-id})
                   (reset! running false)
                   (.offer wake-signal :stop)
-                  (shutdown-executor! executor owner-id shutdown-timeout-ms)
-                  (when (= :timeout (deref worker-future shutdown-timeout-ms :timeout))
-                    (log/warn "Worker loop did not stop before timeout"
-                              {:owner-id owner-id
-                               :shutdown-timeout-ms shutdown-timeout-ms}))))
+                  ;; Wait for coordinator loop to finish before shutting down
+                  ;; executor. This ensures any in-flight claim-jobs! completes
+                  ;; and submits its jobs before the executor rejects new work.
+                  ;; No timeout — the loop WILL exit because @running is false;
+                  ;; it just needs to finish its current iteration.
+                  (try
+                    @worker-future
+                    (catch Exception e
+                      (log/warn e "Worker loop ended with error"
+                                {:owner-id owner-id})))
+                  (shutdown-executor! executor owner-id shutdown-timeout-ms)))
        :wake! (fn []
                 (.offer wake-signal :wake))})))
 
