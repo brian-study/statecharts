@@ -14,12 +14,11 @@
    - Exponential backoff for retryable failures"
   (:require
    [com.fulcrologic.statecharts.events :as evts]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
    [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
    [com.fulcrologic.statecharts.protocols :as sp]
    [taoensso.timbre :as log])
   (:import
-   [java.util.concurrent LinkedBlockingQueue TimeUnit]))
+   [java.util.concurrent Callable ExecutorService Executors LinkedBlockingQueue RejectedExecutionException Semaphore TimeUnit]))
 
 ;; -----------------------------------------------------------------------------
 ;; Optimistic Retry (I5)
@@ -189,12 +188,58 @@
     (catch Exception e
       (log/warn e "Reconciliation loop error"))))
 
+(defn- execute-claimed-job!
+  [pool event-queue env handlers owner-id exec-opts job]
+  (let [job-type (:job-type job)
+        handler-fn (or (get handlers (keyword job-type))
+                       (get handlers job-type))]
+    (if handler-fn
+      (execute-job! pool event-queue env job handler-fn owner-id exec-opts)
+      (do
+        (log/error "No handler registered for job type"
+                   {:job-type job-type :job-id (:id job)})
+        (let [error {:message (str "No handler for job type: " job-type)}
+              invokeid (:invokeid job)
+              error-event-name (pr-str (evts/invoke-error-event invokeid))
+              event-data (merge error {:job-id (str (:id job))})]
+          (when (= :failed
+                   (job-store/fail! pool (:id job) owner-id
+                                    (:max-attempts job)
+                                    (:max-attempts job)
+                                    error error-event-name event-data))
+            (when (dispatch-terminal-event! event-queue env
+                    (assoc job :terminal-event-name error-event-name
+                               :terminal-event-data event-data)
+                    exec-opts)
+              (job-store/mark-terminal-event-dispatched! pool (:id job)))))))))
+
+(defn- shutdown-executor!
+  [^ExecutorService executor owner-id shutdown-timeout-ms]
+  (when executor
+    (.shutdown executor)
+    (try
+      (when-not (.awaitTermination executor shutdown-timeout-ms TimeUnit/MILLISECONDS)
+        (log/warn "Worker executor did not stop in time, forcing shutdownNow"
+                  {:owner-id owner-id :shutdown-timeout-ms shutdown-timeout-ms})
+        (.shutdownNow executor)
+        (when-not (.awaitTermination executor shutdown-timeout-ms TimeUnit/MILLISECONDS)
+          (log/warn "Worker executor still running after shutdownNow"
+                    {:owner-id owner-id :shutdown-timeout-ms shutdown-timeout-ms})))
+      (catch InterruptedException e
+        (.shutdownNow executor)
+        (.interrupt (Thread/currentThread))
+        (log/warn e "Interrupted while stopping worker executor"
+                  {:owner-id owner-id})))))
+
 ;; -----------------------------------------------------------------------------
 ;; Worker Lifecycle
 ;; -----------------------------------------------------------------------------
 
 (defn start-worker!
-  "Start a background job worker.
+  "Start a background job worker with demand-driven claiming.
+
+   The worker tracks available concurrency slots. As soon as a job finishes,
+   the coordinator claims more work to fill the freed slot. No batch wait.
 
    Options:
    - :pool - pg2 connection pool (REQUIRED)
@@ -203,96 +248,226 @@
    - :handlers - Map of job-type keyword to handler fn (REQUIRED)
    - :owner-id - Unique worker identifier (optional, auto-generated)
    - :poll-interval-ms - How often to check for jobs when idle (default 1000)
-   - :claim-limit - Max jobs to claim per poll (default 5)
+   - :claim-limit - Max jobs to claim per poll (default 5). Clamped to concurrency
+     internally: effective-claim-limit = min(claim-limit, concurrency)
+   - :concurrency - Max concurrent job executions (default claim-limit)
    - :lease-duration-seconds - How long a lease lasts (default 60)
    - :update-data-by-id-fn - Function to update data model by session-id (REQUIRED)
    - :get-session-state-fn - Function to check session state for I3/I4 (optional)
    - :wake-event-loop-fn - Function to wake event loop after terminal dispatch (optional)
    - :max-update-retries - Max retries for optimistic lock conflicts (default 5)
    - :reconcile-interval-polls - Run reconciliation every N polls (default 10)
+   - :shutdown-timeout-ms - Wait timeout for executor shutdown (default 5000)
 
    Handlers receive: {:keys [job-id params session-id update-fn continue-fn]}
    - update-fn: (fn [session-id data-map]) - update data model with retry
    - continue-fn: (fn []) - returns true if worker should continue, false to stop
 
-   Returns a map with :stop! and :wake! functions."
+   Returns a map with :stop!, :wake!, :alive?, and :restart-count functions.
+   - :alive? returns true if the coordinator loop is still running
+   - :restart-count returns the number of supervisor restarts after VirtualMachineError
+   `stop!` blocks for up to ~4x shutdown-timeout-ms (2x for coordinator drain + 2x for executor shutdown).
+
+   NOTE: Dynamic bindings active at start-worker! call time are captured via bound-fn
+   and propagated to all handler invocations on executor threads. If your handlers rely
+   on dynamic vars (e.g., *conn*, *env*), ensure they are bound when calling start-worker!."
   [{:keys [pool event-queue env handlers owner-id
-           poll-interval-ms claim-limit lease-duration-seconds
+           poll-interval-ms claim-limit concurrency
+           lease-duration-seconds
            update-data-by-id-fn get-session-state-fn wake-event-loop-fn
-           max-update-retries reconcile-interval-polls]
+           max-update-retries reconcile-interval-polls shutdown-timeout-ms]
     :or {owner-id (str "worker-" (random-uuid))
          poll-interval-ms 1000
          claim-limit 5
          lease-duration-seconds 60
          max-update-retries 5
-         reconcile-interval-polls 10}}]
+         reconcile-interval-polls 10
+         shutdown-timeout-ms 5000}}]
   (assert pool "pool is required")
   (assert event-queue "event-queue is required")
   (assert env "env is required")
   (assert handlers "handlers map is required")
   (assert update-data-by-id-fn "update-data-by-id-fn is required")
   (let [running (atom true)
-        wake-signal (LinkedBlockingQueue.)
+        stopping? (atom false)
+        restart-count* (atom 0)
+        wake-signal (LinkedBlockingQueue. 1)
+        concurrency (max 1 (long (or concurrency claim-limit)))
+        claim-limit (max 1 (long claim-limit))
+        effective-claim-limit (min claim-limit concurrency)
+        executor (Executors/newFixedThreadPool (int concurrency))
+        sem (Semaphore. concurrency)
         exec-opts {:lease-duration-seconds lease-duration-seconds
                    :update-data-by-id-fn update-data-by-id-fn
                    :get-session-state-fn get-session-state-fn
                    :wake-event-loop-fn wake-event-loop-fn
                    :max-update-retries max-update-retries}
+        ;; Preserve dynamic bindings from start-worker! caller so handlers that
+        ;; rely on dynamic vars keep working under concurrent execution.
+        ;; Note: no @running/@stopping? guard here — once a job is claimed from
+        ;; the DB and submitted to the executor, it MUST execute. The executor's
+        ;; awaitTermination handles draining on shutdown. Skipping would orphan
+        ;; the claimed job until its lease expires.
+        execute-one-job! (bound-fn [job]
+                           (execute-claimed-job! pool event-queue env handlers owner-id exec-opts job))
+        submit-job! (fn [job]
+                      (try
+                        (.submit ^ExecutorService executor
+                          ^Callable (fn []
+                            (try
+                              (execute-one-job! job)
+                              (finally
+                                (.release sem)
+                                (.offer wake-signal :job-done)))))
+                        (catch Exception e
+                          ;; Release permit for any submission failure (not just
+                          ;; RejectedExecutionException) to prevent permit leak
+                          (.release sem)
+                          (when-not (instance? RejectedExecutionException e)
+                            (log/error e "Failed to submit job to executor"
+                                       {:job-id (:id job)}))
+                          ;; Expire the lease so another worker can reclaim
+                          ;; immediately rather than waiting for full lease
+                          ;; duration (60-300s in production). This applies to
+                          ;; ALL submission failures including REE (shutdown).
+                          (try
+                            (job-store/heartbeat! pool (:id job) owner-id 0)
+                            (catch Exception he
+                              (log/warn he "Failed to expire lease for unsubmitted job"
+                                        {:job-id (:id job)}))))))
         loop-fn (fn []
                   (log/info "Job worker started"
                             {:owner-id owner-id
                              :poll-interval-ms poll-interval-ms
                              :claim-limit claim-limit
+                             :effective-claim-limit effective-claim-limit
+                             :concurrency concurrency
                              :handler-types (vec (keys handlers))})
                   (loop [poll-count 0]
                     (when @running
                       (try
-                        ;; Claim and execute jobs
-                        (let [jobs (job-store/claim-jobs! pool
-                                    {:owner-id owner-id
-                                     :lease-duration-seconds lease-duration-seconds
-                                     :limit claim-limit})]
-                          (doseq [job jobs]
-                            (when @running
-                              (let [job-type (:job-type job)
-                                    handler-fn (or (get handlers (keyword job-type))
-                                                   (get handlers job-type))]
-                                (if handler-fn
-                                  (execute-job! pool event-queue env job handler-fn owner-id exec-opts)
-                                  (do
-                                    (log/error "No handler registered for job type"
-                                              {:job-type job-type :job-id (:id job)})
-                                    (let [error {:message (str "No handler for job type: " job-type)}
-                                          invokeid (:invokeid job)
-                                          error-event-name (pr-str (evts/invoke-error-event invokeid))
-                                          event-data (merge error {:job-id (str (:id job))})]
-                                      (when (= :failed
-                                               (job-store/fail! pool (:id job) owner-id
-                                                                (:max-attempts job)
-                                                                (:max-attempts job)
-                                                                error error-event-name event-data))
-                                        (when (dispatch-terminal-event! event-queue env
-                                                (assoc job :terminal-event-name error-event-name
-                                                           :terminal-event-data event-data)
-                                                exec-opts)
-                                          (job-store/mark-terminal-event-dispatched! pool (:id job)))))))))))
-                        ;; Periodic reconciliation
-                        (when (zero? (mod poll-count reconcile-interval-polls))
+                        (let [available (.drainPermits sem)]
+                          (if (pos? available)
+                            ;; Capacity available — claim up to available jobs
+                            (let [jobs (try
+                                         (job-store/claim-jobs! pool
+                                           {:owner-id owner-id
+                                            :lease-duration-seconds lease-duration-seconds
+                                            :limit (min available effective-claim-limit)})
+                                         (catch Throwable e
+                                           ;; Restore all drained permits so the semaphore
+                                           ;; doesn't get stuck at 0 on claim failure.
+                                           ;; Catches Throwable (not just Exception) so
+                                           ;; Errors don't leak permits either.
+                                           (.release sem available)
+                                           (throw e)))]
+                              ;; Return permits for slots we didn't fill
+                              (.release sem (- available (count jobs)))
+                              (if (seq jobs)
+                                (let [n-submitted (atom 0)]
+                                  (try
+                                    (doseq [job jobs]
+                                      (submit-job! job)
+                                      (swap! n-submitted inc))
+                                    (catch Throwable e
+                                      ;; Release permits for jobs we didn't get to submit
+                                      (.release sem (- (count jobs) @n-submitted))
+                                      (throw e))))
+                                ;; No jobs in DB — wait for wake or poll interval
+                                (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
+                            ;; All slots busy — wait for a job to complete or wake
+                            (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
+                        ;; Periodic reconciliation — catches terminal events that
+                        ;; weren't dispatched due to crashes. Skips first iteration
+                        ;; (poll-count 0) since no work has been done yet.
+                        (when (and (pos? poll-count)
+                                   (zero? (mod poll-count reconcile-interval-polls)))
                           (reconcile-undispatched! pool event-queue env exec-opts))
-                        (catch Exception e
-                          (log/error e "Job worker error" {:owner-id owner-id})))
-                      ;; Wait for wake or poll interval
-                      (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)
+                        (catch InterruptedException e
+                          (.interrupt (Thread/currentThread))
+                          (log/warn "Worker thread interrupted" {:owner-id owner-id}))
+                        (catch VirtualMachineError e
+                          (throw e))
+                        (catch Throwable e
+                          (log/error e "Job worker error" {:owner-id owner-id})
+                          ;; Backoff before retrying. Without this, a flapping DB
+                          ;; causes the coordinator to spin at CPU speed because
+                          ;; drainPermits returns all permits (released in claim
+                          ;; catch) and claim-jobs! is called again immediately.
+                          ;; Wrapped in try/catch because .poll() can throw
+                          ;; InterruptedException if the thread is interrupted
+                          ;; (e.g., by future-cancel during stop!). Without this,
+                          ;; the IE propagates uncaught from the catch handler and
+                          ;; kills the coordinator loop.
+                          (try
+                            (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)
+                            (catch InterruptedException _
+                              (.interrupt (Thread/currentThread))))))
                       (recur (inc poll-count))))
                   (log/info "Job worker stopped" {:owner-id owner-id}))]
-    (future (loop-fn))
-    ;; Return map with stop and wake functions
-    {:stop! (fn []
-              (log/info "Job worker stop requested" {:owner-id owner-id})
-              (reset! running false)
-              (.offer wake-signal :stop))
-     :wake! (fn []
-              (.offer wake-signal :wake))}))
+    (let [;; Supervisor: restart the coordinator after VirtualMachineError
+          ;; with exponential backoff (1s, 2s, 3s). After 3 consecutive
+          ;; failures, re-throw and let the worker die. Callers can detect
+          ;; this via :alive? and restart the entire worker.
+          supervised-loop-fn
+          (fn []
+            (loop [restart-count 0]
+              (let [result (try
+                             (loop-fn)
+                             {:exit true}
+                             (catch VirtualMachineError e
+                               {:vme e :restart-count restart-count}))]
+                (if-let [e (:vme result)]
+                  (if (and @running (< restart-count 3))
+                    (let [n (inc restart-count)
+                          backoff-ms (* 1000 n)]
+                      (reset! restart-count* n)
+                      (log/error e "Coordinator died, restarting after backoff"
+                                 {:owner-id owner-id
+                                  :restart-count n
+                                  :backoff-ms backoff-ms})
+                      (Thread/sleep backoff-ms)
+                      (recur n))
+                    (do
+                      (log/error e "Coordinator giving up after repeated failures"
+                                 {:owner-id owner-id
+                                  :restart-count restart-count})
+                      (throw e)))
+                  nil))))
+          worker-future (future (supervised-loop-fn))
+          stop-done (java.util.concurrent.CountDownLatch. 1)]
+      {:stop! (fn []
+                (if (compare-and-set! stopping? false true)
+                  (try
+                    (log/info "Job worker stop requested" {:owner-id owner-id})
+                    (reset! running false)
+                    (.offer wake-signal :stop)
+                    ;; Wait for coordinator loop to finish before shutting down
+                    ;; executor. This ensures any in-flight claim-jobs! completes
+                    ;; and submits its jobs before the executor rejects new work.
+                    ;; Timeout prevents stop! from hanging if the coordinator is
+                    ;; stuck in a hung DB query (connection pool exhaustion, etc.).
+                    (try
+                      (deref worker-future (* 2 shutdown-timeout-ms) nil)
+                      (catch Exception e
+                        (log/warn e "Worker loop ended with error"
+                                  {:owner-id owner-id})))
+                    (when-not (future-done? worker-future)
+                      (log/warn "Coordinator did not exit in time, cancelling"
+                                {:owner-id owner-id
+                                 :timeout-ms (* 2 shutdown-timeout-ms)})
+                      (future-cancel worker-future))
+                    (shutdown-executor! executor owner-id shutdown-timeout-ms)
+                    (finally
+                      (.countDown stop-done)))
+                  ;; Second caller waits for the first stop! to complete.
+                  ;; Bounded to avoid hanging if first caller's thread dies.
+                  (.await stop-done (* 4 shutdown-timeout-ms) TimeUnit/MILLISECONDS)))
+       :wake! (fn []
+                (.offer wake-signal :wake))
+       :alive? (fn []
+                 (and @running (not (future-done? worker-future))))
+       :restart-count (fn [] @restart-count*)})))
 
 (defn wake!
   "Wake the worker to check for new jobs immediately.
