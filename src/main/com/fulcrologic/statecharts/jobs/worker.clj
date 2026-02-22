@@ -325,15 +325,16 @@
                           (.release sem)
                           (when-not (instance? RejectedExecutionException e)
                             (log/error e "Failed to submit job to executor"
-                                       {:job-id (:id job)})
-                            ;; Expire the lease so another worker can reclaim
-                            ;; immediately rather than waiting for full lease
-                            ;; duration (60-300s in production).
-                            (try
-                              (job-store/heartbeat! pool (:id job) owner-id 0)
-                              (catch Exception he
-                                (log/warn he "Failed to expire lease for unsubmitted job"
-                                          {:job-id (:id job)})))))))
+                                       {:job-id (:id job)}))
+                          ;; Expire the lease so another worker can reclaim
+                          ;; immediately rather than waiting for full lease
+                          ;; duration (60-300s in production). This applies to
+                          ;; ALL submission failures including REE (shutdown).
+                          (try
+                            (job-store/heartbeat! pool (:id job) owner-id 0)
+                            (catch Exception he
+                              (log/warn he "Failed to expire lease for unsubmitted job"
+                                        {:job-id (:id job)}))))))
         loop-fn (fn []
                   (log/info "Job worker started"
                             {:owner-id owner-id

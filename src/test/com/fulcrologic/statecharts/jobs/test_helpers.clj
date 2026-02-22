@@ -185,7 +185,8 @@
          (on-start job-id params))
        (Thread/sleep delay-ms)
        (let [continue? (when continue-fn (continue-fn))]
-         (swap! tracker update :continue-results conj continue?)
+         (when tracker
+           (swap! tracker update :continue-results conj continue?))
          (when on-finish
            (on-finish job-id params))
          {:job-id job-id
@@ -206,7 +207,8 @@
         (Thread/sleep delay-ms)
         (let [job-index (:job-index params)
               continue? (when continue-fn (continue-fn))]
-          (swap! tracker update :continue-results conj continue?)
+          (when tracker
+            (swap! tracker update :continue-results conj continue?))
           (if (contains? fail-job-indexes job-index)
             (throw (ex-info "Injected benchmark failure"
                             {:job-id job-id :job-index job-index}))
@@ -226,7 +228,8 @@
          (deliver started-promise true))
        (Thread/sleep sleep-ms)
        (let [continue? (when continue-fn (continue-fn))]
-         (swap! tracker update :continue-results conj continue?)
+         (when tracker
+           (swap! tracker update :continue-results conj continue?))
          {:job-id job-id
           :worker (or worker-tag "slow")
           :continue-after-sleep continue?})
