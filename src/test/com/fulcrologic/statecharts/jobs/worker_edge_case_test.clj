@@ -8,161 +8,18 @@
      clj -M:test -e \"(require '[com.fulcrologic.statecharts.jobs.worker-edge-case-test :as edge] :reload) ...\""
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
+   [com.fulcrologic.statecharts.jobs.test-helpers :as th]
    [com.fulcrologic.statecharts.jobs.worker :as worker]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
-   [com.fulcrologic.statecharts.protocols :as sp]
-   [pg.core :as pg]
-   [pg.pool :as pool]
-   [taoensso.timbre :as log])
+   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store])
   (:import
-   [java.util UUID]
-   [java.util.concurrent CountDownLatch Semaphore TimeUnit]))
+   [java.util.concurrent CountDownLatch TimeUnit]))
 
 ;; -----------------------------------------------------------------------------
-;; Test Configuration / Fixtures
+;; Fixtures — delegate to shared helpers
 ;; -----------------------------------------------------------------------------
 
-(def ^:private test-config
-  {:host (or (System/getenv "PG_TEST_HOST") "localhost")
-   :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :database (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :user (or (System/getenv "PG_TEST_USER") "postgres")
-   :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
-
-(def ^:dynamic *pool* nil)
-
-(defn with-pool [f]
-  (let [p (pool/pool test-config)]
-    (try
-      (binding [*pool* p]
-        (f))
-      (finally
-        (pool/close p)))))
-
-(defn with-clean-tables [f]
-  (schema/create-tables! *pool*)
-  (schema/truncate-tables! *pool*)
-  (try
-    (f)
-    (finally
-      (schema/truncate-tables! *pool*))))
-
-(use-fixtures :once with-pool)
-(use-fixtures :each with-clean-tables)
-
-;; -----------------------------------------------------------------------------
-;; Helpers (duplicated from worker_benchmark_test)
-;; -----------------------------------------------------------------------------
-
-(def ^:private terminal-statuses
-  #{"succeeded" "failed" "cancelled"})
-
-(defn noop-update-data-by-id-fn
-  [_session-id _data-updates]
-  nil)
-
-(defn make-tracking-event-queue []
-  (let [events (atom [])]
-    {:events events
-     :queue (reify sp/EventQueue
-              (send! [_ _env send-request]
-                (swap! events conj send-request)
-                true)
-              (cancel! [_ _env _session-id _send-id]
-                true)
-              (receive-events! [_ _env _handler]
-                nil)
-              (receive-events! [_ _env _handler _options]
-                nil))}))
-
-(defn create-n-jobs!
-  ([pool n]
-   (create-n-jobs! pool n {}))
-  ([pool n {:keys [job-type max-attempts payload-fn]
-            :or {job-type "test-job"
-                 max-attempts 1
-                 payload-fn (fn [idx] {:job-index idx})}}]
-   (let [run-id (subs (str (random-uuid)) 0 8)]
-     (mapv
-      (fn [idx]
-        (let [job-id (UUID/randomUUID)]
-          (job-store/create-job! pool
-            {:id job-id
-             :session-id (keyword (str "edge-session-" run-id "-" idx))
-             :invokeid (keyword (str "edge-invoke-" run-id "-" idx))
-             :job-type job-type
-             :payload (payload-fn idx)
-             :max-attempts max-attempts})
-          job-id))
-      (range n)))))
-
-(defn- get-job-row [pool job-id]
-  (pg/with-connection [c pool]
-    (let [rows (pg/execute c
-                 "SELECT * FROM statechart_jobs WHERE id = $1"
-                 {:params [job-id]
-                  :kebab-keys? true})]
-      (when-let [row (first rows)]
-        (-> row
-            (update :payload core/thaw)
-            (cond->
-              (:result row) (update :result core/thaw)
-              (:error row) (update :error core/thaw)
-              (:terminal-event-data row) (update :terminal-event-data core/thaw)))))))
-
-(defn- get-job-rows [pool job-ids]
-  (mapv #(get-job-row pool %) job-ids))
-
-(defn- wait-for-terminal-rows
-  [pool job-ids timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
-    (loop []
-      (let [rows (get-job-rows pool job-ids)]
-        (cond
-          (every? #(and % (contains? terminal-statuses (:status %))) rows)
-          rows
-
-          (>= (System/currentTimeMillis) deadline)
-          rows
-
-          :else
-          (do
-            (Thread/sleep 25)
-            (recur)))))))
-
-(defn- new-handler-tracker []
-  (atom {:in-flight 0
-         :max-in-flight 0
-         :started-at-ms {}
-         :finished-at-ms {}
-         :handler-latencies-ms {}
-         :calls []
-         :continue-results []}))
-
-(defn- mark-handler-start! [tracker job-id]
-  (when tracker
-    (let [now-ms (System/currentTimeMillis)]
-      (swap! tracker
-        (fn [{:keys [in-flight] :as state}]
-          (let [running (inc (long (or in-flight 0)))]
-            (-> state
-                (assoc :in-flight running)
-                (assoc-in [:started-at-ms job-id] now-ms)
-                (update :calls (fnil conj []) job-id)
-                (update :max-in-flight (fnil max 0) running))))))))
-
-(defn- mark-handler-stop! [tracker job-id]
-  (when tracker
-    (let [now-ms (System/currentTimeMillis)]
-      (swap! tracker
-        (fn [{:keys [in-flight] :as state}]
-          (let [start-ms (get-in state [:started-at-ms job-id] now-ms)]
-            (-> state
-                (assoc :in-flight (max 0 (dec (long (or in-flight 0)))))
-                (assoc-in [:finished-at-ms job-id] now-ms)
-                (assoc-in [:handler-latencies-ms job-id] (- now-ms start-ms)))))))))
+(use-fixtures :once th/with-pool)
+(use-fixtures :each th/with-clean-tables)
 
 ;; -----------------------------------------------------------------------------
 ;; Tests
@@ -172,36 +29,36 @@
   (testing "worker loop survives a claim-jobs! failure and processes jobs created after the failure"
     (let [call-count (atom 0)
           original-claim-jobs! job-store/claim-jobs!
-          tracker (new-handler-tracker)
-          {:keys [queue]} (make-tracking-event-queue)]
+          tracker (th/new-handler-tracker)
+          {:keys [queue]} (th/make-tracking-event-queue)]
       (with-redefs [job-store/claim-jobs!
                      (fn [pool opts]
                        (if (= 1 (swap! call-count inc))
                          (throw (ex-info "Simulated DB blip" {}))
                          (original-claim-jobs! pool opts)))]
         (let [worker (worker/start-worker!
-                       {:pool *pool*
+                       {:pool th/*pool*
                         :event-queue queue
                         :env {}
                         :handlers {"test-job" (fn [{:keys [job-id]}]
-                                                (mark-handler-start! tracker job-id)
+                                                (th/mark-handler-start! tracker job-id)
                                                 (try
                                                   {:job-id job-id}
                                                   (finally
-                                                    (mark-handler-stop! tracker job-id))))}
+                                                    (th/mark-handler-stop! tracker job-id))))}
                         :owner-id (str "claim-survive-" (random-uuid))
                         :poll-interval-ms 20
                         :claim-limit 2
                         :concurrency 2
                         :lease-duration-seconds 30
-                        :update-data-by-id-fn noop-update-data-by-id-fn})]
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
           (try
             ;; Wait for the first poll to fail
             (Thread/sleep 200)
             ;; Create jobs AFTER the failure
-            (let [job-ids (create-n-jobs! *pool* 3)]
+            (let [job-ids (th/create-n-jobs! th/*pool* 3 {:session-prefix "edge"})]
               ((:wake! worker))
-              (let [rows (wait-for-terminal-rows *pool* job-ids 10000)]
+              (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 10000)]
                 (is (every? #(= "succeeded" (:status %)) rows)
                     "All 3 jobs created after claim failure should succeed")
                 (is (= 3 (count (filter #(= "succeeded" (:status %)) rows))))
@@ -212,13 +69,12 @@
 
 (deftest ^:integration handler-throws-after-lease-lost-test
   (testing "handler throws after lease expires — fail! is ignored, Worker B completes the job"
-    (let [job-ids (create-n-jobs! *pool* 1 {:max-attempts 3})
-          job-id (first job-ids)
+    (let [job-ids (th/create-n-jobs! th/*pool* 1 {:max-attempts 3 :session-prefix "edge"})
           a-started (promise)
-          {:keys [queue]} (make-tracking-event-queue)
+          {:keys [queue]} (th/make-tracking-event-queue)
           ;; Worker A: signals start, sleeps past lease, then throws
           worker-a (worker/start-worker!
-                     {:pool *pool*
+                     {:pool th/*pool*
                       :event-queue queue
                       :env {}
                       :handlers {"test-job" (fn [{:keys [continue-fn]}]
@@ -231,7 +87,7 @@
                       :concurrency 1
                       :lease-duration-seconds 1
                       :shutdown-timeout-ms 5000
-                      :update-data-by-id-fn noop-update-data-by-id-fn})]
+                      :update-data-by-id-fn th/noop-update-data-by-id-fn})]
       (try
         (is (not= :timeout (deref a-started 5000 :timeout))
             "Worker A should start the job")
@@ -239,7 +95,7 @@
         (Thread/sleep 1500)
         ;; Start Worker B with a fast handler
         (let [worker-b (worker/start-worker!
-                         {:pool *pool*
+                         {:pool th/*pool*
                           :event-queue queue
                           :env {}
                           :handlers {"test-job" (fn [_ctx]
@@ -249,9 +105,9 @@
                           :claim-limit 1
                           :concurrency 1
                           :lease-duration-seconds 30
-                          :update-data-by-id-fn noop-update-data-by-id-fn})]
+                          :update-data-by-id-fn th/noop-update-data-by-id-fn})]
           (try
-            (let [rows (wait-for-terminal-rows *pool* job-ids 15000)
+            (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 15000)
                   row (first rows)]
               (is (= "succeeded" (:status row))
                   "Job should succeed via Worker B")
@@ -266,21 +122,22 @@
 
 (deftest ^:integration executor-saturation-rapid-claim-cycling-test
   (testing "tight concurrency=2 with claim-limit=1 and mixed delays processes all jobs"
-    (let [tracker (new-handler-tracker)
-          job-ids (create-n-jobs! *pool* 10
-                    {:payload-fn (fn [idx]
+    (let [tracker (th/new-handler-tracker)
+          job-ids (th/create-n-jobs! th/*pool* 10
+                    {:session-prefix "edge"
+                     :payload-fn (fn [idx]
                                    {:job-index idx
                                     :delay-ms (if (even? idx) 20 80)})})
-          {:keys [queue]} (make-tracking-event-queue)
+          {:keys [queue]} (th/make-tracking-event-queue)
           handler-fn (fn [{:keys [job-id params]}]
-                       (mark-handler-start! tracker job-id)
+                       (th/mark-handler-start! tracker job-id)
                        (try
                          (Thread/sleep (:delay-ms params))
                          {:job-id job-id :job-index (:job-index params)}
                          (finally
-                           (mark-handler-stop! tracker job-id))))
+                           (th/mark-handler-stop! tracker job-id))))
           worker (worker/start-worker!
-                   {:pool *pool*
+                   {:pool th/*pool*
                     :event-queue queue
                     :env {}
                     :handlers {"test-job" handler-fn}
@@ -289,9 +146,9 @@
                     :claim-limit 1
                     :concurrency 2
                     :lease-duration-seconds 30
-                    :update-data-by-id-fn noop-update-data-by-id-fn})]
+                    :update-data-by-id-fn th/noop-update-data-by-id-fn})]
       (try
-        (let [rows (wait-for-terminal-rows *pool* job-ids 10000)
+        (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 10000)
               t @tracker
               max-in-flight (:max-in-flight t)]
           (is (every? #(= "succeeded" (:status %)) rows)
@@ -309,8 +166,8 @@
     (let [claim-entered (atom 0)
           claim-latch (CountDownLatch. 1)
           original-claim-jobs! job-store/claim-jobs!
-          job-ids (create-n-jobs! *pool* 3 {:max-attempts 3})
-          {:keys [queue]} (make-tracking-event-queue)]
+          job-ids (th/create-n-jobs! th/*pool* 3 {:max-attempts 3 :session-prefix "edge"})
+          {:keys [queue]} (th/make-tracking-event-queue)]
       (with-redefs [job-store/claim-jobs!
                      (fn [pool opts]
                        (let [n (swap! claim-entered inc)]
@@ -319,7 +176,7 @@
                            (.await claim-latch 30 TimeUnit/SECONDS))
                          (original-claim-jobs! pool opts)))]
         (let [worker (worker/start-worker!
-                       {:pool *pool*
+                       {:pool th/*pool*
                         :event-queue queue
                         :env {}
                         :handlers {"test-job" (fn [_ctx] {:result "ok"})}
@@ -329,7 +186,7 @@
                         :concurrency 3
                         :lease-duration-seconds 2
                         :shutdown-timeout-ms 3000
-                        :update-data-by-id-fn noop-update-data-by-id-fn})]
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
           (try
             ;; Wait for claim-jobs! to be entered
             (loop [i 0]
@@ -350,7 +207,7 @@
       (Thread/sleep 3000)
       ;; Start a recovery worker (outside with-redefs so it uses real claim-jobs!)
       (let [worker-b (worker/start-worker!
-                       {:pool *pool*
+                       {:pool th/*pool*
                         :event-queue queue
                         :env {}
                         :handlers {"test-job" (fn [_ctx] {:result "recovered"})}
@@ -359,37 +216,37 @@
                         :claim-limit 3
                         :concurrency 3
                         :lease-duration-seconds 30
-                        :update-data-by-id-fn noop-update-data-by-id-fn})]
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
         (try
-          (let [rows (wait-for-terminal-rows *pool* job-ids 15000)]
-            (is (every? #(contains? terminal-statuses (:status %)) rows)
+          (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 15000)]
+            (is (every? #(contains? th/terminal-statuses (:status %)) rows)
                 "All 3 jobs should reach terminal status after recovery"))
           (finally
             ((:stop! worker-b))))))))
 
 (deftest ^:integration concurrent-stop-no-deadlock-test
   (testing "stop! called from two threads simultaneously — no deadlock, post-stop jobs unprocessed"
-    (let [tracker (new-handler-tracker)
-          job-ids (create-n-jobs! *pool* 5)
-          {:keys [queue]} (make-tracking-event-queue)
+    (let [tracker (th/new-handler-tracker)
+          job-ids (th/create-n-jobs! th/*pool* 5 {:session-prefix "edge"})
+          {:keys [queue]} (th/make-tracking-event-queue)
           worker (worker/start-worker!
-                   {:pool *pool*
+                   {:pool th/*pool*
                     :event-queue queue
                     :env {}
                     :handlers {"test-job" (fn [{:keys [job-id]}]
-                                            (mark-handler-start! tracker job-id)
+                                            (th/mark-handler-start! tracker job-id)
                                             (try
                                               (Thread/sleep 200)
                                               {:job-id job-id}
                                               (finally
-                                                (mark-handler-stop! tracker job-id))))}
+                                                (th/mark-handler-stop! tracker job-id))))}
                     :owner-id (str "concurrent-stop-" (random-uuid))
                     :poll-interval-ms 20
                     :claim-limit 5
                     :concurrency 5
                     :lease-duration-seconds 30
                     :shutdown-timeout-ms 3000
-                    :update-data-by-id-fn noop-update-data-by-id-fn})]
+                    :update-data-by-id-fn th/noop-update-data-by-id-fn})]
       ;; Let handler start processing
       (Thread/sleep 100)
       ;; Two concurrent stop! calls
@@ -400,9 +257,9 @@
         (is (not= :timeout r1) "First stop! should complete")
         (is (not= :timeout r2) "Second stop! should complete"))
       ;; Create jobs after stop — they should NOT be processed
-      (let [post-stop-ids (create-n-jobs! *pool* 3)]
+      (let [post-stop-ids (th/create-n-jobs! th/*pool* 3 {:session-prefix "edge"})]
         (Thread/sleep 500)
-        (let [rows (get-job-rows *pool* post-stop-ids)]
+        (let [rows (th/get-job-rows th/*pool* post-stop-ids)]
           (is (every? #(= "pending" (:status %)) rows)
               "Post-stop jobs should remain pending (worker is dead)"))))))
 
@@ -413,15 +270,15 @@
           first-result (promise)
           second-result (promise)
           proceed-latch (CountDownLatch. 1)
-          job-ids (create-n-jobs! *pool* 1)
-          {:keys [queue]} (make-tracking-event-queue)]
+          job-ids (th/create-n-jobs! th/*pool* 1 {:session-prefix "edge"})
+          {:keys [queue]} (th/make-tracking-event-queue)]
       (with-redefs [job-store/heartbeat!
                      (fn [pool job-id owner-id lease-duration-seconds]
                        (if @heartbeat-should-fail
                          (throw (ex-info "Simulated DB pool closed" {}))
                          (original-heartbeat! pool job-id owner-id lease-duration-seconds)))]
         (let [worker (worker/start-worker!
-                       {:pool *pool*
+                       {:pool th/*pool*
                         :event-queue queue
                         :env {}
                         :handlers {"test-job" (fn [{:keys [continue-fn]}]
@@ -437,7 +294,7 @@
                         :claim-limit 1
                         :concurrency 1
                         :lease-duration-seconds 60
-                        :update-data-by-id-fn noop-update-data-by-id-fn})]
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
           (try
             ;; Wait for first continue-fn call
             (let [r1 (deref first-result 10000 :timeout)]
@@ -456,32 +313,32 @@
 
 (deftest ^:integration wake-signal-flooding-no-adverse-effects-test
   (testing "1000 rapid wake! calls do not cause duplicate executions or exceed concurrency"
-    (let [tracker (new-handler-tracker)
-          job-ids (create-n-jobs! *pool* 5)
-          {:keys [queue]} (make-tracking-event-queue)
+    (let [tracker (th/new-handler-tracker)
+          job-ids (th/create-n-jobs! th/*pool* 5 {:session-prefix "edge"})
+          {:keys [queue]} (th/make-tracking-event-queue)
           worker (worker/start-worker!
-                   {:pool *pool*
+                   {:pool th/*pool*
                     :event-queue queue
                     :env {}
                     :handlers {"test-job" (fn [{:keys [job-id]}]
-                                            (mark-handler-start! tracker job-id)
+                                            (th/mark-handler-start! tracker job-id)
                                             (try
                                               (Thread/sleep 100)
                                               {:job-id job-id}
                                               (finally
-                                                (mark-handler-stop! tracker job-id))))}
+                                                (th/mark-handler-stop! tracker job-id))))}
                     :owner-id (str "wake-flood-" (random-uuid))
                     :poll-interval-ms 50
                     :claim-limit 2
                     :concurrency 2
                     :lease-duration-seconds 30
-                    :update-data-by-id-fn noop-update-data-by-id-fn})]
+                    :update-data-by-id-fn th/noop-update-data-by-id-fn})]
       (try
         ;; Flood with wake signals
         (dotimes [_ 1000]
           ((:wake! worker)))
         ;; Wait for all jobs to complete
-        (let [rows (wait-for-terminal-rows *pool* job-ids 10000)
+        (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 10000)
               t @tracker
               max-in-flight (:max-in-flight t)
               calls (:calls t)]
@@ -496,11 +353,11 @@
 
 (deftest ^:integration mass-failure-terminal-dispatch-exactly-once-test
   (testing "all jobs failing at max-attempts=1 — each job fails and gets terminal event dispatched"
-    (let [{:keys [queue events]} (make-tracking-event-queue)
-          job-ids (create-n-jobs! *pool* 20 {:max-attempts 1})
+    (let [{:keys [queue events]} (th/make-tracking-event-queue)
+          job-ids (th/create-n-jobs! th/*pool* 20 {:max-attempts 1 :session-prefix "edge"})
           job-id-strs (set (map str job-ids))
           worker (worker/start-worker!
-                   {:pool *pool*
+                   {:pool th/*pool*
                     :event-queue queue
                     :env {}
                     :handlers {"test-job" (fn [_ctx]
@@ -511,16 +368,16 @@
                     :concurrency 5
                     :lease-duration-seconds 30
                     :reconcile-interval-polls 10
-                    :update-data-by-id-fn noop-update-data-by-id-fn})]
+                    :update-data-by-id-fn th/noop-update-data-by-id-fn})]
       (try
-        (let [rows (wait-for-terminal-rows *pool* job-ids 15000)]
+        (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 15000)]
           (is (every? #(= "failed" (:status %)) rows)
               "All 20 jobs should fail")
           (is (= 20 (count (filter #(= "failed" (:status %)) rows)))))
         ;; Let reconciliation run to mark any undispatched
         (Thread/sleep 500)
         ;; Check terminal event dispatch in DB
-        (let [rows (get-job-rows *pool* job-ids)]
+        (let [rows (th/get-job-rows th/*pool* job-ids)]
           (is (every? #(some? (:terminal-event-dispatched-at %)) rows)
               "All jobs should have terminal-event-dispatched-at set"))
         ;; Check event queue: every job-id must appear at least once
@@ -535,13 +392,13 @@
 
 (deftest ^:integration lease-expiry-both-workers-complete-contention-test
   (testing "Worker A loses lease mid-execution, Worker B completes — only one terminal event"
-    (let [job-ids (create-n-jobs! *pool* 1 {:max-attempts 3})
+    (let [job-ids (th/create-n-jobs! th/*pool* 1 {:max-attempts 3 :session-prefix "edge"})
           job-id (first job-ids)
           a-started (promise)
-          {:keys [queue events]} (make-tracking-event-queue)
+          {:keys [queue events]} (th/make-tracking-event-queue)
           ;; Worker A: short lease, slow handler
           worker-a (worker/start-worker!
-                     {:pool *pool*
+                     {:pool th/*pool*
                       :event-queue queue
                       :env {}
                       :handlers {"test-job" (fn [{:keys [continue-fn]}]
@@ -554,7 +411,7 @@
                       :concurrency 1
                       :lease-duration-seconds 1
                       :shutdown-timeout-ms 5000
-                      :update-data-by-id-fn noop-update-data-by-id-fn})]
+                      :update-data-by-id-fn th/noop-update-data-by-id-fn})]
       (try
         (is (not= :timeout (deref a-started 5000 :timeout))
             "Worker A should start the job")
@@ -562,7 +419,7 @@
         (Thread/sleep 1500)
         ;; Start Worker B with a fast handler
         (let [worker-b (worker/start-worker!
-                         {:pool *pool*
+                         {:pool th/*pool*
                           :event-queue queue
                           :env {}
                           :handlers {"test-job" (fn [_ctx]
@@ -572,9 +429,9 @@
                           :claim-limit 1
                           :concurrency 1
                           :lease-duration-seconds 30
-                          :update-data-by-id-fn noop-update-data-by-id-fn})]
+                          :update-data-by-id-fn th/noop-update-data-by-id-fn})]
           (try
-            (let [rows (wait-for-terminal-rows *pool* job-ids 15000)
+            (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 15000)
                   row (first rows)]
               (is (= "succeeded" (:status row))
                   "Job should succeed")
@@ -596,12 +453,12 @@
 
 (deftest ^:integration coordinator-death-stop-returns-promptly-test
   (testing "stop! returns or throws promptly when coordinator thread has died from Error"
-    (let [{:keys [queue]} (make-tracking-event-queue)]
+    (let [{:keys [queue]} (th/make-tracking-event-queue)]
       (with-redefs [job-store/claim-jobs!
                      (fn [_pool _opts]
                        (throw (Error. "Simulated OOM")))]
         (let [worker (worker/start-worker!
-                       {:pool *pool*
+                       {:pool th/*pool*
                         :event-queue queue
                         :env {}
                         :handlers {"test-job" identity}
@@ -610,7 +467,7 @@
                         :claim-limit 1
                         :concurrency 1
                         :lease-duration-seconds 30
-                        :update-data-by-id-fn noop-update-data-by-id-fn})]
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
           ;; Wait for coordinator to die on first poll
           (Thread/sleep 200)
           ;; stop! should complete promptly (may throw ExecutionException from dead future)

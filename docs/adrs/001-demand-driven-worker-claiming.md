@@ -75,16 +75,20 @@ Per-worker claiming (used by Sidekiq, Faktory) is only viable with Redis, where 
 - Slightly more complex coordinator loop than the batch version (semaphore management)
 
 ### Neutral
-- `worker_missionary.clj` is simplified to a thin alias for `start-worker!`. The file is kept for backward compatibility but the missionary batch executor is removed
+- `worker_missionary.clj` was removed — no callers existed in any repo
 - The `:concurrency` option now means "how many jobs can run simultaneously" rather than "batch size." This is a more intuitive meaning
 
 ## Implementation
 
-### Files Changed
-- `projects/statecharts/src/main/com/fulcrologic/statecharts/jobs/worker.clj` -- rewrite poll loop with semaphore + per-job submission, remove `default-execute-batch!` and `execute-batch-fn`
-- `projects/statecharts/src/main/com/fulcrologic/statecharts/jobs/worker_missionary.clj` -- simplify to thin alias
+### Files Changed (this repo)
+- `src/main/com/fulcrologic/statecharts/jobs/worker.clj` -- rewrite poll loop with semaphore + per-job submission, remove `default-execute-batch!` and `execute-batch-fn`
+- `src/main/com/fulcrologic/statecharts/jobs/worker_missionary.clj` -- removed (no callers)
+- `src/test/com/fulcrologic/statecharts/jobs/test_helpers.clj` -- shared test infrastructure (fixtures, job creation, tracker, handler factories)
+- `src/test/com/fulcrologic/statecharts/jobs/worker_benchmark_test.clj` -- collapse redundant 3-approach tests to single runs
+- `src/test/com/fulcrologic/statecharts/jobs/worker_edge_case_test.clj` -- 10 edge-case tests (failure recovery, concurrency invariants, lifecycle)
+
+### Consumer-side changes (brian repo, already merged on main)
 - `projects/brian/src/main/brian/statecharts/runtime.clj` -- remove `:execute-batch-fn`, keep `:concurrency 5`
-- `projects/statecharts/src/test/com/fulcrologic/statecharts/jobs/worker_benchmark_test.clj` -- simplify approach routing
 
 ### Key Implementation Details
 - `Semaphore(concurrency)` starts with all permits available

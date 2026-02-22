@@ -249,7 +249,8 @@
    - :handlers - Map of job-type keyword to handler fn (REQUIRED)
    - :owner-id - Unique worker identifier (optional, auto-generated)
    - :poll-interval-ms - How often to check for jobs when idle (default 1000)
-   - :claim-limit - Max jobs to claim per poll (default 5)
+   - :claim-limit - Max jobs to claim per poll (default 5). Clamped to concurrency
+     internally: effective-claim-limit = min(claim-limit, concurrency)
    - :concurrency - Max concurrent job executions (default claim-limit)
    - :lease-duration-seconds - How long a lease lasts (default 60)
    - :update-data-by-id-fn - Function to update data model by session-id (REQUIRED)
@@ -264,7 +265,7 @@
    - continue-fn: (fn []) - returns true if worker should continue, false to stop
 
    Returns a map with :stop! and :wake! functions.
-   `stop!` blocks for up to ~2x shutdown-timeout-ms (executor shutdown + worker loop drain)."
+   `stop!` blocks for up to ~3x shutdown-timeout-ms (executor orderly + forced shutdown + worker loop drain)."
   [{:keys [pool event-queue env handlers owner-id
            poll-interval-ms claim-limit concurrency
            lease-duration-seconds
@@ -297,9 +298,12 @@
                    :max-update-retries max-update-retries}
         ;; Preserve dynamic bindings from start-worker! caller so handlers that
         ;; rely on dynamic vars keep working under concurrent execution.
+        ;; Note: no @running/@stopping? guard here — once a job is claimed from
+        ;; the DB and submitted to the executor, it MUST execute. The executor's
+        ;; awaitTermination handles draining on shutdown. Skipping would orphan
+        ;; the claimed job until its lease expires.
         execute-one-job! (bound-fn [job]
-                           (when (and @running (not @stopping?))
-                             (execute-claimed-job! pool event-queue env handlers owner-id exec-opts job)))
+                           (execute-claimed-job! pool event-queue env handlers owner-id exec-opts job))
         submit-job! (fn [job]
                       (try
                         (.submit ^ExecutorService executor
@@ -309,8 +313,13 @@
                               (finally
                                 (.release sem)
                                 (.offer wake-signal :job-done)))))
-                        (catch RejectedExecutionException _
-                          (.release sem))))
+                        (catch Exception e
+                          ;; Release permit for any submission failure (not just
+                          ;; RejectedExecutionException) to prevent permit leak
+                          (.release sem)
+                          (when-not (instance? RejectedExecutionException e)
+                            (log/error e "Failed to submit job to executor"
+                                       {:job-id (:id job)})))))
         loop-fn (fn []
                   (log/info "Job worker started"
                             {:owner-id owner-id
@@ -325,10 +334,16 @@
                         (let [available (.drainPermits sem)]
                           (if (pos? available)
                             ;; Capacity available — claim up to available jobs
-                            (let [jobs (job-store/claim-jobs! pool
-                                         {:owner-id owner-id
-                                          :lease-duration-seconds lease-duration-seconds
-                                          :limit (min available effective-claim-limit)})]
+                            (let [jobs (try
+                                         (job-store/claim-jobs! pool
+                                           {:owner-id owner-id
+                                            :lease-duration-seconds lease-duration-seconds
+                                            :limit (min available effective-claim-limit)})
+                                         (catch Exception e
+                                           ;; Restore all drained permits so the semaphore
+                                           ;; doesn't get stuck at 0 on claim failure
+                                           (.release sem available)
+                                           (throw e)))]
                               ;; Return permits for slots we didn't fill
                               (.release sem (- available (count jobs)))
                               (if (seq jobs)
@@ -338,14 +353,16 @@
                                 (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
                             ;; All slots busy — wait for a job to complete or wake
                             (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
+                        ;; Periodic reconciliation (skip when all slots busy to avoid
+                        ;; unnecessary DB load — reconciliation will run on next idle cycle)
+                        (when (and (zero? (mod poll-count reconcile-interval-polls))
+                                   (pos? (.availablePermits sem)))
+                          (reconcile-undispatched! pool event-queue env exec-opts))
                         (catch InterruptedException e
                           (.interrupt (Thread/currentThread))
                           (log/warn "Worker thread interrupted" {:owner-id owner-id}))
                         (catch Exception e
                           (log/error e "Job worker error" {:owner-id owner-id})))
-                      ;; Periodic reconciliation
-                      (when (zero? (mod poll-count reconcile-interval-polls))
-                        (reconcile-undispatched! pool event-queue env exec-opts))
                       (recur (inc poll-count))))
                   (log/info "Job worker stopped" {:owner-id owner-id}))]
     (let [worker-future (future (loop-fn))]
