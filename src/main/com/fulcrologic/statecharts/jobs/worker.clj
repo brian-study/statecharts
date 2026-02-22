@@ -322,7 +322,15 @@
                           (.release sem)
                           (when-not (instance? RejectedExecutionException e)
                             (log/error e "Failed to submit job to executor"
-                                       {:job-id (:id job)})))))
+                                       {:job-id (:id job)})
+                            ;; Expire the lease so another worker can reclaim
+                            ;; immediately rather than waiting for full lease
+                            ;; duration (60-300s in production).
+                            (try
+                              (job-store/heartbeat! pool (:id job) owner-id 0)
+                              (catch Exception he
+                                (log/warn he "Failed to expire lease for unsubmitted job"
+                                          {:job-id (:id job)})))))))
         loop-fn (fn []
                   (log/info "Job worker started"
                             {:owner-id owner-id
@@ -368,7 +376,12 @@
                           (.interrupt (Thread/currentThread))
                           (log/warn "Worker thread interrupted" {:owner-id owner-id}))
                         (catch Throwable e
-                          (log/error e "Job worker error" {:owner-id owner-id})))
+                          (log/error e "Job worker error" {:owner-id owner-id})
+                          ;; Backoff before retrying. Without this, a flapping DB
+                          ;; causes the coordinator to spin at CPU speed because
+                          ;; drainPermits returns all permits (released in claim
+                          ;; catch) and claim-jobs! is called again immediately.
+                          (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
                       (recur (inc poll-count))))
                   (log/info "Job worker stopped" {:owner-id owner-id}))]
     (let [worker-future (future (loop-fn))]

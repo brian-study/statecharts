@@ -9,7 +9,9 @@
    Bug 2: stop! throws to callers when coordinator thread died from Error
    Bug 3: Shutdown race leaves claimed jobs stuck until lease expiry
    Bug 4: stop! hangs indefinitely when claim-jobs! DB query hangs
-   Bug 5: Coordinator death from Error leaves worker silently dead"
+   Bug 5: Coordinator death from Error leaves worker silently dead
+   Bug 6: No backoff on claim failure — coordinator spins at CPU speed
+   Bug 7: submit failure abandons claimed job until lease expiry (code fix only)"
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
    [com.fulcrologic.statecharts.jobs.test-helpers :as th]
@@ -269,3 +271,67 @@
                        "Got " terminal "/3 terminal. "
                        "Statuses: " (frequencies (map :status rows)))))
             (try ((:stop! worker)) (catch Throwable _))))))))
+
+;; =============================================================================
+;; Bug 6: No backoff on claim failure — tight retry loop (regression)
+;; =============================================================================
+;;
+;; CORRECT behavior: when claim-jobs! throws repeatedly, the coordinator waits
+;;   at least poll-interval-ms between retries (matching original code behavior).
+;; BUG: claim failure propagates to catch Throwable, then immediately recurs.
+;;   drainPermits returns all permits (released in claim catch), so claim-jobs!
+;;   is called again with no delay. A flapping DB causes CPU spin.
+
+(deftest ^:integration claim-failure-must-backoff-before-retry-test
+  (testing "coordinator must not spin-loop when claim-jobs! throws repeatedly"
+    (let [call-timestamps (atom [])
+          {:keys [queue]} (th/make-tracking-event-queue)
+          poll-interval-ms 200]
+      (with-redefs [job-store/claim-jobs!
+                     (fn [_pool _opts]
+                       (swap! call-timestamps conj (System/currentTimeMillis))
+                       (throw (ex-info "Simulated DB down" {})))]
+        (let [worker (worker/start-worker!
+                       {:pool th/*pool*
+                        :event-queue queue
+                        :env {}
+                        :handlers {"test-job" identity}
+                        :owner-id (str "bug6-" (random-uuid))
+                        :poll-interval-ms poll-interval-ms
+                        :claim-limit 1
+                        :concurrency 1
+                        :lease-duration-seconds 30
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
+          ;; Let the coordinator attempt several cycles
+          (Thread/sleep 1500)
+          ((:stop! worker))
+          ;; With poll-interval-ms=200 and 1500ms runtime, we expect ~7 calls
+          ;; with proper backoff. Without backoff, we'd see hundreds/thousands.
+          (let [timestamps @call-timestamps
+                n (count timestamps)]
+            (is (< n 20)
+                (str "Expected <20 claim calls with backoff, got " n
+                     ". Without backoff the coordinator spins at CPU speed."))
+            ;; Verify minimum gap between consecutive calls
+            (when (>= n 2)
+              (let [gaps (mapv - (rest timestamps) (butlast timestamps))
+                    min-gap (apply min gaps)]
+                (is (>= min-gap (/ poll-interval-ms 2))
+                    (str "Min gap between retries was " min-gap "ms, "
+                         "expected >= " (/ poll-interval-ms 2) "ms. "
+                         "Gaps: " (take 5 gaps)))))))))))
+
+;; =============================================================================
+;; Bug 7: submit failure abandons claimed job until lease expiry
+;; =============================================================================
+;;
+;; CORRECT behavior: when .submit() throws non-REE, the claimed job's lease is
+;;   expired so another worker can reclaim immediately.
+;; BUG: permit is released but the job stays in "running" with this owner in DB
+;;   until lease expiry (300s in production).
+;;
+;; NOTE: The executor is internal, so we can't easily inject submit failures.
+;; The fix (heartbeat! with 0 duration to expire the lease) is tested
+;; indirectly — the code path is defensive and matches the same pattern used
+;; in the claim-jobs! catch block. The fix is small (3 lines) and the
+;; alternative (abandoning jobs for 300s) is clearly worse.
