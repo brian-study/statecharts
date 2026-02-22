@@ -386,7 +386,15 @@
                           ;; causes the coordinator to spin at CPU speed because
                           ;; drainPermits returns all permits (released in claim
                           ;; catch) and claim-jobs! is called again immediately.
-                          (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)))
+                          ;; Wrapped in try/catch because .poll() can throw
+                          ;; InterruptedException if the thread is interrupted
+                          ;; (e.g., by future-cancel during stop!). Without this,
+                          ;; the IE propagates uncaught from the catch handler and
+                          ;; kills the coordinator loop.
+                          (try
+                            (.poll wake-signal poll-interval-ms TimeUnit/MILLISECONDS)
+                            (catch InterruptedException _
+                              (.interrupt (Thread/currentThread))))))
                       (recur (inc poll-count))))
                   (log/info "Job worker stopped" {:owner-id owner-id}))]
     (let [worker-future (future (loop-fn))

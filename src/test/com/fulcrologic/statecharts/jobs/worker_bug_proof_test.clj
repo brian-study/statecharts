@@ -322,6 +322,74 @@
                          "Gaps: " (take 5 gaps)))))))))))
 
 ;; =============================================================================
+;; Bug 8: InterruptedException in catch-handler backoff poll crashes coordinator
+;; =============================================================================
+;;
+;; CORRECT behavior: the coordinator survives an InterruptedException thrown by
+;;   the backoff .poll() inside the catch Throwable handler.
+;; BUG: .poll() inside the catch Throwable handler is not wrapped in try/catch.
+;;   When the thread is interrupted while blocking on .poll() for backoff (after
+;;   a caught Throwable), the InterruptedException propagates uncaught and kills
+;;   the coordinator loop.
+;;
+;; Trigger: mock claim-jobs! to throw on every call, then externally interrupt
+;;   the coordinator thread while it's in the backoff .poll() inside the catch
+;;   Throwable handler. Note: we can't use Thread.interrupt() inside the mock
+;;   because Timbre's log/error (which runs between the throw and the poll)
+;;   incidentally consumes the interrupted flag via its internal deref call.
+;;   Instead, we capture the coordinator thread reference and interrupt it
+;;   externally from another thread, timed to hit during the backoff poll.
+
+(deftest ^:integration backoff-poll-interrupt-must-not-crash-coordinator-test
+  (testing "InterruptedException during error-handler backoff poll should not crash coordinator"
+    (let [coordinator-thread (atom nil)
+          call-count (atom 0)
+          original-claim! job-store/claim-jobs!
+          {:keys [queue]} (th/make-tracking-event-queue)]
+      ;; claim-jobs! always throws for the first few calls, capturing the
+      ;; coordinator thread on the first call so we can interrupt it externally.
+      (with-redefs [job-store/claim-jobs!
+                     (fn [pool opts]
+                       (let [n (swap! call-count inc)]
+                         (when (= n 1)
+                           (reset! coordinator-thread (Thread/currentThread)))
+                         (if (<= n 3)
+                           (throw (ex-info "Simulated DB error" {:call n}))
+                           (original-claim! pool opts))))]
+        (let [worker (worker/start-worker!
+                       {:pool th/*pool*
+                        :event-queue queue
+                        :env {}
+                        :handlers {"test-job" (fn [_] {:result "ok"})}
+                        :owner-id (str "bug8-" (random-uuid))
+                        :poll-interval-ms 2000
+                        :claim-limit 1
+                        :concurrency 1
+                        :lease-duration-seconds 30
+                        :update-data-by-id-fn th/noop-update-data-by-id-fn})]
+          ;; Wait for coordinator to enter the backoff .poll() after first failure
+          (Thread/sleep 200)
+          ;; Interrupt the coordinator while it's blocking on the backoff poll.
+          ;; BUG: InterruptedException from .poll() propagates uncaught, killing
+          ;; the coordinator loop. CORRECT: coordinator handles it and continues.
+          (when-let [t @coordinator-thread]
+            (.interrupt t))
+          ;; Wait for the coordinator to (hopefully) recover
+          (Thread/sleep 500)
+          (is (true? ((:alive? worker)))
+              "Coordinator should be alive after interrupt during backoff poll")
+          ;; Verify the coordinator is actually working by processing new jobs
+          (let [job-ids (th/create-n-jobs! th/*pool* 3 {:session-prefix "bug8"})]
+            ((:wake! worker))
+            (let [rows (th/wait-for-terminal-rows th/*pool* job-ids 10000)
+                  terminal (count (filter #(contains? th/terminal-statuses (:status %)) rows))]
+              (is (= 3 terminal)
+                  (str "All 3 jobs should succeed after coordinator recovered. "
+                       "Got " terminal "/3. "
+                       "Statuses: " (frequencies (map :status rows))))))
+          ((:stop! worker)))))))
+
+;; =============================================================================
 ;; Bug 7: submit failure abandons claimed job until lease expiry
 ;; =============================================================================
 ;;
