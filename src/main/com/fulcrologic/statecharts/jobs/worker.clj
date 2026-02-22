@@ -265,7 +265,7 @@
    - continue-fn: (fn []) - returns true if worker should continue, false to stop
 
    Returns a map with :stop! and :wake! functions.
-   `stop!` blocks for up to ~3x shutdown-timeout-ms (executor orderly + forced shutdown + worker loop drain)."
+   `stop!` blocks for up to ~4x shutdown-timeout-ms (2x for coordinator drain + 2x for executor shutdown)."
   [{:keys [pool event-queue env handlers owner-id
            poll-interval-ms claim-limit concurrency
            lease-duration-seconds
@@ -361,7 +361,7 @@
                         (catch InterruptedException e
                           (.interrupt (Thread/currentThread))
                           (log/warn "Worker thread interrupted" {:owner-id owner-id}))
-                        (catch Exception e
+                        (catch Throwable e
                           (log/error e "Job worker error" {:owner-id owner-id})))
                       (recur (inc poll-count))))
                   (log/info "Job worker stopped" {:owner-id owner-id}))]
@@ -374,13 +374,18 @@
                   ;; Wait for coordinator loop to finish before shutting down
                   ;; executor. This ensures any in-flight claim-jobs! completes
                   ;; and submits its jobs before the executor rejects new work.
-                  ;; No timeout — the loop WILL exit because @running is false;
-                  ;; it just needs to finish its current iteration.
+                  ;; Timeout prevents stop! from hanging if the coordinator is
+                  ;; stuck in a hung DB query (connection pool exhaustion, etc.).
                   (try
-                    @worker-future
+                    (deref worker-future (* 2 shutdown-timeout-ms) nil)
                     (catch Exception e
                       (log/warn e "Worker loop ended with error"
                                 {:owner-id owner-id})))
+                  (when-not (future-done? worker-future)
+                    (log/warn "Coordinator did not exit in time, cancelling"
+                              {:owner-id owner-id
+                               :timeout-ms (* 2 shutdown-timeout-ms)})
+                    (future-cancel worker-future))
                   (shutdown-executor! executor owner-id shutdown-timeout-ms)))
        :wake! (fn []
                 (.offer wake-signal :wake))})))
