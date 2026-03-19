@@ -283,13 +283,7 @@
   (let [events (get-all-events pool)
         violations (atom [])]
 
-    ;; I1: No event should be both claimed and processed
-    ;; (processed events may retain their claimed_by for audit,
-    ;;  but the semantics should be: once processed, not re-claimable)
-    ;; Actually, processed events retain claimed_at/claimed_by. This is fine.
-
-    ;; I2: Every processed event must have been claimed at some point
-    ;; (processed_at implies claimed_at was set during the processing transaction)
+    ;; I1: Every processed event must have been claimed at some point
     (doseq [e events]
       (when (and (:processed-at e) (nil? (:claimed-at e)))
         (swap! violations conj
@@ -297,25 +291,26 @@
                 :event-id (:id e)
                 :message "Event is processed but was never claimed"})))
 
-    ;; I3: No two unprocessed events should be claimed by the same worker
-    ;; for the same session at the same time (prevents duplicate processing)
-    (let [active-claims (->> events
-                             (filter #(and (:claimed-at %) (nil? (:processed-at %))))
-                             (group-by (juxt :claimed-by :target-session-id)))]
-      (doseq [[[worker session] claimed] active-claims]
-        (when (> (count claimed) 1)
-          ;; This is actually allowed - a worker can claim multiple events
-          ;; for the same session. The invariant is about SKIP LOCKED preventing
-          ;; concurrent claims, not about batch sizes.
-          nil)))
-
-    ;; I4: deliver_at must be set for all events
+    ;; I2: deliver_at must be set for all events
     (doseq [e events]
       (when (nil? (:deliver-at e))
         (swap! violations conj
                {:invariant :deliver-at-required
                 :event-id (:id e)
                 :message "Event missing deliver_at timestamp"})))
+
+    ;; I3: No event should be claimed by more than one worker at the same time.
+    ;; A single worker CAN claim multiple events (batch), but each event should
+    ;; have at most one claimed_by value when unprocessed.
+    ;; (This is a data consistency check, not a concurrency test.)
+    (let [unprocessed-claimed (->> events
+                                   (filter #(and (:claimed-at %) (nil? (:processed-at %)))))]
+      (doseq [e unprocessed-claimed]
+        (when (nil? (:claimed-by e))
+          (swap! violations conj
+                 {:invariant :claimed-has-worker
+                  :event-id (:id e)
+                  :message "Event has claimed_at but no claimed_by"}))))
 
     {:valid? (empty? @violations)
      :violations @violations}))
@@ -388,15 +383,21 @@
                   :job-id (:id j)
                   :message "Running job missing lease_expires_at"}))))
 
-    ;; I3: Terminal jobs (succeeded/failed) must NOT have lease
+    ;; I3: Terminal jobs (succeeded/failed/cancelled) must NOT have lease
     (doseq [j jobs]
-      (when (#{"succeeded" "failed"} (:status j))
+      (when (#{"succeeded" "failed" "cancelled"} (:status j))
         (when (:lease-owner j)
           (swap! violations conj
                  {:invariant :terminal-no-lease
                   :job-id (:id j)
                   :status (:status j)
-                  :message "Terminal job should not have lease_owner"}))))
+                  :message "Terminal job should not have lease_owner"}))
+        (when (:lease-expires-at j)
+          (swap! violations conj
+                 {:invariant :terminal-no-lease-expiry
+                  :job-id (:id j)
+                  :status (:status j)
+                  :message "Terminal job should not have lease_expires_at"}))))
 
     ;; I4: Attempt count must be <= max_attempts
     (doseq [j jobs]

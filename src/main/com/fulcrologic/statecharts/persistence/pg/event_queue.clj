@@ -227,7 +227,27 @@
                                  (log/info "Event released for retry"
                                            {:event-id event-id
                                             :event-name event-name
-                                            :target target})))))))]
+                                            :target target}))
+                               (catch Error e
+                                 (log/error e "Event handler threw a fatal error"
+                                            {:event-id event-id
+                                             :event-name event-name
+                                             :target target
+                                             :node-id node-id})
+                                 ;; Release this event's claim so it can be retried.
+                                 ;; Remaining claimed events in this batch will be
+                                 ;; recovered by stale claim timeout.
+                                 (try
+                                   (pg/with-tx [conn]
+                                     (release-claim! conn event-id))
+                                   (log/info "Event released for retry after fatal error"
+                                             {:event-id event-id
+                                              :event-name event-name
+                                              :target target})
+                                   (catch Throwable t
+                                     (log/error t "Failed to release claim after fatal error"
+                                                {:event-id event-id})))
+                                 (throw e)))))))]
       (if (pool/pool? pool)
         (pg/with-connection [c pool]
           (process-fn c))
@@ -259,7 +279,8 @@
    Returns the number of recovered events."
   ([pool] (recover-stale-claims! pool 30))
   ([pool timeout-seconds]
-   (let [sql {:update :statechart-events
+   (let [timeout-seconds (long timeout-seconds) ;; ensure numeric — prevent SQL injection
+         sql {:update :statechart-events
               :set {:claimed-at nil
                     :claimed-by nil}
               :where [:and
@@ -285,7 +306,8 @@
    Returns the number of purged events."
   ([pool] (purge-processed-events! pool 7))
   ([pool retention-days]
-   (let [sql {:delete-from :statechart-events
+   (let [retention-days (long retention-days) ;; ensure numeric — prevent SQL injection
+         sql {:delete-from :statechart-events
               :where [:and
                       [:is-not :processed-at nil]
                       [:< :processed-at [:raw (str "now() - interval '" retention-days " days'")]]]}

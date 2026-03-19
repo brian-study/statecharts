@@ -86,35 +86,31 @@
          :or {max-attempts 3}}]
   (with-conn pool
     (fn [conn]
-      (let [result (pg/execute conn
-                     (str "INSERT INTO statechart_jobs (id, session_id, invokeid, job_type, payload, max_attempts)"
-                          " VALUES ($1, $2, $3, $4, $5, $6)"
-                          " ON CONFLICT (session_id, invokeid) WHERE status IN ('pending', 'running')"
-                          " DO NOTHING"
-                          " RETURNING id")
-                     {:params [id
-                               (core/session-id->str session-id)
-                               (invokeid->str invokeid)
-                               job-type
-                               (core/freeze payload)
-                               max-attempts]
-                      :kebab-keys? true})]
-        (if-let [inserted-id (some-> (when (sequential? result) (first result)) :id)]
-          ;; INSERT succeeded — RETURNING row with id
-          inserted-id
-          ;; Some pg2 variants return summary maps for mutations.
-          ;; If we affected a row, the inserted id is the one we requested.
-          (if (pos? (core/affected-row-count result))
-            id
-            ;; Conflict — active job already exists, fetch its id
-            (let [existing (pg/execute conn
-                             (str "SELECT id FROM statechart_jobs"
-                                  " WHERE session_id = $1 AND invokeid = $2"
-                                  " AND status IN ('pending', 'running')")
-                             {:params [(core/session-id->str session-id)
-                                       (invokeid->str invokeid)]
-                              :kebab-keys? true})]
-              (:id (first existing)))))))))
+      (let [sid-str (core/session-id->str session-id)
+            iid-str (invokeid->str invokeid)
+            insert-sql (str "INSERT INTO statechart_jobs (id, session_id, invokeid, job_type, payload, max_attempts)"
+                            " VALUES ($1, $2, $3, $4, $5, $6)"
+                            " ON CONFLICT (session_id, invokeid) WHERE status IN ('pending', 'running')"
+                            " DO NOTHING"
+                            " RETURNING id")
+            insert-params [id sid-str iid-str job-type (core/freeze payload) max-attempts]
+            try-insert! (fn []
+                          (let [result (pg/execute conn insert-sql
+                                         {:params insert-params :kebab-keys? true})]
+                            (or (some-> (when (sequential? result) (first result)) :id)
+                                (when (pos? (core/affected-row-count result)) id))))
+            find-active (fn []
+                          (:id (first (pg/execute conn
+                                        (str "SELECT id FROM statechart_jobs"
+                                             " WHERE session_id = $1 AND invokeid = $2"
+                                             " AND status IN ('pending', 'running')")
+                                        {:params [sid-str iid-str]
+                                         :kebab-keys? true}))))]
+        (or (try-insert!)
+            (find-active)
+            ;; Race: active job was resolved between INSERT and SELECT.
+            ;; Retry the insert once.
+            (try-insert!))))))
 
 (defn claim-jobs!
   "Claim up to `limit` claimable jobs for this worker.
@@ -279,7 +275,10 @@
     (fn [conn]
       (let [result (pg/execute conn
                      (str "UPDATE statechart_jobs"
-                          " SET status = 'cancelled', updated_at = now()"
+                          " SET status = 'cancelled',"
+                          "     lease_owner = NULL,"
+                          "     lease_expires_at = NULL,"
+                          "     updated_at = now()"
                           " WHERE session_id = $1 AND invokeid = $2"
                           " AND status IN ('pending', 'running')"
                           " RETURNING id")
@@ -296,7 +295,10 @@
     (fn [conn]
       (let [result (pg/execute conn
                      (str "UPDATE statechart_jobs"
-                          " SET status = 'cancelled', updated_at = now()"
+                          " SET status = 'cancelled',"
+                          "     lease_owner = NULL,"
+                          "     lease_expires_at = NULL,"
+                          "     updated_at = now()"
                           " WHERE session_id = $1"
                           " AND status IN ('pending', 'running')"
                           " RETURNING id")
@@ -336,7 +338,8 @@
   [pool limit]
   (with-conn pool
     (fn [conn]
-      (let [rows (pg/execute conn
+      (let [limit (long limit) ;; ensure numeric — prevent SQL injection
+            rows (pg/execute conn
                    (str "SELECT * FROM statechart_jobs"
                         " WHERE status IN ('succeeded', 'failed')"
                         " AND terminal_event_dispatched_at IS NULL"

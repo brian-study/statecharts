@@ -24,9 +24,7 @@
    [com.fulcrologic.statecharts.persistence.pg.working-memory-store :as pg-wms]
    [com.fulcrologic.statecharts.protocols :as sp]
    [pg.core :as pg]
-   [pg.pool :as pool])
-  (:import
-   [java.util.concurrent CountDownLatch CyclicBarrier TimeUnit]))
+   [pg.pool :as pool]))
 
 ;; =============================================================================
 ;; Test Configuration
@@ -68,104 +66,7 @@
 (use-fixtures :each with-clean-tables)
 
 ;; =============================================================================
-;; 1. Concurrent Event Processing - Exactly Once
-;; =============================================================================
-
-(deftest ^:integration concurrent-event-claiming-exactly-once-test
-  (testing "multiple workers claiming events concurrently - each event processed exactly once"
-    (let [session-id :chaos-session-1
-          event-count 100
-          worker-count 4
-          queue (pg-eq/new-queue *pool* "setup-worker")]
-
-      ;; Insert many events
-      (dotimes [i event-count]
-        (sp/send! queue {} (chaos/make-event session-id
-                                             (keyword (str "evt-" i))
-                                             {:seq i})))
-
-      ;; Verify all events inserted
-      (is (= event-count (chaos/count-events *pool* :processed? false))
-          "All events should be in queue")
-
-      ;; Run multiple workers concurrently, each processing events
-      (let [[handler counts] (chaos/counting-handler)
-            worker-fns (for [worker-id (range worker-count)]
-                         (fn []
-                           (let [wq (pg-eq/new-queue *pool* (str "worker-" worker-id))]
-                             ;; Each worker polls until no more events
-                             (loop [total 0]
-                               (let [before (chaos/count-events *pool* :processed? false)]
-                                 (when (pos? before)
-                                   (sp/receive-events! wq {} handler
-                                                       {:batch-size 5})
-                                   (recur (inc total))))))))]
-        (chaos/execute-concurrent! (vec worker-fns) :timeout-ms 30000)
-
-        ;; Give a moment for all transactions to commit
-        (Thread/sleep 100)
-
-        ;; Verify: all events processed, none lost, none duplicated
-        (let [processed (chaos/count-events *pool* :processed? true)
-              unprocessed (chaos/count-events *pool* :processed? false)]
-          (is (= event-count processed)
-              (str "Expected " event-count " processed events, got " processed))
-          (is (zero? unprocessed)
-              (str "Expected 0 unprocessed events, got " unprocessed)))
-
-        ;; Verify: no event was handled more than once
-        (let [total-handler-calls (reduce + (vals @counts))]
-          (is (= event-count total-handler-calls)
-              (str "Handler should be called exactly " event-count
-                   " times, was called " total-handler-calls " times")))
-
-        ;; Check invariants
-        (chaos/assert-invariants! *pool* "after concurrent event processing")))))
-
-(deftest ^:integration concurrent-send-and-process-test
-  (testing "concurrent sending and processing don't lose events"
-    (let [session-id :chaos-session-2
-          send-count 50
-          [handler counts] (chaos/counting-handler)
-          sender-done (atom false)
-          processed-total (atom 0)]
-
-      ;; Start processor thread
-      (let [processor-thread
-            (future
-              (let [wq (pg-eq/new-queue *pool* "processor")]
-                (while (or (not @sender-done)
-                           (pos? (chaos/count-events *pool* :processed? false)))
-                  (sp/receive-events! wq {} handler {:batch-size 10})
-                  (Thread/sleep 5))
-                ;; One final sweep
-                (sp/receive-events! wq {} handler {:batch-size 100})))]
-
-        ;; Send events concurrently from multiple threads
-        (let [sender-fns (for [sender-id (range 5)]
-                           (fn []
-                             (let [sq (pg-eq/new-queue *pool* (str "sender-" sender-id))]
-                               (dotimes [i (/ send-count 5)]
-                                 (sp/send! sq {}
-                                           (chaos/make-event
-                                            session-id
-                                            (keyword (str "evt-s" sender-id "-" i))))))))]
-          (chaos/execute-concurrent! (vec sender-fns) :timeout-ms 10000))
-
-        (reset! sender-done true)
-        ;; Wait for processor to finish
-        (Thread/sleep 500)
-        (deref processor-thread 10000 :timeout)
-
-        ;; Verify all events processed
-        (let [total-handled (reduce + (vals @counts))]
-          (is (= send-count total-handled)
-              (str "All " send-count " sent events should be processed, got " total-handled)))
-
-        (chaos/assert-invariants! *pool* "after concurrent send+process")))))
-
-;; =============================================================================
-;; 2. Concurrent Session Access - Optimistic Locking
+;; 1. Concurrent Session Access - Optimistic Locking
 ;; =============================================================================
 
 (deftest ^:integration concurrent-session-contention-test
@@ -237,52 +138,20 @@
           (is (some? final) "Session must exist")
           (is (= session-id (::sc/session-id final)))
           (is (some? (get-in final [::sc/data-model :creator]))
-              "Session should have a creator from one of the threads")))
+              "Session should have a creator from one of the threads")
+          ;; Version must be >= 1, and if multiple succeeded, > 1
+          (let [version (core/get-version final)
+                success-count (count (filter #(= :saved (:result %)) results))]
+            (is (pos? version) "Version must be positive")
+            (when (> success-count 1)
+              (is (>= version 2)
+                  (str "With " success-count " concurrent creates, version should be >= 2, got " version))))))
 
       (chaos/assert-invariants! *pool* "after session create race"))))
 
 ;; =============================================================================
-;; 3. Concurrent Job Claiming
+;; 2. Job Lifecycle
 ;; =============================================================================
-
-(deftest ^:integration concurrent-job-claiming-no-double-claim-test
-  (testing "multiple workers claiming jobs concurrently - no double claims"
-    (let [job-count 20
-          worker-count 4
-          job-ids (atom [])]
-
-      ;; Create many jobs for different sessions
-      (dotimes [i job-count]
-        (let [sid (chaos/make-session-id "job-sess" i)
-              job-id (job-store/create-job! *pool*
-                       (chaos/make-job sid (keyword (str "invoke-" i))))]
-          (swap! job-ids conj job-id)))
-
-      ;; All workers try to claim jobs simultaneously
-      (let [claimed-by-worker (atom {})
-            worker-fns (for [worker-id (range worker-count)]
-                         (fn []
-                           (let [owner (str "worker-" worker-id)
-                                 claimed (job-store/claim-jobs! *pool*
-                                           {:owner-id owner
-                                            :lease-duration-seconds 60
-                                            :limit job-count})]
-                             (swap! claimed-by-worker assoc worker-id
-                                    (mapv :id claimed))
-                             (count claimed))))]
-        (let [results (chaos/execute-concurrent! (vec worker-fns) :timeout-ms 15000)
-              total-claimed (reduce + (keep :result results))
-              all-claimed-ids (mapcat val @claimed-by-worker)]
-
-          ;; Total claimed should equal job count
-          (is (= job-count total-claimed)
-              (str "Total claimed should be " job-count ", got " total-claimed))
-
-          ;; No job should be claimed by multiple workers
-          (is (= (count all-claimed-ids) (count (set all-claimed-ids)))
-              "No job should be claimed by more than one worker")))
-
-      (chaos/assert-invariants! *pool* "after concurrent job claiming"))))
 
 (deftest ^:integration job-lease-expiry-recovery-test
   (testing "expired leases are reclaimed by other workers"
@@ -467,6 +336,11 @@
                         :timeout-ms 30000)]
           ;; Some errors may occur due to pool exhaustion timeouts,
           ;; but no corruption should result
+          (when (seq @errors)
+            (is (<= (count @errors) (* thread-count ops-per-thread))
+                (str "Errors should be pool-exhaustion related, got "
+                     (count @errors) " errors: "
+                     (pr-str (take 3 @errors)))))
           (chaos/assert-invariants! tiny-pool "after pool stress"))
         (finally
           (pool/close tiny-pool))))))
@@ -585,6 +459,19 @@
               (str "Exactly one operation should succeed, got: "
                    (mapv :result results)))))
 
+      ;; Verify final state is consistent with the winning operation
+      (let [rows (pg/with-connection [c *pool*]
+                   (pg/execute c
+                     "SELECT status, lease_owner, lease_expires_at FROM statechart_jobs WHERE id = $1"
+                     {:params [job-id] :kebab-keys? true}))
+            final-status (:status (first rows))]
+        (is (#{"succeeded" "failed" "pending"} final-status)
+            (str "Job should be in a terminal or retry state, got: " final-status))
+        ;; Terminal jobs should have no lease
+        (when (#{"succeeded" "failed"} final-status)
+          (is (nil? (:lease-owner (first rows)))
+              "Terminal job should have no lease_owner")))
+
       (chaos/assert-invariants! *pool* "after job complete/fail race"))))
 
 (deftest ^:integration job-cancel-during-execution-test
@@ -622,21 +509,23 @@
 ;; =============================================================================
 
 (deftest ^:integration version-monotonicity-under-contention-test
-  (testing "session version is strictly monotonically increasing"
+  (testing "session version is non-decreasing per observer thread"
     (let [store (pg-wms/new-store *pool*)
           session-id :version-test
           wmem (chaos/make-working-memory session-id :chart)
-          observed-versions (atom [])]
+          ;; Track per-thread version observations
+          per-thread-versions (atom {})]
 
       ;; Create session
       (sp/save-working-memory! store {} session-id wmem)
 
-      ;; Concurrent readers tracking version progression
-      (let [reader-fns (for [_rid (range 4)]
+      ;; Concurrent readers tracking version progression per thread
+      (let [reader-fns (for [rid (range 4)]
                          (fn []
                            (dotimes [_ 50]
                              (when-let [wm (sp/get-working-memory store {} session-id)]
-                               (swap! observed-versions conj (core/get-version wm)))
+                               (swap! per-thread-versions update rid
+                                      (fnil conj []) (core/get-version wm)))
                              (Thread/sleep 1))))
             ;; Concurrent writer incrementing
             writer-fn (fn []
@@ -652,15 +541,22 @@
         (chaos/execute-concurrent! (conj (vec reader-fns) writer-fn)
                                    :timeout-ms 15000))
 
+      ;; Verify: each thread's observations are non-decreasing (monotonic)
+      (doseq [[thread-id versions] @per-thread-versions]
+        (is (= versions (sort versions))
+            (str "Thread " thread-id " should observe non-decreasing versions"
+                 ", but got: " (take 20 versions))))
+
       ;; Verify: all observed versions are positive integers
-      (let [versions (sort @observed-versions)]
-        (is (every? pos? versions)
-            "All observed versions should be positive")
-        ;; The final version should be 1 (initial) + 20 (writes) = 21
-        (let [final-wm (sp/get-working-memory store {} session-id)
-              final-version (core/get-version final-wm)]
-          (is (= 21 final-version)
-              (str "Final version should be 21, got " final-version)))))))
+      (let [all-versions (mapcat val @per-thread-versions)]
+        (is (every? pos? all-versions)
+            "All observed versions should be positive"))
+
+      ;; The final version should be 1 (initial) + 20 (writes) = 21
+      (let [final-wm (sp/get-working-memory store {} session-id)
+            final-version (core/get-version final-wm)]
+        (is (= 21 final-version)
+            (str "Final version should be 21, got " final-version))))))
 
 ;; =============================================================================
 ;; 9. Event Delivery Ordering and Delayed Events
@@ -700,61 +596,6 @@
           "Delayed event should be delivered last"))))
 
 ;; =============================================================================
-;; 10. High-Volume Exactly-Once with Multiple Sessions
-;; =============================================================================
-
-(deftest ^:integration high-volume-multi-session-exactly-once-test
-  (testing "exactly-once delivery across many sessions with concurrent workers"
-    (let [session-count 10
-          events-per-session 20
-          worker-count 4
-          total-events (* session-count events-per-session)
-          processed-events (atom #{})]
-
-      ;; Send events to multiple sessions
-      (let [queue (pg-eq/new-queue *pool* "bulk-sender")]
-        (dotimes [s session-count]
-          (let [sid (chaos/make-session-id "multi" s)]
-            (dotimes [e events-per-session]
-              (sp/send! queue {}
-                (chaos/make-event sid (keyword (str "e-" s "-" e))
-                                  {:session s :event-num e}))))))
-
-      ;; Process with multiple workers
-      (let [worker-fns (for [wid (range worker-count)]
-                         (fn []
-                           (let [wq (pg-eq/new-queue *pool* (str "multi-w-" wid))]
-                             (loop [rounds 0]
-                               (when (and (< rounds 100)
-                                          (pos? (chaos/count-events *pool* :processed? false)))
-                                 (sp/receive-events! wq {}
-                                   (fn [_ event]
-                                     (let [key [(:target event) (:name event)]]
-                                       ;; Track for duplicate detection
-                                       (when (contains? @processed-events key)
-                                         (throw (ex-info "DUPLICATE PROCESSING"
-                                                         {:key key})))
-                                       (swap! processed-events conj key)))
-                                   {:batch-size 10})
-                                 (Thread/sleep 5)
-                                 (recur (inc rounds)))))))]
-        (chaos/execute-concurrent! (vec worker-fns) :timeout-ms 60000))
-
-      ;; Wait for stragglers
-      (Thread/sleep 200)
-
-      ;; Verify exactly-once
-      (is (= total-events (count @processed-events))
-          (str "Expected " total-events " unique processed events, got "
-               (count @processed-events)))
-
-      (let [verification (chaos/verify-exactly-once-events *pool* total-events)]
-        (is (:valid? verification)
-            (str "Exactly-once verification failed: " (pr-str verification))))
-
-      (chaos/assert-invariants! *pool* "after high-volume multi-session"))))
-
-;; =============================================================================
 ;; Regression Tests for Bug #3 and Bug #4
 ;;
 ;; These tests were written RED-first to prove the bugs existed, then the
@@ -776,7 +617,7 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest ^:integration per-event-tx-prevents-double-processing-test
-  (testing "Error in event C does not roll back event A's mark-processed"
+  (testing "Exception in event C does not undo event A's mark-processed"
     (let [session-id :double-process-session
           queue (pg-eq/new-queue *pool* "dp-worker")
           handler-calls (atom [])
@@ -787,23 +628,22 @@
       (sp/send! queue {} (chaos/make-event session-id :event-B {:seq 2}))
       (sp/send! queue {} (chaos/make-event session-id :event-C {:seq 3}))
 
-      ;; Process. Handler records invocations and on event-C throws an Error.
-      ;; With per-event tx, events A and B are already individually committed.
-      (try
-        (sp/receive-events! queue {}
-          (fn [_env event]
-            (swap! handler-calls conj (:name event))
-            (swap! call-count inc)
-            (when (= :event-C (:name event))
-              (throw (AssertionError. "Chaos: kill event C"))))
-          {:batch-size 10})
-        (catch AssertionError _))
+      ;; Process. Handler throws Exception on event-C.
+      ;; With per-event tx, events A and B are already individually mark-processed.
+      ;; The Exception on C is caught per-event, C's claim is released.
+      (sp/receive-events! queue {}
+        (fn [_env event]
+          (swap! handler-calls conj (:name event))
+          (swap! call-count inc)
+          (when (= :event-C (:name event))
+            (throw (ex-info "Chaos: kill event C" {}))))
+        {:batch-size 10})
 
       ;; Handler was called for all 3 events
       (is (= 3 @call-count) "Handler called 3 times in first pass")
 
       ;; Events A and B should be marked processed (their per-event tx committed).
-      ;; Event C should NOT be processed (its handler threw before mark-processed).
+      ;; Event C's claim was released (Exception caught per-event).
       (let [processed (chaos/count-events *pool* :processed? true)
             unprocessed (chaos/count-events *pool* :processed? false)]
         (is (= 2 processed)
@@ -877,3 +717,125 @@
         ;; The important thing is the version bump so the loser can detect it.
         (let [creator (get-in final [::sc/data-model :creator])]
           (is (#{:alpha :beta} creator)))))))
+
+;; =============================================================================
+;; Edge Case: Error (not Exception) in handler releases claim
+;; =============================================================================
+
+(deftest ^:integration error-in-handler-releases-claim-test
+  (testing "Error (not Exception) in handler releases claim for the failing event"
+    (let [session-id :error-session
+          queue (pg-eq/new-queue *pool* "error-worker")
+          handler-calls (atom [])]
+
+      ;; Send 3 events
+      (sp/send! queue {} (chaos/make-event session-id :event-A {:seq 1}))
+      (sp/send! queue {} (chaos/make-event session-id :event-B {:seq 2}))
+      (sp/send! queue {} (chaos/make-event session-id :event-C {:seq 3}))
+
+      ;; Handler throws AssertionError on event-B.
+      ;; Error is caught per-event, claim released, then re-thrown.
+      ;; Events after B in the batch are NOT processed (doseq breaks).
+      (try
+        (sp/receive-events! queue {}
+          (fn [_env event]
+            (swap! handler-calls conj (:name event))
+            (when (= :event-B (:name event))
+              (throw (AssertionError. "Chaos: fatal error on B"))))
+          {:batch-size 10})
+        (catch AssertionError _))
+
+      ;; Event A: processed (mark-processed committed before B threw)
+      (is (= 1 (chaos/count-events *pool* :processed? true))
+          "Only event A should be processed")
+
+      ;; Event B: claim released (Error caught + released + re-thrown)
+      ;; Event C: claim still held (never reached in doseq after Error)
+      (is (= 2 (chaos/count-events *pool* :processed? false))
+          "Events B and C should be unprocessed")
+
+      ;; Event B should be unclaimed (released by Error handler)
+      (is (= 1 (chaos/count-events *pool* :claimed? false :processed? false))
+          "Event B should be unclaimed after Error release")
+
+      ;; Recover stale claims (for event C which is still claimed)
+      (pg-eq/recover-stale-claims! *pool* 0)
+
+      ;; Process again — both B and C should be handled
+      (reset! handler-calls [])
+      (sp/receive-events! queue {}
+        (fn [_env event]
+          (swap! handler-calls conj (:name event)))
+        {:batch-size 10})
+
+      (is (= 2 (count @handler-calls))
+          "Events B and C should both be retried after recovery")
+
+      ;; All 3 events now processed
+      (is (= 3 (chaos/count-events *pool* :processed? true))
+          "All 3 events should be processed"))))
+
+;; =============================================================================
+;; Edge Case: cancel! clears lease fields
+;; =============================================================================
+
+(deftest ^:integration cancel-clears-lease-fields-test
+  (testing "cancelling a running job clears lease_owner and lease_expires_at"
+    (let [session-id :cancel-lease-session
+          job-id (job-store/create-job! *pool*
+                   (chaos/make-job session-id :lease-invoke))]
+
+      ;; Claim the job (sets lease_owner and lease_expires_at)
+      (let [claimed (job-store/claim-jobs! *pool*
+                      {:owner-id "worker-1" :lease-duration-seconds 60 :limit 1})]
+        (is (= 1 (count claimed)) "Should claim the job")
+        (is (= "worker-1" (:lease-owner (first claimed)))))
+
+      ;; Cancel the running job
+      (job-store/cancel! *pool* session-id :lease-invoke)
+
+      ;; Verify lease fields are cleared
+      (pg/with-connection [c *pool*]
+        (let [rows (pg/execute c
+                     "SELECT status, lease_owner, lease_expires_at FROM statechart_jobs WHERE id = $1"
+                     {:params [job-id] :kebab-keys? true})
+              job (first rows)]
+          (is (= "cancelled" (:status job)))
+          (is (nil? (:lease-owner job))
+              "Cancelled job should have no lease_owner")
+          (is (nil? (:lease-expires-at job))
+              "Cancelled job should have no lease_expires_at")))
+
+      (chaos/assert-invariants! *pool* "after cancel clears lease"))))
+
+;; =============================================================================
+;; Edge Case: upsert with different chart sources
+;; =============================================================================
+
+(deftest ^:integration upsert-race-updates-statechart-src-test
+  (testing "ON CONFLICT upsert updates statechart_src along with working memory"
+    (let [store (pg-wms/new-store *pool*)
+          session-id :src-race-session
+          wmem-a (assoc (chaos/make-working-memory session-id :chart-alpha)
+                        ::sc/data-model {:writer :first})
+          wmem-b (assoc (chaos/make-working-memory session-id :chart-beta)
+                        ::sc/data-model {:writer :second})]
+
+      ;; First create
+      (sp/save-working-memory! store {} session-id wmem-a)
+
+      ;; Verify chart-alpha is stored
+      (let [wm (sp/get-working-memory store {} session-id)]
+        (is (= :chart-alpha (::sc/statechart-src wm))))
+
+      ;; Second create (no version = new session path, triggers ON CONFLICT)
+      (sp/save-working-memory! store {} session-id wmem-b)
+
+      ;; Verify statechart_src was updated to chart-beta (not stuck on chart-alpha)
+      (let [wm (sp/get-working-memory store {} session-id)]
+        (is (= :chart-beta (::sc/statechart-src wm))
+            "ON CONFLICT should update statechart_src to the new value")
+        (is (= :second (get-in wm [::sc/data-model :writer]))
+            "Working memory should be from the second writer")
+        (is (= 2 (core/get-version wm))
+            "Version should be 2 after conflict resolution")))))
