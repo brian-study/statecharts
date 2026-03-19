@@ -30,11 +30,10 @@
 
 (defn str->session-id
   "Convert a string from database back to original session ID type.
-   Attempts to read EDN if it looks like a keyword/symbol."
+   Attempts to read EDN if it looks like a keyword."
   [s]
   (when s
-    (if (or (.startsWith s ":")
-            (.startsWith s "'"))
+    (if (.startsWith s ":")
       (edn/read-string s)
       ;; Try UUID, fall back to string
       (or (parse-uuid s) s))))

@@ -103,6 +103,8 @@
                                   :version 1}]
                         :on-conflict [:session-id]
                         :do-update-set {:working-memory :excluded.working-memory
+                                        :statechart-src :excluded.statechart-src
+                                        :version [:+ :statechart-sessions.version 1]
                                         :updated-at [:now]}})
         true))))
 
