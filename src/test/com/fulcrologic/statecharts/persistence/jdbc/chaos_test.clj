@@ -1,4 +1,4 @@
-(ns com.fulcrologic.statecharts.persistence.pg.chaos-test
+(ns com.fulcrologic.statecharts.persistence.jdbc.chaos-test
   "Chaos tests for the PostgreSQL persistence layer.
 
    Tests concurrent access, failure recovery, and invariant preservation
@@ -16,28 +16,28 @@
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
    [com.fulcrologic.statecharts :as sc]
-   [com.fulcrologic.statecharts.persistence.pg.chaos :as chaos]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.event-queue :as pg-eq]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
-   [com.fulcrologic.statecharts.persistence.pg.working-memory-store :as pg-wms]
+   [com.fulcrologic.statecharts.persistence.jdbc.chaos :as chaos]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
    [com.fulcrologic.statecharts.protocols :as sp]
-   [pg.core :as pg]
-   [pg.pool :as pool]))
+   [next.jdbc.connection :as jdbc.connection])
+  (:import
+   [com.zaxxer.hikari HikariDataSource]))
 
 ;; =============================================================================
 ;; Test Configuration
 ;; =============================================================================
 
 (def ^:private test-config
-  {:host (or (System/getenv "PG_TEST_HOST") "localhost")
+  {:dbtype "postgres"
+   :dbname (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
+   :host (or (System/getenv "PG_TEST_HOST") "localhost")
    :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :database (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :user (or (System/getenv "PG_TEST_USER") "postgres")
-   :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")
-   :binary-encode? true
-   :binary-decode? true})
+   :username (or (System/getenv "PG_TEST_USER") "postgres")
+   :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
 
 (def ^:dynamic *pool* nil)
 
@@ -46,14 +46,15 @@
 ;; =============================================================================
 
 (defn with-pool [f]
-  (let [p (pool/pool (assoc test-config
-                            :pool-min-size 3
-                            :pool-max-size 8))]
+  (let [ds (jdbc.connection/->pool HikariDataSource
+             (assoc test-config
+                    :minimumIdle 3
+                    :maximumPoolSize 8))]
     (try
-      (binding [*pool* p]
+      (binding [*pool* ds]
         (f))
       (finally
-        (pool/close p)))))
+        (.close ^HikariDataSource ds)))))
 
 (defn with-clean-tables [f]
   (chaos/setup-tables! *pool*)
@@ -104,8 +105,8 @@
         (is (= expected final-counter)
             (str "Counter should be " expected " but was " final-counter
                  ". Lost updates detected!"))
-        (is (= expected (core/get-version final-wmem))
-            (str "Version should be " expected " (initial 1 + " (dec expected)
+        (is (= (inc expected) (core/get-version final-wmem))
+            (str "Version should be " (inc expected) " (initial 1 + " expected
                  " updates) but was " (core/get-version final-wmem))))
 
       (chaos/assert-invariants! *pool* "after session contention"))))
@@ -264,11 +265,9 @@
         (sp/send! queue {} (chaos/make-event session-id (keyword (str "evt-" i)))))
 
       ;; Claim events (simulating a worker that crashes mid-processing)
-      (pg/with-connection [conn *pool*]
-        (pg/with-tx [conn]
-          (pg/execute conn
-            "UPDATE statechart_events SET claimed_at = now(), claimed_by = 'dead-worker' WHERE processed_at IS NULL"
-            {})))
+      (core/with-tx [tx *pool*]
+        (core/execute-sql! tx
+          "UPDATE statechart_events SET claimed_at = now(), claimed_by = 'dead-worker' WHERE processed_at IS NULL"))
 
       ;; Verify events are claimed
       (is (= 5 (chaos/count-events *pool* :claimed? true :processed? false))
@@ -299,9 +298,10 @@
 (deftest ^:integration pool-exhaustion-under-concurrent-load-test
   (testing "operations survive pool contention with small pool"
     (let [;; Create a tiny pool to force contention
-          tiny-pool (pool/pool (assoc test-config
-                                      :pool-min-size 1
-                                      :pool-max-size 2))
+          tiny-pool (jdbc.connection/->pool HikariDataSource
+                      (assoc test-config
+                             :minimumIdle 1
+                             :maximumPoolSize 2))
           store (pg-wms/new-store tiny-pool)
           queue (pg-eq/new-queue tiny-pool "stress-worker")]
       (try
@@ -343,7 +343,7 @@
                      (pr-str (take 3 @errors)))))
           (chaos/assert-invariants! tiny-pool "after pool stress"))
         (finally
-          (pool/close tiny-pool))))))
+          (.close ^HikariDataSource tiny-pool))))))
 
 (deftest ^:integration mixed-workload-concurrent-stress-test
   (testing "mixed read/write/event workload under concurrency"
@@ -460,10 +460,9 @@
                    (mapv :result results)))))
 
       ;; Verify final state is consistent with the winning operation
-      (let [rows (pg/with-connection [c *pool*]
-                   (pg/execute c
-                     "SELECT status, lease_owner, lease_expires_at FROM statechart_jobs WHERE id = $1"
-                     {:params [job-id] :kebab-keys? true}))
+      (let [rows (core/execute-sql! *pool*
+                   "SELECT status, lease_owner, lease_expires_at FROM statechart_jobs WHERE id = ?"
+                   [job-id])
             final-status (:status (first rows))]
         (is (#{"succeeded" "failed" "pending"} final-status)
             (str "Job should be in a terminal or retry state, got: " final-status))
@@ -606,7 +605,7 @@
 ;; Bug #3 (FIXED): Double-processing when batch tx rolls back
 ;;
 ;; Previously, receive-events! wrapped the entire batch (claim + all handlers
-;; + all mark-processed) in a single pg/with-tx. If an Error propagated from
+;; + all mark-processed) in a single transaction. If an Error propagated from
 ;; a later handler, the tx rolled back, un-marking earlier events that had
 ;; already been handled (with committed side effects). Those events would be
 ;; re-claimed and re-handled = double processing.
@@ -795,16 +794,15 @@
       (job-store/cancel! *pool* session-id :lease-invoke)
 
       ;; Verify lease fields are cleared
-      (pg/with-connection [c *pool*]
-        (let [rows (pg/execute c
-                     "SELECT status, lease_owner, lease_expires_at FROM statechart_jobs WHERE id = $1"
-                     {:params [job-id] :kebab-keys? true})
-              job (first rows)]
-          (is (= "cancelled" (:status job)))
-          (is (nil? (:lease-owner job))
-              "Cancelled job should have no lease_owner")
-          (is (nil? (:lease-expires-at job))
-              "Cancelled job should have no lease_expires_at")))
+      (let [rows (core/execute-sql! *pool*
+                   "SELECT status, lease_owner, lease_expires_at FROM statechart_jobs WHERE id = ?"
+                   [job-id])
+            job (first rows)]
+        (is (= "cancelled" (:status job)))
+        (is (nil? (:lease-owner job))
+            "Cancelled job should have no lease_owner")
+        (is (nil? (:lease-expires-at job))
+            "Cancelled job should have no lease_expires_at"))
 
       (chaos/assert-invariants! *pool* "after cancel clears lease"))))
 

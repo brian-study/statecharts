@@ -10,7 +10,7 @@
    [clojure.test :refer [deftest is testing use-fixtures]]
    [com.fulcrologic.statecharts.jobs.test-helpers :as th]
    [com.fulcrologic.statecharts.jobs.worker :as worker]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
    [taoensso.timbre :as log])
   (:import
    [java.time Duration]

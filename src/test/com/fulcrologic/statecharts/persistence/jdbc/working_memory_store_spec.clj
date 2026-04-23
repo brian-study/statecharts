@@ -1,12 +1,12 @@
-(ns com.fulcrologic.statecharts.persistence.pg.working-memory-store-spec
+(ns com.fulcrologic.statecharts.persistence.jdbc.working-memory-store-spec
   "Tests for PostgreSQL working memory store.
 
    These tests verify the WorkingMemoryStore protocol behavior and optimistic
    locking logic using stubbed database functions."
   (:require
    [com.fulcrologic.statecharts :as sc]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.working-memory-store :as wms]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as wms]
    [com.fulcrologic.statecharts.protocols :as sp]
    [fulcro-spec.core :refer [=> assertions behavior component specification when-mocking]]))
 
@@ -105,17 +105,17 @@
 ;; Protocol Behavior Tests (Structural)
 ;; -----------------------------------------------------------------------------
 
-(specification "PostgresWorkingMemoryStore Record"
+(specification "JdbcWorkingMemoryStore Record"
   (let [fake-pool {:type :fake-pool}
         store (wms/new-store fake-pool)]
 
     (component "new-store"
       (behavior "creates a valid store"
         (assertions
-          "creates a PostgresWorkingMemoryStore"
-          (instance? com.fulcrologic.statecharts.persistence.pg.working_memory_store.PostgresWorkingMemoryStore store) => true
-          "stores the pool reference"
-          (:pool store) => fake-pool)))
+          "creates a JdbcWorkingMemoryStore"
+          (instance? com.fulcrologic.statecharts.persistence.jdbc.working_memory_store.JdbcWorkingMemoryStore store) => true
+          "stores the datasource reference"
+          (:datasource store) => fake-pool)))
 
     (component "implements WorkingMemoryStore"
       (behavior "satisfies the protocol"

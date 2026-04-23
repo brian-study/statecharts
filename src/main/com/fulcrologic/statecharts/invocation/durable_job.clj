@@ -12,7 +12,7 @@
    [com.fulcrologic.statecharts :as sc]
    [com.fulcrologic.statecharts.data-model.operations :as ops]
    [com.fulcrologic.statecharts.environment :as env]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
    [com.fulcrologic.statecharts.protocols :as sp]
    [taoensso.timbre :as log]))
 

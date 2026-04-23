@@ -16,21 +16,24 @@
    [com.fulcrologic.statecharts.events :as evts]
    [com.fulcrologic.statecharts.invocation.durable-job :as durable-job]
    [com.fulcrologic.statecharts.jobs.worker :as worker]
-   [com.fulcrologic.statecharts.persistence.pg :as pg-sc]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [com.fulcrologic.statecharts.protocols :as sp]
-   [pg.pool :as pool]))
+   [next.jdbc.connection :as jdbc.connection])
+  (:import
+   [com.zaxxer.hikari HikariDataSource]))
 
 ;; -----------------------------------------------------------------------------
 ;; Test Configuration
 ;; -----------------------------------------------------------------------------
 
 (def ^:private test-config
-  {:host (or (System/getenv "PG_TEST_HOST") "localhost")
+  {:dbtype "postgres"
+   :dbname (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
+   :host (or (System/getenv "PG_TEST_HOST") "localhost")
    :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :database (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :user (or (System/getenv "PG_TEST_USER") "postgres")
+   :username (or (System/getenv "PG_TEST_USER") "postgres")
    :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
 
 (def ^:dynamic *pool* nil)
@@ -40,12 +43,12 @@
 ;; -----------------------------------------------------------------------------
 
 (defn with-pool [f]
-  (let [p (pool/pool test-config)]
+  (let [ds (jdbc.connection/->pool HikariDataSource test-config)]
     (try
-      (binding [*pool* p]
+      (binding [*pool* ds]
         (f))
       (finally
-        (pool/close p)))))
+        (.close ^HikariDataSource ds)))))
 
 (defn with-clean-tables [f]
   (schema/create-tables! *pool*)
@@ -89,11 +92,11 @@
     (state {:id :cancelled})))
 
 (defn- make-env-with-durable-jobs
-  "Create a pg-backed env with DurableJobInvocationProcessor."
-  [pool]
+  "Create a JDBC-backed env with DurableJobInvocationProcessor."
+  [ds]
   (pg-sc/pg-env
-    {:pool pool
-     :invocation-processors [(durable-job/->DurableJobInvocationProcessor pool nil)]}))
+    {:datasource ds
+     :invocation-processors [(durable-job/->DurableJobInvocationProcessor ds nil)]}))
 
 (defn- get-wmem
   "Get working memory for a session."
@@ -169,7 +172,7 @@
 
       ;; Verify we're in :working state and job was created
       (is (contains? (get-configuration env session-id) :working))
-      (let [job (job-store/get-active-job pool session-id "test-job")]
+      (let [job (job-store/get-active-job pool session-id :test-job)]
         (is (some? job) "Job should be created in DB")
         (is (= "pending" (:status job)))
         (is (= "test-job" (:job-type job))))
@@ -204,7 +207,7 @@
       (process-pending-events! env)
 
       ;; Verify job exists
-      (let [job (job-store/get-active-job pool session-id "test-job")]
+      (let [job (job-store/get-active-job pool session-id :test-job)]
         (is (some? job) "Job should exist")
         (is (= "pending" (:status job)))
 
@@ -242,7 +245,7 @@
                        {:success true}))})
 
       ;; After first failure, job should be back to pending with backoff
-      (let [job (job-store/get-active-job pool session-id "test-job")]
+      (let [job (job-store/get-active-job pool session-id :test-job)]
         (if (some? job)
           (do
             (is (= "pending" (:status job)) "Job should be re-queued as pending")
@@ -302,7 +305,7 @@
         (deref handler-started 5000 :timeout)
 
         ;; Cancel the job externally (simulates session exit)
-        (job-store/cancel! pool session-id "test-job")
+        (job-store/cancel! pool session-id :test-job)
 
         ;; Let handler continue
         (deliver handler-proceed true)

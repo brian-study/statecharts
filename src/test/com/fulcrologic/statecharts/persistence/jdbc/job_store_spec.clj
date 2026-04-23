@@ -1,4 +1,4 @@
-(ns ^:integration com.fulcrologic.statecharts.persistence.pg.job-store-spec
+(ns ^:integration com.fulcrologic.statecharts.persistence.jdbc.job-store-spec
   "Integration tests for PostgreSQL job store.
 
    These tests require a running PostgreSQL instance.
@@ -16,12 +16,12 @@
    - PG_TEST_PASSWORD (default: postgres)"
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as sut]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
-   [pg.core :as pg]
-   [pg.pool :as pool])
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as sut]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
+   [next.jdbc.connection :as jdbc.connection])
   (:import
+   [com.zaxxer.hikari HikariDataSource]
    [java.time OffsetDateTime Duration]
    [java.util UUID]))
 
@@ -30,10 +30,11 @@
 ;; -----------------------------------------------------------------------------
 
 (def ^:private test-config
-  {:host (or (System/getenv "PG_TEST_HOST") "localhost")
+  {:dbtype "postgres"
+   :dbname (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
+   :host (or (System/getenv "PG_TEST_HOST") "localhost")
    :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :database (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :user (or (System/getenv "PG_TEST_USER") "postgres")
+   :username (or (System/getenv "PG_TEST_USER") "postgres")
    :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
 
 (def ^:dynamic *pool* nil)
@@ -43,12 +44,12 @@
 ;; -----------------------------------------------------------------------------
 
 (defn with-pool [f]
-  (let [pool (pool/pool test-config)]
+  (let [ds (jdbc.connection/->pool HikariDataSource test-config)]
     (try
-      (binding [*pool* pool]
+      (binding [*pool* ds]
         (f))
       (finally
-        (pool/close pool)))))
+        (.close ^HikariDataSource ds)))))
 
 (defn with-clean-tables [f]
   (schema/create-tables! *pool*)
@@ -80,33 +81,31 @@
 (defn- get-job-row
   "Fetch a raw job row by id for assertion purposes."
   [pool job-id]
-  (first
-    (pg/execute pool
-      "SELECT * FROM statechart_jobs WHERE id = $1"
-      {:params [job-id]
-       :kebab-keys? true})))
+  (core/execute-sql-one! pool
+    "SELECT * FROM statechart_jobs WHERE id = ?"
+    [job-id]))
 
 (defn- set-job-status!
   "Directly set a job's status in the database (test helper)."
   [pool job-id status]
-  (pg/execute pool
-    "UPDATE statechart_jobs SET status = $1, updated_at = now() WHERE id = $2"
-    {:params [status job-id]}))
+  (core/execute-sql! pool
+    "UPDATE statechart_jobs SET status = ?, updated_at = now() WHERE id = ?"
+    [status job-id]))
 
 (defn- set-lease!
   "Directly set lease fields on a job (test helper)."
   [pool job-id owner expires-at]
-  (pg/execute pool
-    (str "UPDATE statechart_jobs SET lease_owner = $1, lease_expires_at = $2,"
-         " status = 'running', updated_at = now() WHERE id = $3")
-    {:params [owner expires-at job-id]}))
+  (core/execute-sql! pool
+    (str "UPDATE statechart_jobs SET lease_owner = ?, lease_expires_at = ?,"
+         " status = 'running', updated_at = now() WHERE id = ?")
+    [owner expires-at job-id]))
 
 (defn- set-next-run-at!
   "Directly set next_run_at on a job (test helper)."
   [pool job-id next-run-at]
-  (pg/execute pool
-    "UPDATE statechart_jobs SET next_run_at = $1, updated_at = now() WHERE id = $2"
-    {:params [next-run-at job-id]}))
+  (core/execute-sql! pool
+    "UPDATE statechart_jobs SET next_run_at = ?, updated_at = now() WHERE id = ?"
+    [next-run-at job-id]))
 
 ;; -----------------------------------------------------------------------------
 ;; 1. CRUD Operations

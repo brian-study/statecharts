@@ -1,10 +1,10 @@
-(ns com.fulcrologic.statecharts.persistence.pg.schema-spec
+(ns com.fulcrologic.statecharts.persistence.jdbc.schema-spec
   "Tests for PostgreSQL schema DDL.
 
    These tests verify the DDL structure and function existence
    without requiring a database."
   (:require
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [fulcro-spec.core :refer [=> assertions behavior component specification]]))
 
 ;; -----------------------------------------------------------------------------

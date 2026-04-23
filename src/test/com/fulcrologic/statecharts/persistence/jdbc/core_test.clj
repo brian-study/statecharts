@@ -1,9 +1,9 @@
-(ns com.fulcrologic.statecharts.persistence.pg.core-test
+(ns com.fulcrologic.statecharts.persistence.jdbc.core-test
   "Unit tests for PostgreSQL persistence core utilities.
    These tests do not require a database connection."
   (:require
    [clojure.test :refer [deftest is testing]]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]))
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]))
 
 ;; -----------------------------------------------------------------------------
 ;; Session ID Serialization
@@ -120,10 +120,7 @@
     (let [result (core/freeze {:foo :bar})]
       (is (bytes? result)))))
 
-(deftest thaw-requires-binary-protocol-test
-  "Tests that thaw requires byte[] input and rejects strings.
-   pg2 must be configured with :binary-decode? true."
-
+(deftest thaw-rejects-non-byte-input-test
   (testing "thaw handles byte array"
     (let [data {:foo :bar :baz [1 2 3] :keywords #{:a :b :c}}
           frozen (core/freeze data)
@@ -133,13 +130,13 @@
   (testing "thaw handles nil"
     (is (nil? (core/thaw nil))))
 
-  (testing "thaw throws on string input (misconfigured pool)"
+  (testing "thaw throws on non-byte[] input"
     (let [base64-encoder (java.util.Base64/getEncoder)
           data {:foo :bar}
           frozen (core/freeze data)
           base64-str (.encodeToString base64-encoder frozen)]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"pg2 pool must have :binary-decode\?"
+                            #"expected byte\[\]"
                             (core/thaw base64-str))))))
 
 ;; -----------------------------------------------------------------------------

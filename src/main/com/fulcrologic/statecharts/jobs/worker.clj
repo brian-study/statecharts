@@ -14,7 +14,7 @@
    - Exponential backoff for retryable failures"
   (:require
    [com.fulcrologic.statecharts.events :as evts]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
    [com.fulcrologic.statecharts.protocols :as sp]
    [taoensso.timbre :as log])
   (:import
@@ -242,7 +242,7 @@
    the coordinator claims more work to fill the freed slot. No batch wait.
 
    Options:
-   - :pool - pg2 connection pool (REQUIRED)
+   - :pool - javax.sql.DataSource (REQUIRED)
    - :event-queue - Event queue for terminal event dispatch (REQUIRED)
    - :env - Statechart env map (REQUIRED, used for event dispatch)
    - :handlers - Map of job-type keyword to handler fn (REQUIRED)

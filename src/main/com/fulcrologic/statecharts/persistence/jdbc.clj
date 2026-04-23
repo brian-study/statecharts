@@ -1,28 +1,30 @@
-(ns com.fulcrologic.statecharts.persistence.pg
-  "PostgreSQL persistence layer for statecharts.
+(ns com.fulcrologic.statecharts.persistence.jdbc
+  "JDBC-backed (PostgreSQL) persistence layer for statecharts.
 
    Provides durable storage for:
    - Working memory (session state)
    - Event queue (with exactly-once delivery)
    - Statechart registry (chart definitions)
 
+   Consumers pass a `javax.sql.DataSource` (HikariCP is the standard choice);
+   any DataSource that `next.jdbc` accepts will work.
+
    Usage:
    ```clojure
-   (require '[com.fulcrologic.statecharts.persistence.pg :as pg-sc])
-   (require '[pg.pool :as pool])
+   (require '[com.fulcrologic.statecharts.persistence.jdbc :as pg-sc])
+   (require '[next.jdbc.connection :as jdbc.connection])
 
-   ;; Create pg2 connection pool
-   (def pool (pool/pool {:host \"localhost\"
-                         :port 5432
-                         :database \"statecharts\"
-                         :user \"user\"
-                         :password \"pass\"}))
+   ;; Create a DataSource (HikariCP shown; any javax.sql.DataSource works)
+   (def ds (jdbc.connection/->pool com.zaxxer.hikari.HikariDataSource
+             {:dbtype \"postgres\" :dbname \"statecharts\"
+              :host \"localhost\" :port 5432
+              :username \"user\" :password \"pass\"}))
 
    ;; Create tables (safe to call multiple times)
-   (pg-sc/create-tables! pool)
+   (pg-sc/create-tables! ds)
 
    ;; Create environment
-   (def env (pg-sc/pg-env {:pool pool}))
+   (def env (pg-sc/pg-env {:datasource ds}))
 
    ;; Use like any other statechart env
    (pg-sc/register! env ::my-chart my-chart)
@@ -44,13 +46,12 @@
    [com.fulcrologic.statecharts.execution-model.lambda :as lambda]
    [com.fulcrologic.statecharts.invocation.future :as i.future]
    [com.fulcrologic.statecharts.invocation.statechart :as i.statechart]
-   [com.fulcrologic.statecharts.persistence.pg.event-queue :as pg-eq]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
-   [com.fulcrologic.statecharts.persistence.pg.working-memory-store :as pg-wms]
+   [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
    [com.fulcrologic.statecharts.protocols :as sp]
    [com.fulcrologic.statecharts.registry.local-memory-registry :as mem-reg]
    [com.fulcrologic.statecharts.util :refer [new-uuid]]
-   [pg.core :as pg]
    [taoensso.timbre :as log]))
 
 ;; -----------------------------------------------------------------------------
@@ -60,24 +61,24 @@
 (defn create-tables!
   "Create all required database tables.
    Safe to call multiple times (uses IF NOT EXISTS)."
-  [pool]
-  (schema/create-tables! pool))
+  [datasource]
+  (schema/create-tables! datasource))
 
 (defn drop-tables!
   "Drop all database tables.
    WARNING: This will delete all data!"
-  [pool]
-  (schema/drop-tables! pool))
+  [datasource]
+  (schema/drop-tables! datasource))
 
 ;; -----------------------------------------------------------------------------
 ;; Environment Creation
 ;; -----------------------------------------------------------------------------
 
 (defn pg-env
-  "Create a statechart environment backed by PostgreSQL.
+  "Create a statechart environment backed by PostgreSQL (via JDBC).
 
    Options:
-   - :pool - pg2 connection pool (REQUIRED)
+   - :datasource - javax.sql.DataSource (REQUIRED). HikariCP is the standard choice.
    - :node-id - Unique identifier for this worker node (optional, auto-generated if not provided)
    - :data-model - Custom data model (optional, defaults to flat working memory model)
    - :execution-model - Custom execution model (optional, defaults to lambda model)
@@ -87,20 +88,20 @@
 
    Example:
    ```clojure
-   (def env (pg-env {:pool my-pool}))
+   (def env (pg-env {:datasource my-hikari-ds}))
    (register! env ::my-chart my-chart)
    (start! env ::my-chart \"session-1\")
    ```"
-  [{:keys [pool node-id data-model execution-model invocation-processors]
+  [{:keys [datasource node-id data-model execution-model invocation-processors]
     :or {node-id (str (random-uuid))}}]
-  (assert pool "A pg2 connection pool is required")
+  (assert datasource "A javax.sql.DataSource is required under :datasource")
   (let [dm (or data-model (wmdm/new-flat-model))
-        q (pg-eq/new-queue pool node-id)
+        q (pg-eq/new-queue datasource node-id)
         ex (or execution-model (lambda/new-execution-model dm q))
         ;; Use in-memory registry - chart definitions are code, not data.
         ;; Only working memory and events need database persistence.
         registry (mem-reg/new-registry)
-        wmstore (pg-wms/new-store pool)
+        wmstore (pg-wms/new-store datasource)
         inv-processors (or invocation-processors
                            [(i.statechart/new-invocation-processor)
                             (i.future/new-future-processor)])]
@@ -111,8 +112,8 @@
      ::sc/processor (alg/new-processor)
      ::sc/invocation-processors inv-processors
      ::sc/execution-model ex
-     ;; Store pool and node-id for maintenance functions
-     ::pool pool
+     ;; Store datasource and node-id for maintenance functions
+     ::datasource datasource
      ::node-id node-id}))
 
 ;; -----------------------------------------------------------------------------
@@ -184,6 +185,18 @@
 ;; Event Loop
 ;; -----------------------------------------------------------------------------
 
+(defn- datasource-closed?
+  "Return true if the datasource exposes an `isClosed` method that reports true.
+   Works with HikariDataSource and any other pool following the convention.
+   Returns false for datasources without an `isClosed` method."
+  [ds]
+  (when ds
+    (try
+      (let [m (.getMethod (class ds) "isClosed" (into-array Class []))]
+        (boolean (.invoke m ds (object-array 0))))
+      (catch NoSuchMethodException _ false)
+      (catch Exception _ false))))
+
 (defn start-event-loop!
   "Start a background event processing loop.
 
@@ -207,7 +220,7 @@
    ```"
   ([env] (start-event-loop! env 100))
   ([env poll-interval-ms] (start-event-loop! env poll-interval-ms {}))
-  ([{::sc/keys [event-queue] ::keys [node-id] :as env} poll-interval-ms options]
+  ([{::sc/keys [event-queue] ::keys [node-id datasource] :as env} poll-interval-ms options]
    (let [running (atom true)
          ;; Signal queue for immediate wake-up
          wake-signal (java.util.concurrent.LinkedBlockingQueue.)
@@ -215,7 +228,6 @@
          env-with-signal (assoc env ::wake-signal wake-signal)
          handler (fn [env event]
                    (ep/standard-statechart-event-handler env event))
-         pool (:pool event-queue)
          loop-fn (fn []
                    (log/info "Event loop started"
                              {:node-id node-id
@@ -223,8 +235,8 @@
                               :session-filter (:session-id options)})
                    (while @running
                      (try
-                       (if (and pool (pg/closed? pool))
-                         (do (log/info "Pool closed, stopping event loop" {:node-id node-id})
+                       (if (datasource-closed? datasource)
+                         (do (log/info "Datasource closed, stopping event loop" {:node-id node-id})
                              (reset! running false))
                          (sp/receive-events! event-queue env-with-signal handler options))
                        (catch Exception e
@@ -254,7 +266,7 @@
    timeout-seconds - How old a claim must be to recover (default 30)"
   ([env] (recover-stale-claims! env 30))
   ([env timeout-seconds]
-   (pg-eq/recover-stale-claims! (::pool env) timeout-seconds)))
+   (pg-eq/recover-stale-claims! (::datasource env) timeout-seconds)))
 
 (defn purge-processed-events!
   "Delete old processed events to reclaim database space.
@@ -263,7 +275,7 @@
    retention-days - How many days of events to keep (default 7)"
   ([env] (purge-processed-events! env 7))
   ([env retention-days]
-   (pg-eq/purge-processed-events! (::pool env) retention-days)))
+   (pg-eq/purge-processed-events! (::datasource env) retention-days)))
 
 (defn queue-depth
   "Get the current number of unprocessed events.
@@ -272,7 +284,7 @@
    - :session-id - Count only events for this session"
   ([env] (queue-depth env {}))
   ([env options]
-   (pg-eq/queue-depth (::pool env) options)))
+   (pg-eq/queue-depth (::datasource env) options)))
 
 ;; Note: With in-memory registry, these cache functions are no longer needed.
 ;; The in-memory registry has no cache layer - charts are stored directly in memory.

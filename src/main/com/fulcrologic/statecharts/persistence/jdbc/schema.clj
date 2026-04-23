@@ -1,9 +1,9 @@
-(ns com.fulcrologic.statecharts.persistence.pg.schema
+(ns com.fulcrologic.statecharts.persistence.jdbc.schema
   "Database schema DDL for statechart persistence.
 
    Provides functions to create and drop the required tables."
   (:require
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]))
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]))
 
 ;; -----------------------------------------------------------------------------
 ;; Table Creation DDL
@@ -105,32 +105,33 @@
 (defn create-tables!
   "Create all statechart persistence tables and indexes.
    Safe to call multiple times (uses IF NOT EXISTS)."
-  [conn-or-pool]
-  (core/execute! conn-or-pool {:raw sessions-ddl})
+  [ds-or-conn]
+  (core/execute-sql! ds-or-conn sessions-ddl)
   (doseq [idx sessions-indexes-ddl]
-    (core/execute! conn-or-pool {:raw idx}))
-  (core/execute! conn-or-pool {:raw events-ddl})
+    (core/execute-sql! ds-or-conn idx))
+  (core/execute-sql! ds-or-conn events-ddl)
   (doseq [idx events-indexes-ddl]
-    (core/execute! conn-or-pool {:raw idx}))
-  (core/execute! conn-or-pool {:raw definitions-ddl})
-  (core/execute! conn-or-pool {:raw jobs-ddl})
+    (core/execute-sql! ds-or-conn idx))
+  (core/execute-sql! ds-or-conn definitions-ddl)
+  (core/execute-sql! ds-or-conn jobs-ddl)
   (doseq [idx jobs-indexes-ddl]
-    (core/execute! conn-or-pool {:raw idx}))
+    (core/execute-sql! ds-or-conn idx))
   true)
 
 (defn drop-tables!
   "Drop all statechart persistence tables.
    WARNING: This will delete all data!"
-  [conn-or-pool]
-  (core/execute! conn-or-pool {:raw drop-jobs-ddl})
-  (core/execute! conn-or-pool {:raw drop-events-ddl})
-  (core/execute! conn-or-pool {:raw drop-sessions-ddl})
-  (core/execute! conn-or-pool {:raw drop-definitions-ddl})
+  [ds-or-conn]
+  (core/execute-sql! ds-or-conn drop-jobs-ddl)
+  (core/execute-sql! ds-or-conn drop-events-ddl)
+  (core/execute-sql! ds-or-conn drop-sessions-ddl)
+  (core/execute-sql! ds-or-conn drop-definitions-ddl)
   true)
 
 (defn truncate-tables!
   "Truncate all statechart persistence tables.
    Removes all data but keeps table structure."
-  [conn-or-pool]
-  (core/execute! conn-or-pool {:raw "TRUNCATE statechart_events, statechart_sessions, statechart_definitions, statechart_jobs RESTART IDENTITY CASCADE"})
+  [ds-or-conn]
+  (core/execute-sql! ds-or-conn
+    "TRUNCATE statechart_events, statechart_sessions, statechart_definitions, statechart_jobs RESTART IDENTITY CASCADE")
   true)

@@ -1,3 +1,29 @@
+2.0.0
+-----
+
+BREAKING: The PostgreSQL persistence layer was migrated from pg2 to next.jdbc.
+
+* Dropped `com.github.igrishaev/pg2-honey` (pg2); added `com.github.seancorfield/next.jdbc`,
+  `com.github.seancorfield/honeysql`, and `org.postgresql/postgresql` as direct deps.
+* Renamed the namespace segment `com.fulcrologic.statecharts.persistence.pg.*` to
+  `com.fulcrologic.statecharts.persistence.jdbc.*`. Update your imports accordingly.
+* Constructors now accept a `javax.sql.DataSource` instead of a pg2 pool:
+    * `persistence.jdbc/pg-env` takes `:datasource` instead of `:pool`.
+    * `persistence.jdbc.working-memory-store/new-store`, `event-queue/new-queue`,
+      `registry/new-registry` all take a DataSource.
+    * HikariCP is the standard choice; any DataSource that `next.jdbc` accepts
+      will work.
+* Record names renamed: `PostgresWorkingMemoryStore` → `JdbcWorkingMemoryStore`,
+  `PostgresEventQueue` → `JdbcEventQueue`, `PostgresStatechartRegistry` →
+  `JdbcStatechartRegistry`. The record field holding the DataSource is
+  `:datasource` (was `:pool`).
+* Schema, SQL semantics, and Nippy wire format are unchanged. Tables, columns,
+  indexes, `SELECT FOR UPDATE SKIP LOCKED`, `ON CONFLICT` upserts, and BYTEA
+  round-trips all behave identically.
+* `TIMESTAMPTZ` reads are returned as `java.time.OffsetDateTime` (matching the
+  prior pg2 backend); pgjdbc's default `java.sql.Timestamp` is adapted in
+  `persistence.jdbc.core`.
+
 1.1.6
 -----
 

@@ -1,10 +1,14 @@
-# PostgreSQL Persistence Layer for Statecharts
+# JDBC (PostgreSQL) Persistence Layer for Statecharts
 
-This module provides durable PostgreSQL-backed storage for statecharts, implementing all three core storage protocols:
+This module provides durable PostgreSQL-backed storage for statecharts,
+implementing all three core storage protocols on top of `next.jdbc`:
 
 - **WorkingMemoryStore** - Persist session state across restarts
 - **EventQueue** - Durable event queue with exactly-once delivery
 - **StatechartRegistry** - Store chart definitions in the database
+
+Consumers pass a `javax.sql.DataSource`. HikariCP is the standard choice but
+any DataSource `next.jdbc` accepts will work.
 
 ## Quick Start
 
@@ -14,22 +18,26 @@ This module provides durable PostgreSQL-backed storage for statecharts, implemen
    [com.fulcrologic.statecharts.chart :as chart]
    [com.fulcrologic.statecharts.elements :refer [state transition on-entry assign script]]
    [com.fulcrologic.statecharts.data-model.operations :as ops]
-   [com.fulcrologic.statecharts.persistence.pg :as pg-sc]
-   [pg.pool :as pool]))
+   [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
+   [next.jdbc.connection :as jdbc.connection])
+  (:import
+   [com.zaxxer.hikari HikariDataSource]))
 
-;; 1. Create connection pool
-(def pool
-  (pool/pool {:host "localhost"
-              :port 5432
-              :database "myapp"
-              :user "postgres"
-              :password "postgres"}))
+;; 1. Create a DataSource (HikariCP shown — any javax.sql.DataSource works)
+(def ds
+  (jdbc.connection/->pool HikariDataSource
+    {:dbtype "postgres"
+     :dbname "myapp"
+     :host "localhost"
+     :port 5432
+     :username "postgres"
+     :password "postgres"}))
 
 ;; 2. Create tables (idempotent)
-(pg-sc/create-tables! pool)
+(pg-sc/create-tables! ds)
 
 ;; 3. Create environment
-(def env (pg-sc/pg-env {:pool pool}))
+(def env (pg-sc/pg-env {:datasource ds}))
 
 ;; 4. Define and register a chart
 (def order-chart
@@ -288,7 +296,7 @@ Sessions use optimistic locking to handle concurrent modifications safely:
 ;; If two workers try to update the same session simultaneously,
 ;; one will succeed and one will get an optimistic lock failure
 
-(require '[com.fulcrologic.statecharts.persistence.pg.working-memory-store :as wms])
+(require '[com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as wms])
 
 ;; Retry wrapper for handling conflicts
 (wms/with-optimistic-retry
@@ -365,7 +373,7 @@ When using `start-event-loop!`, events sent via `send!` on the same env instance
 
 ```clojure
 (pg-sc/pg-env
-  {:pool pool                              ; Required: pg2 connection pool
+  {:datasource ds                          ; Required: javax.sql.DataSource
    :node-id "worker-1"                     ; Optional: unique worker ID (auto-generated if omitted)
    :data-model my-custom-data-model        ; Optional: custom DataModel implementation
    :execution-model my-execution-model     ; Optional: custom ExecutionModel
@@ -381,8 +389,7 @@ When using `start-event-loop!`, events sent via `send!` on the same env instance
    [com.fulcrologic.statecharts.chart :as chart]
    [com.fulcrologic.statecharts.elements :refer [state transition on-entry assign script final]]
    [com.fulcrologic.statecharts.data-model.operations :as ops]
-   [com.fulcrologic.statecharts.persistence.pg :as pg-sc]
-   [pg.pool :as pool]))
+   [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]))
 
 (def order-chart
   (chart/statechart {:initial :pending}
@@ -436,10 +443,12 @@ When using `start-event-loop!`, events sent via `send!` on the same env instance
     (final {:id :failed})))
 
 ;; Setup
-(def pool (pool/pool {:host "localhost" :port 5432
-                      :database "orders" :user "app" :password "secret"}))
-(pg-sc/create-tables! pool)
-(def env (pg-sc/pg-env {:pool pool :node-id "order-worker-1"}))
+(def ds (jdbc.connection/->pool com.zaxxer.hikari.HikariDataSource
+          {:dbtype "postgres" :dbname "orders"
+           :host "localhost" :port 5432
+           :username "app" :password "secret"}))
+(pg-sc/create-tables! ds)
+(def env (pg-sc/pg-env {:datasource ds :node-id "order-worker-1"}))
 (pg-sc/register! env :orders/process order-chart)
 
 ;; Start event loop
@@ -471,15 +480,17 @@ For testing, you can use an in-memory approach or a test database:
 
 ```clojure
 ;; Option 1: Use test database
-(def test-pool (pool/pool {:database "statecharts_test" ...}))
+(def test-ds
+  (jdbc.connection/->pool com.zaxxer.hikari.HikariDataSource
+    {:dbtype "postgres" :dbname "statecharts_test" ...}))
 
 (use-fixtures :each
   (fn [f]
-    (pg-sc/create-tables! test-pool)
-    (schema/truncate-tables! test-pool)
+    (pg-sc/create-tables! test-ds)
+    (schema/truncate-tables! test-ds)
     (try (f)
       (finally
-        (schema/truncate-tables! test-pool)))))
+        (schema/truncate-tables! test-ds)))))
 
 ;; Option 2: Use the in-memory simple environment for unit tests
 (require '[com.fulcrologic.statecharts.simple :as simple])

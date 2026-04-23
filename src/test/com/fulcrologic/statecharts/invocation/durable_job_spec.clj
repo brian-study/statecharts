@@ -9,22 +9,24 @@
    [com.fulcrologic.statecharts.data-model.operations :as ops]
    [com.fulcrologic.statecharts.data-model.working-memory-data-model :as wmdm]
    [com.fulcrologic.statecharts.invocation.durable-job :as sut]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [com.fulcrologic.statecharts.protocols :as sp]
-   [pg.core :as pg]
-   [pg.pool :as pool]))
+   [next.jdbc.connection :as jdbc.connection])
+  (:import
+   [com.zaxxer.hikari HikariDataSource]))
 
 ;; -----------------------------------------------------------------------------
 ;; Test Configuration
 ;; -----------------------------------------------------------------------------
 
 (def ^:private test-config
-  {:host (or (System/getenv "PG_TEST_HOST") "localhost")
+  {:dbtype "postgres"
+   :dbname (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
+   :host (or (System/getenv "PG_TEST_HOST") "localhost")
    :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :database (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :user (or (System/getenv "PG_TEST_USER") "postgres")
+   :username (or (System/getenv "PG_TEST_USER") "postgres")
    :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
 
 (def ^:dynamic *pool* nil)
@@ -34,12 +36,12 @@
 ;; -----------------------------------------------------------------------------
 
 (defn with-pool [f]
-  (let [pool (pool/pool test-config)]
+  (let [ds (jdbc.connection/->pool HikariDataSource test-config)]
     (try
-      (binding [*pool* pool]
+      (binding [*pool* ds]
         (f))
       (finally
-        (pool/close pool)))))
+        (.close ^HikariDataSource ds)))))
 
 (defn with-clean-tables [f]
   (schema/create-tables! *pool*)
@@ -75,20 +77,16 @@
 (defn- get-job-status
   "Fetch the raw status string for a job by id."
   [pool job-id]
-  (let [rows (pg/with-connection [c pool]
-               (pg/execute c
-                 "SELECT status FROM statechart_jobs WHERE id = $1"
-                 {:params [job-id]
-                  :kebab-keys? true}))]
-    (:status (first rows))))
+  (:status (core/execute-sql-one! pool
+             "SELECT status FROM statechart_jobs WHERE id = ?"
+             [job-id])))
 
 (defn- set-job-status!
   "Directly update a job's status in the database (test helper)."
   [pool job-id status]
-  (pg/with-connection [c pool]
-    (pg/execute c
-      "UPDATE statechart_jobs SET status = $1, updated_at = now() WHERE id = $2"
-      {:params [status job-id]})))
+  (core/execute-sql! pool
+    "UPDATE statechart_jobs SET status = ?, updated_at = now() WHERE id = ?"
+    [status job-id]))
 
 ;; -----------------------------------------------------------------------------
 ;; Tests: supports-invocation-type?

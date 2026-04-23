@@ -1,4 +1,4 @@
-(ns com.fulcrologic.statecharts.persistence.pg.event-queue-spec
+(ns com.fulcrologic.statecharts.persistence.jdbc.event-queue-spec
   "Tests for PostgreSQL event queue.
 
    These tests verify the EventQueue protocol behavior, event structure,
@@ -6,8 +6,8 @@
   (:require
    [com.fulcrologic.statecharts :as sc]
    [com.fulcrologic.statecharts.events :as evts]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.event-queue :as eq]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as eq]
    [com.fulcrologic.statecharts.protocols :as sp]
    [fulcro-spec.core :refer [=> assertions behavior component specification]])
   (:import
@@ -17,16 +17,16 @@
 ;; Queue Creation Tests
 ;; -----------------------------------------------------------------------------
 
-(specification "PostgresEventQueue Record"
+(specification "JdbcEventQueue Record"
   (component "new-queue"
     (behavior "creates queue with pool and auto-generated node-id"
       (let [fake-pool {:type :fake-pool}
             queue (eq/new-queue fake-pool)]
         (assertions
-          "creates a PostgresEventQueue"
-          (instance? com.fulcrologic.statecharts.persistence.pg.event_queue.PostgresEventQueue queue) => true
-          "stores the pool reference"
-          (:pool queue) => fake-pool
+          "creates a JdbcEventQueue"
+          (instance? com.fulcrologic.statecharts.persistence.jdbc.event_queue.JdbcEventQueue queue) => true
+          "stores the datasource reference"
+          (:datasource queue) => fake-pool
           "generates a node-id"
           (string? (:node-id queue)) => true
           (not (empty? (:node-id queue))) => true)))

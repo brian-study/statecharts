@@ -1,13 +1,12 @@
-(ns com.fulcrologic.statecharts.persistence.pg.registry
-  "A PostgreSQL-backed statechart registry with local caching.
+(ns com.fulcrologic.statecharts.persistence.jdbc.registry
+  "A JDBC-backed statechart registry with local caching.
 
    Chart definitions are stored in the database and cached in memory
    for fast lookups."
   (:require
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
+   [clojure.edn :as edn]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.protocols :as sp]
-   [pg.core :as pg]
-   [pg.pool :as pool]
    [taoensso.timbre :as log]))
 
 ;; -----------------------------------------------------------------------------
@@ -23,12 +22,12 @@
   "Convert a stored string back to a statechart src."
   [s]
   (when s
-    (clojure.edn/read-string s)))
+    (edn/read-string s)))
 
 (defn- fetch-definition
   "Fetch a chart definition by src."
-  [conn src]
-  (when-let [row (core/execute-one! conn
+  [ds src]
+  (when-let [row (core/execute-one! ds
                                     {:select [:definition]
                                      :from [:statechart-definitions]
                                      :where [:= :src (src->str src)]})]
@@ -36,8 +35,8 @@
 
 (defn- fetch-all-definitions
   "Fetch all chart definitions."
-  [conn]
-  (let [rows (core/execute! conn
+  [ds]
+  (let [rows (core/execute! ds
                             {:select [:src :definition]
                              :from [:statechart-definitions]})]
     (into {}
@@ -48,8 +47,8 @@
 
 (defn- upsert-definition!
   "Insert or update a chart definition."
-  [conn src definition]
-  (core/execute! conn
+  [ds src definition]
+  (core/execute! ds
                  {:insert-into :statechart-definitions
                   :values [{:src (src->str src)
                             :definition (core/freeze definition)}]
@@ -63,14 +62,11 @@
 ;; StatechartRegistry Implementation
 ;; -----------------------------------------------------------------------------
 
-(defrecord PostgresStatechartRegistry [pool cache]
+(defrecord JdbcStatechartRegistry [datasource cache]
   sp/StatechartRegistry
   (register-statechart! [_ src statechart-definition]
     ;; Update database
-    (if (pool/pool? pool)
-      (pg/with-connection [c pool]
-        (upsert-definition! c src statechart-definition))
-      (upsert-definition! pool src statechart-definition))
+    (upsert-definition! datasource src statechart-definition)
     ;; Update cache
     (swap! cache assoc src statechart-definition)
     (log/info "Statechart registered"
@@ -86,13 +82,9 @@
         (log/trace "Statechart cache hit" {:src src})
         chart)
       ;; Not in cache, check database
-      (let [chart (if (pool/pool? pool)
-                    (pg/with-connection [c pool]
-                      (fetch-definition c src))
-                    (fetch-definition pool src))]
+      (let [chart (fetch-definition datasource src)]
         (if chart
           (do
-            ;; Populate cache
             (swap! cache assoc src chart)
             (log/debug "Statechart cache miss, loaded from DB" {:src src})
             chart)
@@ -102,11 +94,7 @@
 
   (all-charts [_]
     ;; Always fetch from database for complete picture
-    (let [charts (if (pool/pool? pool)
-                   (pg/with-connection [c pool]
-                     (fetch-all-definitions c))
-                   (fetch-all-definitions pool))]
-      ;; Update cache with all charts
+    (let [charts (fetch-all-definitions datasource)]
       (reset! cache charts)
       (log/debug "Loaded all statecharts" {:count (count charts)})
       charts)))
@@ -116,18 +104,19 @@
 ;; -----------------------------------------------------------------------------
 
 (defn new-registry
-  "Create a new PostgreSQL-backed statechart registry.
+  "Create a new JDBC-backed statechart registry.
 
-   pool - pg2 connection pool"
-  [pool]
-  (->PostgresStatechartRegistry pool (atom {})))
+   datasource - a javax.sql.DataSource (HikariCP is the standard choice) or a
+                java.sql.Connection."
+  [datasource]
+  (->JdbcStatechartRegistry datasource (atom {})))
 
 (defn clear-cache!
   "Clear the local cache. Useful after external database modifications."
   [registry]
-  (let [count (count @(:cache registry))]
+  (let [n (count @(:cache registry))]
     (reset! (:cache registry) {})
-    (log/debug "Registry cache cleared" {:previous-count count}))
+    (log/debug "Registry cache cleared" {:previous-count n}))
   nil)
 
 (defn preload-cache!

@@ -5,13 +5,13 @@
    tracker utilities used by worker-spec, worker-benchmark-test, and
    worker-edge-case-test."
   (:require
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [com.fulcrologic.statecharts.protocols :as sp]
-   [pg.core :as pg]
-   [pg.pool :as pool])
+   [next.jdbc.connection :as jdbc.connection])
   (:import
+   [com.zaxxer.hikari HikariDataSource]
    [java.util UUID]))
 
 ;; -----------------------------------------------------------------------------
@@ -19,21 +19,22 @@
 ;; -----------------------------------------------------------------------------
 
 (def test-config
-  {:host (or (System/getenv "PG_TEST_HOST") "localhost")
+  {:dbtype "postgres"
+   :dbname (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
+   :host (or (System/getenv "PG_TEST_HOST") "localhost")
    :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :database (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :user (or (System/getenv "PG_TEST_USER") "postgres")
+   :username (or (System/getenv "PG_TEST_USER") "postgres")
    :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
 
 (def ^:dynamic *pool* nil)
 
 (defn with-pool [f]
-  (let [p (pool/pool test-config)]
+  (let [ds (jdbc.connection/->pool HikariDataSource test-config)]
     (try
-      (binding [*pool* p]
+      (binding [*pool* ds]
         (f))
       (finally
-        (pool/close p)))))
+        (.close ^HikariDataSource ds)))))
 
 (defn with-clean-tables [f]
   (schema/create-tables! *pool*)
@@ -100,18 +101,15 @@
 (defn get-job-row
   "Fetch a job row from the DB by id. Returns raw row with thawed fields."
   [pool job-id]
-  (pg/with-connection [c pool]
-    (let [rows (pg/execute c
-                 "SELECT * FROM statechart_jobs WHERE id = $1"
-                 {:params [job-id]
-                  :kebab-keys? true})]
-      (when-let [row (first rows)]
-        (-> row
-            (update :payload core/thaw)
-            (cond->
-              (:result row) (update :result core/thaw)
-              (:error row) (update :error core/thaw)
-              (:terminal-event-data row) (update :terminal-event-data core/thaw)))))))
+  (when-let [row (core/execute-sql-one! pool
+                   "SELECT * FROM statechart_jobs WHERE id = ?"
+                   [job-id])]
+    (-> row
+        (update :payload core/thaw)
+        (cond->
+          (:result row) (update :result core/thaw)
+          (:error row) (update :error core/thaw)
+          (:terminal-event-data row) (update :terminal-event-data core/thaw)))))
 
 (defn get-job-rows [pool job-ids]
   (mapv #(get-job-row pool %) job-ids))

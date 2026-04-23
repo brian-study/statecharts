@@ -1,4 +1,4 @@
-(ns com.fulcrologic.statecharts.persistence.pg-spec
+(ns com.fulcrologic.statecharts.persistence.jdbc-spec
   "Tests for PostgreSQL persistence public API.
 
    These tests verify the pg-env construction, component wiring,
@@ -12,9 +12,9 @@
    [com.fulcrologic.statecharts :as sc]
    [com.fulcrologic.statecharts.chart :as chart]
    [com.fulcrologic.statecharts.elements :refer [state transition final]]
-   [com.fulcrologic.statecharts.persistence.pg :as pg]
-   [com.fulcrologic.statecharts.persistence.pg.event-queue :as eq]
-   [com.fulcrologic.statecharts.persistence.pg.working-memory-store :as wms]
+   [com.fulcrologic.statecharts.persistence.jdbc :as pg]
+   [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as eq]
+   [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as wms]
    [com.fulcrologic.statecharts.protocols :as sp]
    [com.fulcrologic.statecharts.registry.local-memory-registry :as mem-reg]
    [fulcro-spec.core :refer [=> assertions behavior component specification]]))
@@ -27,7 +27,7 @@
   (let [fake-pool {:type :fake-pool}]
 
     (component "creates complete environment"
-      (let [env (pg/pg-env {:pool fake-pool})]
+      (let [env (pg/pg-env {:datasource fake-pool})]
         (behavior "includes all required components"
           (assertions
             "has statechart registry"
@@ -44,20 +44,20 @@
             (some? (::sc/execution-model env)) => true
             "has invocation processors"
             (vector? (::sc/invocation-processors env)) => true
-            "stores pool reference"
-            (::pg/pool env) => fake-pool
+            "stores datasource reference"
+            (::pg/datasource env) => fake-pool
             "generates node-id"
             (string? (::pg/node-id env)) => true))))
 
     (component "uses provided options"
-      (let [env (pg/pg-env {:pool fake-pool
+      (let [env (pg/pg-env {:datasource fake-pool
                             :node-id "custom-node"})]
         (behavior "respects custom node-id"
           (assertions
             (::pg/node-id env) => "custom-node"))))
 
     (component "protocol satisfaction"
-      (let [env (pg/pg-env {:pool fake-pool})]
+      (let [env (pg/pg-env {:datasource fake-pool})]
         (behavior "registry implements StatechartRegistry"
           (assertions
             (satisfies? sp/StatechartRegistry (::sc/statechart-registry env)) => true))
@@ -78,8 +78,8 @@
           (assertions
             (satisfies? sp/DataModel (::sc/data-model env)) => true))))
 
-    (component "requires pool"
-      (behavior "throws without pool"
+    (component "requires datasource"
+      (behavior "throws without datasource"
         (try
           (pg/pg-env {})
           (assertions "should have thrown" false => true)
@@ -94,10 +94,10 @@
 
 (specification "Environment Component Types"
   (let [fake-pool {:type :fake-pool}
-        env (pg/pg-env {:pool fake-pool})]
+        env (pg/pg-env {:datasource fake-pool})]
 
     (component "registry type"
-      (behavior "creates LocalMemoryRegistry (not PostgresStatechartRegistry)"
+      (behavior "creates LocalMemoryRegistry (not JdbcStatechartRegistry)"
         ;; pg-env now uses in-memory registry because chart definitions
         ;; contain functions which cannot be serialized to PostgreSQL
         (assertions
@@ -105,15 +105,15 @@
                      (::sc/statechart-registry env)) => true)))
 
     (component "working memory store type"
-      (behavior "creates PostgresWorkingMemoryStore"
+      (behavior "creates JdbcWorkingMemoryStore"
         (assertions
-          (instance? com.fulcrologic.statecharts.persistence.pg.working_memory_store.PostgresWorkingMemoryStore
+          (instance? com.fulcrologic.statecharts.persistence.jdbc.working_memory_store.JdbcWorkingMemoryStore
                      (::sc/working-memory-store env)) => true)))
 
     (component "event queue type"
-      (behavior "creates PostgresEventQueue"
+      (behavior "creates JdbcEventQueue"
         (assertions
-          (instance? com.fulcrologic.statecharts.persistence.pg.event_queue.PostgresEventQueue
+          (instance? com.fulcrologic.statecharts.persistence.jdbc.event_queue.JdbcEventQueue
                      (::sc/event-queue env)) => true)))))
 
 ;; -----------------------------------------------------------------------------
@@ -176,7 +176,7 @@
 (specification "Chart Registration Validation"
   (component "register! validation"
     (let [fake-pool {:type :fake-pool}
-          env (pg/pg-env {:pool fake-pool})
+          env (pg/pg-env {:datasource fake-pool})
           ;; Create a valid chart for testing validation paths
           valid-chart (chart/statechart {:initial :s1}
                                         (state {:id :s1}
@@ -196,13 +196,13 @@
 
 (specification "Event Queue Wiring"
   (let [fake-pool {:type :fake-pool}
-        env (pg/pg-env {:pool fake-pool})
+        env (pg/pg-env {:datasource fake-pool})
         queue (::sc/event-queue env)]
 
     (component "queue configuration"
-      (behavior "queue has pool reference"
+      (behavior "queue has datasource reference"
         (assertions
-          (:pool queue) => fake-pool))
+          (:datasource queue) => fake-pool))
 
       (behavior "queue has node-id"
         (assertions
@@ -214,13 +214,13 @@
 
 (specification "Working Memory Store Wiring"
   (let [fake-pool {:type :fake-pool}
-        env (pg/pg-env {:pool fake-pool})
+        env (pg/pg-env {:datasource fake-pool})
         store (::sc/working-memory-store env)]
 
     (component "store configuration"
-      (behavior "store has pool reference"
+      (behavior "store has datasource reference"
         (assertions
-          (:pool store) => fake-pool)))))
+          (:datasource store) => fake-pool)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Registry Integration Points
@@ -228,7 +228,7 @@
 
 (specification "Registry Wiring"
   (let [fake-pool {:type :fake-pool}
-        env (pg/pg-env {:pool fake-pool})
+        env (pg/pg-env {:datasource fake-pool})
         registry (::sc/statechart-registry env)]
 
     (component "in-memory registry"
@@ -257,7 +257,7 @@
 
 (specification "Invocation Processors"
   (let [fake-pool {:type :fake-pool}
-        env (pg/pg-env {:pool fake-pool})]
+        env (pg/pg-env {:datasource fake-pool})]
 
     (component "default invocation processors"
       (behavior "includes statechart invocation processor"
@@ -280,7 +280,7 @@
   (let [fake-pool {:type :fake-pool}]
 
     (component "custom node-id"
-      (let [env (pg/pg-env {:pool fake-pool :node-id "custom-worker-42"})]
+      (let [env (pg/pg-env {:datasource fake-pool :node-id "custom-worker-42"})]
         (behavior "uses provided node-id"
           (assertions
             (::pg/node-id env) => "custom-worker-42"))
@@ -292,7 +292,7 @@
     (component "custom invocation processors"
       (let [custom-processors [{:type :custom-processor-1}
                                {:type :custom-processor-2}]
-            env (pg/pg-env {:pool fake-pool
+            env (pg/pg-env {:datasource fake-pool
                             :invocation-processors custom-processors})]
         (behavior "uses provided invocation processors"
           (assertions
@@ -300,8 +300,8 @@
             (count (::sc/invocation-processors env)) => 2))))
 
     (component "auto-generated node-id"
-      (let [env1 (pg/pg-env {:pool fake-pool})
-            env2 (pg/pg-env {:pool fake-pool})]
+      (let [env1 (pg/pg-env {:datasource fake-pool})
+            env2 (pg/pg-env {:datasource fake-pool})]
         (behavior "generates unique node-ids"
           (assertions
             "node-ids are different"
@@ -334,7 +334,7 @@
 
 (specification "Maintenance Function Contracts"
   (let [fake-pool {:type :fake-pool}
-        env (pg/pg-env {:pool fake-pool})]
+        env (pg/pg-env {:datasource fake-pool})]
 
     (component "recover-stale-claims!"
       (behavior "accepts env and optional timeout"
@@ -377,7 +377,7 @@
 (specification "Wake Signal Mechanism"
   (component "send! with wake-signal"
     (let [fake-pool {:type :fake-pool}
-          env (pg/pg-env {:pool fake-pool})
+          env (pg/pg-env {:datasource fake-pool})
           wake-signal (java.util.concurrent.LinkedBlockingQueue.)
           env-with-signal (assoc env ::pg/wake-signal wake-signal)]
 

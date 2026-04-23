@@ -1,4 +1,4 @@
-(ns com.fulcrologic.statecharts.persistence.pg.integration-test
+(ns com.fulcrologic.statecharts.persistence.jdbc.integration-test
   "Integration tests for PostgreSQL persistence layer.
 
    These tests require a running PostgreSQL instance.
@@ -19,25 +19,27 @@
    [com.fulcrologic.statecharts :as sc]
    [com.fulcrologic.statecharts.chart :as chart]
    [com.fulcrologic.statecharts.elements :as ele :refer [state transition]]
-   [com.fulcrologic.statecharts.persistence.pg :as pg-sc]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.event-queue :as pg-eq]
-   [com.fulcrologic.statecharts.persistence.pg.registry :as pg-reg]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
-   [com.fulcrologic.statecharts.persistence.pg.working-memory-store :as pg-wms]
+   [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
+   [com.fulcrologic.statecharts.persistence.jdbc.registry :as pg-reg]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
    [com.fulcrologic.statecharts.protocols :as sp]
-   [pg.core :as pg]
-   [pg.pool :as pool]))
+   [next.jdbc.connection :as jdbc.connection])
+  (:import
+   [com.zaxxer.hikari HikariDataSource]))
 
 ;; -----------------------------------------------------------------------------
 ;; Test Configuration
 ;; -----------------------------------------------------------------------------
 
 (def ^:private test-config
-  {:host (or (System/getenv "PG_TEST_HOST") "localhost")
+  {:dbtype "postgres"
+   :dbname (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
+   :host (or (System/getenv "PG_TEST_HOST") "localhost")
    :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :database (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :user (or (System/getenv "PG_TEST_USER") "postgres")
+   :username (or (System/getenv "PG_TEST_USER") "postgres")
    :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
 
 (def ^:dynamic *pool* nil)
@@ -47,12 +49,12 @@
 ;; -----------------------------------------------------------------------------
 
 (defn with-pool [f]
-  (let [pool (pool/pool test-config)]
+  (let [ds (jdbc.connection/->pool HikariDataSource test-config)]
     (try
-      (binding [*pool* pool]
+      (binding [*pool* ds]
         (f))
       (finally
-        (pool/close pool)))))
+        (.close ^HikariDataSource ds)))))
 
 (defn with-clean-tables [f]
   (schema/create-tables! *pool*)
@@ -212,7 +214,7 @@
 ;; -----------------------------------------------------------------------------
 
 (deftest ^:integration pg-env-integration-test
-  (let [env (pg-sc/pg-env {:pool *pool*})
+  (let [env (pg-sc/pg-env {:datasource *pool*})
         chart (chart/statechart {:initial :s1}
                                 (state {:id :s1}
                                        (transition {:event :next :target :s2}))

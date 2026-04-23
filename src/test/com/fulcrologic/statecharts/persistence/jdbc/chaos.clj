@@ -1,4 +1,4 @@
-(ns com.fulcrologic.statecharts.persistence.pg.chaos
+(ns com.fulcrologic.statecharts.persistence.jdbc.chaos
   "Chaos testing harness for the PostgreSQL persistence layer.
 
    Provides:
@@ -12,16 +12,16 @@
   (:require
    [clojure.test :refer [is]]
    [com.fulcrologic.statecharts :as sc]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.event-queue :as pg-eq]
-   [com.fulcrologic.statecharts.persistence.pg.job-store :as job-store]
-   [com.fulcrologic.statecharts.persistence.pg.schema :as schema]
-   [com.fulcrologic.statecharts.persistence.pg.working-memory-store :as pg-wms]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
+   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
    [com.fulcrologic.statecharts.protocols :as sp]
-   [pg.core :as pg]
-   [pg.pool :as pool]
+   [next.jdbc.connection :as jdbc.connection]
    [taoensso.timbre :as log])
   (:import
+   [com.zaxxer.hikari HikariDataSource]
    [java.util.concurrent CyclicBarrier CountDownLatch TimeUnit
     ExecutorService Executors Future]))
 
@@ -145,13 +145,17 @@
 
 (defn execute-concurrent!
   "Execute functions concurrently with a barrier for synchronized start.
-   Returns a vector of {:result _ :error _ :thread-id _} maps."
+   Returns a vector of {:result _ :error _ :thread-id _} maps.
+
+   Worker functions are wrapped with `bound-fn*` so callers that rely on
+   dynamic bindings (e.g. `*pool*`) see the same values in worker threads."
   [fns & {:keys [timeout-ms] :or {timeout-ms 30000}}]
   (let [n (count fns)
         barrier (CyclicBarrier. n)
         done-latch (CountDownLatch. n)
-        results (atom (vec (repeat n nil)))]
-    (doseq [[i f] (map-indexed vector fns)]
+        results (atom (vec (repeat n nil)))
+        bound-fns (mapv bound-fn* fns)]
+    (doseq [[i f] (map-indexed vector bound-fns)]
       (.start
        (Thread.
         (fn []
@@ -173,13 +177,17 @@
 (defn run-workers!
   "Run n worker functions concurrently, each doing iterations-per-worker work.
    worker-fn receives (worker-id iteration).
-   Returns {:results [...] :errors [...] :duration-ms long}."
+   Returns {:results [...] :errors [...] :duration-ms long}.
+
+   worker-fn is wrapped with `bound-fn*` so callers that rely on dynamic
+   bindings (e.g. `*pool*`) see the same values in worker threads."
   [n iterations-per-worker worker-fn & {:keys [timeout-ms] :or {timeout-ms 60000}}]
   (let [barrier (CyclicBarrier. n)
         done-latch (CountDownLatch. n)
         all-results (atom [])
         all-errors (atom [])
-        start-time (System/nanoTime)]
+        start-time (System/nanoTime)
+        bound-worker-fn (bound-fn* worker-fn)]
     (doseq [worker-id (range n)]
       (.start
        (Thread.
@@ -188,7 +196,7 @@
             (.await barrier 10 TimeUnit/SECONDS)
             (dotimes [iter iterations-per-worker]
               (try
-                (let [result (worker-fn worker-id iter)]
+                (let [result (bound-worker-fn worker-id iter)]
                   (swap! all-results conj result))
                 (catch Exception e
                   (swap! all-errors conj
@@ -498,12 +506,13 @@
 ;; =============================================================================
 
 (defn make-pool
-  "Create a test pool with chaos-appropriate settings."
+  "Create a HikariCP DataSource with chaos-appropriate settings."
   [base-config & {:keys [min-size max-size]
                   :or {min-size 2 max-size 4}}]
-  (pool/pool (assoc base-config
-                    :pool-min-size min-size
-                    :pool-max-size max-size)))
+  (jdbc.connection/->pool HikariDataSource
+    (assoc base-config
+           :minimumIdle min-size
+           :maximumPoolSize max-size)))
 
 (defmacro with-chaos-pool
   "Create a pool, bind it, execute body, close pool."
@@ -512,7 +521,7 @@
      (try
        ~@body
        (finally
-         (pool/close ~binding)))))
+         (.close ^HikariDataSource ~binding)))))
 
 (defn setup-tables!
   "Create and truncate tables for a clean test run."

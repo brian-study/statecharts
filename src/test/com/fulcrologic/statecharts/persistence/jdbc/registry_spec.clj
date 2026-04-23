@@ -1,17 +1,17 @@
-(ns com.fulcrologic.statecharts.persistence.pg.registry-spec
+(ns com.fulcrologic.statecharts.persistence.jdbc.registry-spec
   "Tests for PostgreSQL statechart registry.
 
    These tests verify the StatechartRegistry protocol behavior,
    caching logic, and chart definition serialization.
 
-   NOTE: The PostgresStatechartRegistry is designed for charts that are pure data
+   NOTE: The JdbcStatechartRegistry is designed for charts that are pure data
    (no function guards/actions). For charts with functions, use the in-memory
    registry instead. The pg-env function now defaults to in-memory registry."
   (:require
    [com.fulcrologic.statecharts.chart :as chart]
    [com.fulcrologic.statecharts.elements :refer [state transition final initial]]
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
-   [com.fulcrologic.statecharts.persistence.pg.registry :as reg]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.registry :as reg]
    [com.fulcrologic.statecharts.protocols :as sp]
    [fulcro-spec.core :refer [=> assertions behavior component specification]]))
 
@@ -19,16 +19,16 @@
 ;; Registry Creation Tests
 ;; -----------------------------------------------------------------------------
 
-(specification "PostgresStatechartRegistry Record"
+(specification "JdbcStatechartRegistry Record"
   (component "new-registry"
     (behavior "creates registry with pool and empty cache"
       (let [fake-pool {:type :fake-pool}
             registry (reg/new-registry fake-pool)]
         (assertions
-          "creates a PostgresStatechartRegistry"
-          (instance? com.fulcrologic.statecharts.persistence.pg.registry.PostgresStatechartRegistry registry) => true
-          "stores the pool reference"
-          (:pool registry) => fake-pool
+          "creates a JdbcStatechartRegistry"
+          (instance? com.fulcrologic.statecharts.persistence.jdbc.registry.JdbcStatechartRegistry registry) => true
+          "stores the datasource reference"
+          (:datasource registry) => fake-pool
           "initializes empty cache"
           (map? @(:cache registry)) => true
           (empty? @(:cache registry)) => true))))

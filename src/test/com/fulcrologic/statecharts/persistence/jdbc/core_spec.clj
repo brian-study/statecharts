@@ -1,11 +1,11 @@
-(ns com.fulcrologic.statecharts.persistence.pg.core-spec
+(ns com.fulcrologic.statecharts.persistence.jdbc.core-spec
   "Tests for PostgreSQL persistence core utilities.
 
    Tests session ID serialization, nippy-based freeze/thaw, and version metadata.
    Note: SQL execution functions require a live database connection and are
    tested in integration_test.clj."
   (:require
-   [com.fulcrologic.statecharts.persistence.pg.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [fulcro-spec.core :refer [=> assertions behavior component specification]]))
 
 (specification "Session ID Serialization"
