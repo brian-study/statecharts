@@ -63,6 +63,31 @@
    Returns the Fulcro app state ident location of the working memory of a specific statechart session."
   impl/statechart-session-ident)
 
+(defn resolve-invocation-session-id
+  "Resolve a stored SCXML invokeid to the actual child session ID.
+
+   `stored-id` is typically the raw value written to `:idlocation`. If Fulcro
+   `state-map` is available, this prefers whichever session actually exists in
+   state. If no matching session is present, it falls back to the fork's scoped
+   child-session convention: `<parent-session-id>.<invokeid>`."
+  [state-map parent-session-id stored-id]
+  (when stored-id
+    (let [scoped-id (when parent-session-id
+                      (str parent-session-id "." (str stored-id)))]
+      (cond
+        (and state-map (get-in state-map (statechart-session-ident stored-id))) stored-id
+        (and state-map scoped-id (get-in state-map (statechart-session-ident scoped-id))) scoped-id
+        scoped-id scoped-id
+        :else stored-id))))
+
+(defn invoked-session-id
+  "Given Fulcro `state-map`, a `parent-session-id`, and an invocation `target-key`,
+   resolve the actual child session ID for the invocation stored at
+   `[:invocation/id target-key]`."
+  [state-map parent-session-id target-key]
+  (when-let [stored-id (get-in state-map (local-data-path parent-session-id :invocation/id target-key))]
+    (resolve-invocation-session-id state-map parent-session-id stored-id)))
+
 (def resolve-aliases
   "[statechart-event-data]
 

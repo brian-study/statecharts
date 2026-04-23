@@ -9,6 +9,7 @@
     [clojure.set :as set]
     [clojure.string :as str]
     [com.fulcrologic.statecharts :as-alias sc]
+    [com.fulcrologic.statecharts.integration.fulcro :as scf]
     [com.fulcrologic.statecharts.protocols :as scp]))
 
 ;; ---------------------------------------------------------------------------
@@ -188,7 +189,7 @@
                                          (fn [acc state-id]
                                            (let [target-key (get-in elements-by-id [state-id :route/target])]
                                              (if-let [child-sid (and target-key
-                                                                  (get-in local-data [:invocation/id target-key]))]
+                                                                  (scf/invoked-session-id state-map sid target-key))]
                                                (let [child (collect child-sid seen)]
                                                  (cond-> acc
                                                    (seq (:state-ids child)) (update :state-ids into (:state-ids child))

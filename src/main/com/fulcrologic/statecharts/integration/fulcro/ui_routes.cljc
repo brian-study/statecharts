@@ -282,9 +282,9 @@
 
    The remaining keys in the props are kept for the top-level emitted state.
 
-   The session ID of the invoked chart will be at data location `[:invocation/id target-key]` of the routing session
-   (see uir/session-id), where `target-key` is the `:route/target`'s registry keyword. Use `send-to-self!` to
-   send events to the component's chart.
+   The invokeid of the invoked chart will be at data location `[:invocation/id target-key]` of the routing session
+   (see uir/session-id), where `target-key` is the `:route/target`'s registry keyword. Use `send-to-self!` or
+   `scf/invoked-session-id` to resolve the actual child session ID when needed.
 
    The invoked component should specify an ro/idlocation so that events can be sent to it from within.
   "
@@ -647,7 +647,7 @@
   (loop [c this]
     (when c
       (let [key (rc/class->registry-key (rc/component-type c))
-            sid (get-in state-map [::sc/local-data session-id :invocation/id key])]
+            sid (scf/invoked-session-id state-map session-id key)]
         (if sid
           sid
           (recur (rc/isoget-in c [:props :fulcro$parent])))))))

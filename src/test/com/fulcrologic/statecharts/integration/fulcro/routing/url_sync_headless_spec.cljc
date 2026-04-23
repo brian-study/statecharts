@@ -627,7 +627,7 @@
            (settle! app)
            ;; Trigger on-save with child session-id to test parent chain delegation
            (let [state-map        (rapp/current-state app)
-                 child-session-id (get-in state-map [::sc/local-data sid :invocation/id admin-key])]
+                 child-session-id (scf/invoked-session-id state-map sid admin-key)]
              (when child-session-id
                (sroute/url-sync-on-save child-session-id nil app)))
 
@@ -817,7 +817,7 @@
            (sroute/route-to! app `DashReports)
            (settle! app)
            (let [state-map        (rapp/current-state app)
-                 child-session-id (get-in state-map [::sc/local-data sid :invocation/id dash-panel-key])]
+                 child-session-id (scf/invoked-session-id state-map sid dash-panel-key)]
              (when child-session-id
                (sroute/url-sync-on-save child-session-id nil app)))
 
@@ -888,7 +888,7 @@
 
       ;; Before entering istate, no child session exists
       (let [state-map (rapp/current-state app)
-            child-sid (get-in state-map [::sc/local-data sid :invocation/id admin-key])]
+            child-sid (scf/invoked-session-id state-map sid admin-key)]
         (assertions
           "no child session before entering istate"
           child-sid => nil))
@@ -898,7 +898,7 @@
       (settle! app)
 
       (let [state-map (rapp/current-state app)
-            child-sid (get-in state-map [::sc/local-data sid :invocation/id admin-key])
+            child-sid (scf/invoked-session-id state-map sid admin-key)
             child-cfg (when child-sid (scf/current-configuration app child-sid))]
         (assertions
           "child session exists after entering istate"
@@ -919,7 +919,7 @@
 
       ;; Send route event directly to child session (same path as send-to-self!)
       (let [state-map (rapp/current-state app)
-            child-sid (get-in state-map [::sc/local-data sid :invocation/id admin-key])]
+            child-sid (scf/invoked-session-id state-map sid admin-key)]
         (scf/send! app child-sid (sroute/route-to-event-name admin-settings-key) {})
         (settle! app)
 
@@ -934,7 +934,7 @@
 
       ;; On PageA -- not in any istate
       (let [state-map (rapp/current-state app)
-            child-sid (get-in state-map [::sc/local-data sid :invocation/id admin-key])]
+            child-sid (scf/invoked-session-id state-map sid admin-key)]
         (assertions
           "no child session on a regular rstate"
           child-sid => nil)))))

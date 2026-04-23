@@ -392,7 +392,11 @@
    * `on-done` — `(fn [env data & rest] ops)` run if the child chart hits a final state.
    * `exit-target` — State ID to transition to on child chart completion.
    * `statechart-id` — Override the component's co-located chart/id.
-   * `child-session-id` — Explicit session ID for the invoked chart."
+   * `child-session-id` — Explicit session ID for the invoked chart.
+
+   The value stored at `[:invocation/id target-key]` is the invokeid per SCXML.
+   Use `send-to-self!`, `current-invocation-configuration`, or
+   `scf/invoked-session-id` to resolve the actual child session ID when needed."
   [{:keys       [id child-session-id route/target invoke-params namelist finalize autoforward on-done exit-target statechart-id]
     :route/keys [segment reachable]
     :or         {invoke-params {}}
@@ -532,7 +536,7 @@
                       (when target-key
                         (check-component-busy? app state-map local-data target-key))
                       (when-let [child-session-id (and target-key
-                                                    (get-in local-data [:invocation/id target-key]))]
+                                                    (scf/invoked-session-id state-map session-id target-key))]
                         (deep-busy? app registry state-map child-session-id seen)))))
             configuration))))))
 
@@ -645,9 +649,14 @@
                                                :cond  (fn [env _data & _]
                                                         (contains? (senv/current-configuration env) owner-id))}
                                     (ele/raise {:event :event.routing-info/close})
-                                    (script {:expr (fn [env data _event-name event-data]
-                                                     (let [child-session-id (get-in data [:invocation/id owner-id])
-                                                           {::sc/keys [event-queue]} env]
+                                    (script {:expr (fn [{:fulcro/keys [app]
+                                                         ::sc/keys    [event-queue]
+                                                         :as          env} data _event-name event-data]
+                                                     (let [state-map         (some-> app rapp/current-state)
+                                                           child-session-id (scf/resolve-invocation-session-id
+                                                                              state-map
+                                                                              (senv/session-id env)
+                                                                              (get-in data [:invocation/id owner-id]))]
                                                        (when child-session-id
                                                          (scp/send! event-queue env
                                                            {:target            child-session-id
@@ -793,7 +802,7 @@
                     ;; Compound route state in this chart — not a leaf, keep walking children
                     acc
                     ;; Leaf route in this chart — check for child invocation
-                    (let [child-sid (get-in local-data [:invocation/id target])]
+                    (let [child-sid (scf/invoked-session-id state-map session-id target)]
                       (if child-sid
                         ;; Child chart exists — recurse into it for deeper leaves
                         (let [child-leaves (deep-leaf-routes state-map registry child-sid seen)]
@@ -842,7 +851,7 @@
   (loop [c this]
     (when c
       (let [key (rc/class->registry-key (rc/component-type c))
-            sid (get-in state-map [::sc/local-data session-id :invocation/id key])]
+            sid (scf/invoked-session-id state-map session-id key)]
         (if sid
           sid
           (recur (rc/isoget-in c [:props :fulcro$parent])))))))
