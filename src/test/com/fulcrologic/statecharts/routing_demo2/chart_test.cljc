@@ -52,7 +52,7 @@
      (sp/register-statechart! statechart-registry chart-key demo-chart/routing-chart)
      (sp/start! processor env chart-key
        (cond-> {::sc/session-id ::test-session}
-         initial-dm (assoc ::wmdm/data-model initial-dm))))))
+         initial-dm (assoc ::sc/data-model initial-dm))))))
 
 (defn- send-event!
   "Sends an event and returns the resulting working memory (possibly a promise)."
@@ -77,7 +77,7 @@
 (defn- dm-val
   "Gets a value from the flat data model in working memory."
   [wmem k]
-  (get-in wmem [::wmdm/data-model k]))
+  (get-in wmem [::sc/data-model k]))
 
 ;; ---------------------------------------------------------------------------
 ;; Tests
