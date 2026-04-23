@@ -4,13 +4,16 @@
 
    ::sc/k in the docstrings of this namespace assumes the alias `[com.fulcrologic.statecharts :as sc]`, which
    can be generated as only an alias, though an empty namespace of that name does exist."
-  (:require
-    [clojure.set :as set]
-    [com.fulcrologic.guardrails.malli.core :refer [=> >defn >defn- ?]]
-    [com.fulcrologic.statecharts :as sc]
-    [com.fulcrologic.statecharts.elements :as elements]
-    [com.fulcrologic.statecharts.malli-specs]
-    [taoensso.timbre :as log]))
+   (:require
+     [clojure.set :as set]
+     [clojure.string :as str]
+     [com.fulcrologic.guardrails.malli.core :refer [=> >defn >defn- ?]]
+     [com.fulcrologic.statecharts :as sc]
+     [com.fulcrologic.statecharts.elements :as elements]
+     [com.fulcrologic.statecharts.malli-specs]
+     [taoensso.timbre :as log]))
+
+(declare invalid-history-elements)
 
 ;; I did try to translate all that imperative code to something more functional...got really tiring, and generated
 ;; subtle bugs divergent from spec.
@@ -118,9 +121,13 @@
                            children)
         legal-node-types #{:state :parallel :final :data-model :script}
         bad-nodes        (set/difference node-types legal-node-types)]
-    (when (seq bad-nodes)
-      (throw (ex-info (str "Illegal top-level node. Root node cannot have: " bad-nodes " elements.") {})))
-    node))
+     (when (seq bad-nodes)
+       (throw (ex-info (str "Illegal top-level node. Root node cannot have: " bad-nodes " elements.") {})))
+     (let [invalid-histories (invalid-history-elements node)]
+       (when (seq invalid-histories)
+         (let [msgs (into [] (mapcat :msgs) invalid-histories)]
+           (throw (ex-info (str "Invalid history element(s): " (str/join "; " msgs)) {:invalid invalid-histories})))))
+     node))
 
 (def scxml "Alias for `statechart`." statechart)
 
@@ -397,19 +404,96 @@
 
 (defn invalid-history-elements
   "Returns a sequence of history elements from `chart` that have errors. Each node will contain a `:msgs` key
-   with the problem descriptions. This is a static check."
+   with the problem descriptions. This is a static check.
+
+   Validates per W3C SCXML Section 3.10:
+   - History must have exactly one transition child
+   - History transition must not have event or cond attributes
+   - History must be child of a compound or parallel state
+   - Shallow history requires exactly one target
+   - Deep history target should be a proper descendant of the parent state"
   [chart]
   (let [history-nodes (filter #(history-element? chart %) (vals (::sc/elements-by-id chart)))
         e             (fn [n msg] (update n :msgs conj msg))]
-    (for [{:keys [parent deep?] :as hn} history-nodes       ; Section 3.10.2 of spec
+    (for [{:keys [parent deep? type] :as hn} history-nodes  ; Section 3.10 of spec
           :let [transitions        (transitions chart hn)
-                {:keys [target event cond]} (first transitions)
-                immediate-children (set (child-states chart parent))
+                transition-element (element chart (first transitions))
+                {:keys [target event cond]} transition-element
+                parent-descendants (all-descendants chart parent)
+                parent-can-have-history? (or (compound-state? chart parent) 
+                                              (parallel-state? chart parent))
+                targets-are-proper-descendants? (every? #(contains? parent-descendants %) target)
                 possible-problem   (cond-> (assoc hn :msgs [])
-                                     (= 1 (count transitions)) (e "A history node MUST have exactly one transition")
-                                     (and (nil? event) (nil? cond)) (e "A history transition MUST NOT have cond/event.")
+                                     (not= 1 (count transitions)) (e "A history node MUST have exactly one transition")
+                                     (or (some? event) (some? cond)) (e "A history transition MUST NOT have cond/event.")
+                                     (not parent-can-have-history?) (e "A history node MUST be a child of a compound or parallel state.")
                                      (and (not deep?) (not= 1 (count target))) (e "Exactly ONE transition target is required for shallow history.")
-                                     ;; TODO: Validate deep history
-                                     (or deep? (= 1 (count immediate-children))) (e "Exactly ONE transition target for shallow. If many, then deep history is required."))]
+                                     (and deep? (seq target) (not targets-are-proper-descendants?)) (e "Deep history transition target should be a proper descendant of the parent state."))]
           :when (pos-int? (count (:msgs possible-problem)))]
       possible-problem)))
+
+;; ============================================================================
+;; Diagram Label Functions
+;; ============================================================================
+
+(defn diagram-label
+  "Returns a display label for a statechart element. Prefers `:diagram/label` if present,
+   otherwise falls back to `(name id)`."
+  [{:keys [id] :as element}]
+  (or (:diagram/label element)
+      (some-> id name)))
+
+(defn transition-label
+  "Returns a UML-formatted label for a transition: `event [guard] / action1, action2`.
+
+   If the transition has a `:diagram/label`, that overrides everything.
+   Otherwise assembles from `:event`, `:diagram/condition` (or `[cond]` if `:cond` is present),
+   and `:diagram/label` values from executable content children."
+  [elements-by-id transition-element]
+  (if-let [override (:diagram/label transition-element)]
+    override
+    (let [{:keys [event children]} transition-element
+          has-cond?      (contains? transition-element :cond)
+          condition-part (:diagram/condition transition-element)
+          guard         (cond
+                          condition-part (str "[" condition-part "]")
+                          has-cond? "[cond]"
+                          :else nil)
+          action-labels (into []
+                          (keep (fn [child-id]
+                                  (:diagram/label (get elements-by-id child-id))))
+                          children)
+          parts         (cond-> []
+                          event (conj (str event))
+                          guard (conj guard)
+                          (seq action-labels) (conj (str "/ " (str/join ", " action-labels))))]
+      (when (seq parts)
+        (str/join " " parts)))))
+
+(defn state-entry-labels
+  "Returns a vec of `:diagram/label` strings from the executable content children
+   of the on-entry handlers of `state-element`."
+  [elements-by-id state-element]
+  (let [entry-ids (filterv #(= :on-entry (:node-type (get elements-by-id %)))
+                    (:children state-element))]
+    (into []
+      (comp
+        (mapcat (fn [entry-id]
+                  (:children (get elements-by-id entry-id))))
+        (keep (fn [child-id]
+                (:diagram/label (get elements-by-id child-id)))))
+      entry-ids)))
+
+(defn state-exit-labels
+  "Returns a vec of `:diagram/label` strings from the executable content children
+   of the on-exit handlers of `state-element`."
+  [elements-by-id state-element]
+  (let [exit-ids (filterv #(= :on-exit (:node-type (get elements-by-id %)))
+                   (:children state-element))]
+    (into []
+      (comp
+        (mapcat (fn [exit-id]
+                  (:children (get elements-by-id exit-id))))
+        (keep (fn [child-id]
+                (:diagram/label (get elements-by-id child-id)))))
+      exit-ids)))

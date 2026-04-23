@@ -4,7 +4,7 @@
     <groupId>com.fulcrologic</groupId>
     <artifactId>statecharts</artifactId>
     <packaging>jar</packaging>
-    <version>1.2.26-SNAPSHOT</version>
+    <version>1.4.0-RC12-SNAPSHOT</version>
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.source>1.8</maven.compiler.source>
@@ -82,6 +82,11 @@
             <groupId>metosin</groupId>
             <artifactId>malli</artifactId>
             <version>0.20.0</version>
+        </dependency>
+        <dependency>
+            <groupId>funcool</groupId>
+            <artifactId>promesa</artifactId>
+            <version>11.0.678</version>
         </dependency>
         <dependency>
             <groupId>org.clojure</groupId>

@@ -21,6 +21,12 @@
     [com.fulcrologic.statecharts.util :refer [genid new-uuid]]
     [taoensso.timbre :as log]))
 
+;; NOTE: DEBUG-level logging may include chart data/events. Disable in production with sensitive data.
+
+(def ^:private max-eventless-iterations
+  "Safety limit for eventless transition loops to prevent infinite cycling in misconfigured charts."
+  1000)
+
 #?(:clj
    (defmacro with-processing-context [env & body]
      `(let [vwmem# (get ~env ::sc/vwmem)]
@@ -82,6 +88,8 @@
     (log/debug "Running expression" expr)
     (log/spy :debug
       (sp/run-expression! execution-model env expr))
+    ;; W3C SCXML Section 4.4: errors in executable content MUST generate error.execution
+    ;; events rather than crashing the state machine. Broad catch is intentional.
     (catch #?(:clj Throwable :cljs :default) e
       (log/error e "Expression failure")
       (let [session-id (env/session-id env)]
@@ -281,9 +289,11 @@
       :info (log/info (or label "LOG") (run-expression! raw-env expr))
       (log/debug (or label "LOG") (run-expression! raw-env expr)))))
 
-(defmethod execute-element-content! :raise [env {:keys [event]}]
+(defmethod execute-element-content! :raise [env {:keys [event data]}]
   (log/debug "Raise " event)
-  (raise env event))
+  (if data
+    (raise env (evts/new-event {:name event :data (run-expression! (assoc env ::sc/raw-result? true) data)}))
+    (raise env event)))
 
 (defmethod execute-element-content! :assign [env {:keys [location expr]}]
   (let [v (run-expression! (assoc env ::sc/raw-result? true) expr)]
@@ -335,6 +345,69 @@
   (let [id (!? env sendid sendidexpr)]
     (sp/cancel! event-queue env (env/session-id env) id)))
 
+(defmethod execute-element-content! :if [env {:keys [children] :as element}]
+  (log/debug "Evaluating if" element)
+  (let [{::sc/keys [statechart]} env
+        ;; Split children into then-branch and else-branches
+        [then-branch else-branches]
+        (loop [remaining children
+               then []
+               elses []]
+          (if (empty? remaining)
+            [then elses]
+            (let [child-id (first remaining)
+                  {:keys [node-type]} (chart/element statechart child-id)]
+              (if (#{:else-if :else} node-type)
+                (recur (rest remaining) then (conj elses child-id))
+                (recur (rest remaining) (conj then child-id) elses)))))]
+    ;; Evaluate main condition
+    (if (condition-match env element)
+      ;; Execute then-branch
+      (doseq [child-id then-branch]
+        (execute-element-content! env (chart/element statechart child-id)))
+      ;; Check else-if/else branches
+      (letfn [(check-branches [branches]
+                (when (seq branches)
+                  (let [branch-id (first branches)
+                        branch-ele (chart/element statechart branch-id)
+                        {:keys [node-type]} branch-ele]
+                    (cond
+                      (= node-type :else-if)
+                      (if (condition-match env branch-ele)
+                        (execute-element-content! env branch-ele)
+                        (check-branches (rest branches)))
+
+                      (= node-type :else)
+                      (execute-element-content! env branch-ele)
+
+                      :else
+                      (check-branches (rest branches))))))]
+        (check-branches else-branches)))))
+
+(defmethod execute-element-content! :else-if [env {:keys [children] :as element}]
+  (log/debug "Executing else-if branch" element)
+  (let [{::sc/keys [statechart]} env]
+    (doseq [child-id children]
+      (execute-element-content! env (chart/element statechart child-id)))))
+
+(defmethod execute-element-content! :else [env {:keys [children] :as element}]
+  (log/debug "Executing else branch" element)
+  (let [{::sc/keys [statechart]} env]
+    (doseq [child-id children]
+      (execute-element-content! env (chart/element statechart child-id)))))
+
+(defmethod execute-element-content! :for-each [{::sc/keys [data-model statechart] :as env}
+                                                {:keys [array item index children] :as element}]
+  (log/debug "Executing for-each" element)
+  (let [coll (run-expression! (assoc env ::sc/raw-result? true) array)]
+    (doseq [[idx value] (map-indexed vector coll)]
+      (when item
+        (sp/update! data-model env {:ops [(ops/assign item value)]}))
+      (when index
+        (sp/update! data-model env {:ops [(ops/assign index idx)]}))
+      (doseq [child-id children]
+        (execute-element-content! env (chart/element statechart child-id))))))
+
 (>defn execute!
   "Run the executable content (immediate children) of s."
   [{::sc/keys [statechart] :as env} s]
@@ -345,8 +418,9 @@
       (try
         (let [ele (chart/element statechart n)]
           (execute-element-content! env ele))
+        ;; W3C SCXML Section 4.4: executable content errors must not crash the machine.
+        ;; Broad catch is intentional to match spec behavior.
         (catch #?(:clj Throwable :cljs :default) t
-          ;; TODO: Proper error event for execution problem
           (log/error t "Unexpected exception in content")))))
   nil)
 
@@ -632,21 +706,28 @@
   "Work through eventless transitions, returning the updated working memory"
   [{::sc/keys [vwmem] :as env}]
   [::sc/processing-env => nil?]
-  (let [macrostep-done? (volatile! false)]
+  (let [macrostep-done? (volatile! false)
+        iterations      (volatile! 0)]
     (while (and (::sc/running? @vwmem) (not @macrostep-done?))
-      (select-eventless-transitions! env)
-      (let [{::sc/keys [enabled-transitions
-                        internal-queue]} @vwmem]
-        (when (empty? enabled-transitions)
-          (if (empty? internal-queue)
-            (vreset! macrostep-done? true)
-            (let [internal-event (first internal-queue)]
-              (log/spy :debug internal-event)
-              (vswap! vwmem update ::sc/internal-queue pop)
-              (env/assign! env [:ROOT :_event] internal-event)
-              (select-transitions! env internal-event))))
-        (when (seq (::sc/enabled-transitions @vwmem))
-          (microstep! env)))))
+      (vswap! iterations inc)
+      (when (> @iterations max-eventless-iterations)
+        (log/error "Eventless transition loop exceeded" max-eventless-iterations
+          "iterations. Possible infinite loop in chart. Breaking.")
+        (vreset! macrostep-done? true))
+      (when-not @macrostep-done?
+        (select-eventless-transitions! env)
+        (let [{::sc/keys [enabled-transitions
+                          internal-queue]} @vwmem]
+          (when (empty? enabled-transitions)
+            (if (empty? internal-queue)
+              (vreset! macrostep-done? true)
+              (let [internal-event (first internal-queue)]
+                (log/spy :debug internal-event)
+                (vswap! vwmem update ::sc/internal-queue pop)
+                (env/assign! env [:ROOT :_event] internal-event)
+                (select-transitions! env internal-event))))
+          (when (seq (::sc/enabled-transitions @vwmem))
+            (microstep! env))))))
   nil)
 
 (>defn run-exit-handlers!
@@ -696,15 +777,19 @@
   [::sc/processing-env => nil?]
   (let [{::sc/keys [running?]} @vwmem]
     (if running?
-      (loop []
-        (vswap! vwmem assoc ::sc/enabled-transitions (chart/document-ordered-set statechart) ::sc/macrostep-done? false)
-        (handle-eventless-transitions! env)
-        (if (-> vwmem deref ::sc/running?)
-          (do
-            (run-invocations! env)
-            (when (seq (::sc/internal-queue @vwmem))
-              (recur)))
-          (exit-interpreter! env)))
+      (loop [iteration 0]
+        (when (> iteration max-eventless-iterations)
+          (log/error "before-event! loop exceeded" max-eventless-iterations
+            "iterations. Possible infinite loop in chart. Breaking."))
+        (when (<= iteration max-eventless-iterations)
+          (vswap! vwmem assoc ::sc/enabled-transitions (chart/document-ordered-set statechart) ::sc/macrostep-done? false)
+          (handle-eventless-transitions! env)
+          (if (-> vwmem deref ::sc/running?)
+            (do
+              (run-invocations! env)
+              (when (seq (::sc/internal-queue @vwmem))
+                (recur (inc iteration))))
+            (exit-interpreter! env))))
       (exit-interpreter! env))))
 
 (defn cancel? [event] (= :com.fulcrologic.statecharts.events/cancel (:name event)))
@@ -823,6 +908,12 @@
           (doseq [n all-data-model-nodes]
             (in-state-context env n
               (initialize-data-model! env (chart/get-parent statechart n))))))
+      ;; Bind SCXML system variables (Section 5.7) into data model
+      (let [session-id (env/session-id env)
+            chart-name (:name statechart)
+            system-vars (cond-> {:_sessionid session-id}
+                          chart-name (assoc :_name chart-name))]
+        (sp/update! data-model env {:ops (ops/set-map-ops system-vars)}))
       (when (map? invocation-data)
         (sp/update! data-model env {:ops (ops/set-map-ops invocation-data)}))
       (enter-states! env)

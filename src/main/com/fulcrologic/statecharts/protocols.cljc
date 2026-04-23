@@ -193,7 +193,11 @@
      events as `invokeid` so that the session can properly process them through `finalize`.
 
      The newly started invocation instance MUST remember `invokeid`, and respond to calls of `stop-invocation!`
-     and `forward-event!`.")
+     and `forward-event!`.
+
+     Returns `true` if the invocation was successfully started, or `false` if the invocation failed to start
+     (e.g., chart not found, invalid function). Implementations SHOULD send an :error.platform event to the
+     parent session when returning `false`.")
   (stop-invocation! [this env {:keys [type invokeid]}] "Stop the invocation of `type` that was started with `invokeid` from the given `env`.")
   (forward-event! [this env {:keys [type invokeid event]}]
     "Forward the given event from the source `env` to the invocation of the given `type` that is identified by `invokeid`. The
@@ -211,6 +215,13 @@
      and values are the statechart definitions."))
 
 (defprotocol WorkingMemoryStore
+  "Persistence layer for statechart session state. Working memory is saved after each
+   event processing step and retrieved at the start of the next. Implementations range
+   from in-memory atoms (for development) to durable stores (for production).
+
+   Lifecycle: `save-working-memory!` is called after `start!` and each `process-event!`.
+   `get-working-memory` is called before each `process-event!`. `delete-working-memory!`
+   is called when a session reaches a final state."
   (get-working-memory [this env session-id] "Get the working memory for a state machine with session-id")
   (save-working-memory! [this env session-id wmem]
     "Save working memory for session-id")

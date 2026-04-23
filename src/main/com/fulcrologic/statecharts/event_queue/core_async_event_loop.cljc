@@ -12,11 +12,17 @@
     [com.fulcrologic.statecharts :as sc]
     [com.fulcrologic.statecharts.protocols :as sp]
     [taoensso.encore :as enc]
+    [promesa.core :as p]
     [taoensso.timbre :as log]))
 
 (defn run-event-loop!
   "Initializes a new session using `sp/start!` on the processor and assigns it `session-id`.
    Then runs a continuous loop polling the event-queue for new events and processing them.
+
+   WARNING: This event loop processes all ready events in a single `receive-events!` call
+   without per-session serialization. When using an async processor that returns promises,
+   events for the same session may process concurrently. For async processors, use
+   `async-event-loop/run-serialized-event-loop!` instead.
 
    `wmem-atom` is an atom that will be updated with the latest working memory of the state
    machine, and allows you to look at the state of it from outside.  It is safe to read the active states
@@ -40,10 +46,14 @@
               (log/warn "Event did not have a session target. This queue only supports events to charts." event)
               (let [session-id target
                     wmem       (sp/get-working-memory working-memory-store env session-id)
-                    next-mem   (when wmem (sp/process-event! processor env wmem event))]
-                (if next-mem
-                  (sp/save-working-memory! working-memory-store env session-id next-mem)
-                  (log/debug "Session had no working memory. Event could not be sent to session" {:event event :id session-id})))))
+                    result     (when wmem (sp/process-event! processor env wmem event))
+                    save-fn    (fn [next-mem]
+                                 (if next-mem
+                                   (sp/save-working-memory! working-memory-store env session-id next-mem)
+                                   (log/debug "Session had no working memory. Event could not be sent to session" {:event event :id session-id})))]
+                (if (p/promise? result)
+                  (p/then result save-fn)
+                  (save-fn result)))))
           {}))
       (if @running?
         (recur)

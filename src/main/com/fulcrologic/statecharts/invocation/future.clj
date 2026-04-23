@@ -27,32 +27,41 @@
           done-event-name (evts/invoke-done-event invokeid)
           error-event-name (evts/invoke-error-event invokeid)]
       (if-not (fn? src)
-        (sp/send! event-queue env {:target source-session-id
-                                   :sendid child-session-id
-                                   :source-session-id child-session-id
-                                   :event :error.platform
-                                   :data {:message "Could not invoke future. No function supplied."
-                                          :target src}})
-        (let [f (future
-                  (try
-                    (let [result (src params)]
-                      (sp/send! event-queue env {:target source-session-id
-                                                 :sendid child-session-id
-                                                 :source-session-id child-session-id
-                                                 :event done-event-name
-                                                 :data (if (map? result) result {})}))
-                    (catch Throwable t
-                      (log/error t "Future invocation failed" {:invokeid invokeid})
-                      (sp/send! event-queue env {:target source-session-id
-                                                 :sendid child-session-id
-                                                 :source-session-id child-session-id
-                                                 :event error-event-name
-                                                 :data {:message (.getMessage t)
-                                                        :type (str (type t))}}))
-                    (finally
-                      (swap! active-futures dissoc child-session-id))))]
-          (swap! active-futures assoc child-session-id f)))
-      true))
+        (do
+          (sp/send! event-queue env {:target            source-session-id
+                                     :sendid            child-session-id
+                                     :source-session-id child-session-id
+                                     :event             :error.platform
+                                     :data              {:message "Could not invoke future. No function supplied."
+                                                         :target  src}})
+          false)
+        ;; `started` promise: block the future body until we've registered it in active-futures,
+        ;; so a very-fast completion can't run the finally dissoc before the assoc happens.
+        (let [started (promise)
+              f       (future
+                        @started
+                        (try
+                          (let [result (src params)]
+                            (sp/send! event-queue env {:target            source-session-id
+                                                       :sendid            child-session-id
+                                                       :source-session-id child-session-id
+                                                       :event             done-event-name
+                                                       :data              (if (map? result) result {})}))
+                          (catch Throwable t
+                            (log/error t "Future invocation failed" {:invokeid invokeid})
+                            (sp/send! event-queue env {:target            source-session-id
+                                                       :sendid            child-session-id
+                                                       :source-session-id child-session-id
+                                                       :event             error-event-name
+                                                       :data              {:message (.getMessage t)
+                                                                           :type    (str (type t))}}))
+                          (finally
+                            (swap! active-futures dissoc child-session-id))))]
+          (try
+            (swap! active-futures assoc child-session-id f)
+            (finally
+              (deliver started true)))
+          true))))
   (stop-invocation! [_ env {:keys [invokeid]}]
     (log/debug "Stop future" invokeid)
     (let [source-session-id (env/session-id env)

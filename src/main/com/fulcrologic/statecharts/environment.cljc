@@ -49,7 +49,14 @@
 (def In
   "[env state-id]
 
-   Alias for `is-in-state?`"
+   Returns true if `state-id` is in the current configuration (active states).
+   This is the SCXML `In()` predicate (Section 5.10.1).
+
+   NOTE: Requires `::sc/vwmem` in `env`, which is only available during algorithm
+   execution (on-entry, on-exit, transition conditions, scripts). Not available
+   in data model methods.
+
+   See also `com.fulcrologic.statecharts.elements/In`, which is more ergonomic in charts."
   is-in-state?)
 
 (>defn context-element-id
@@ -74,7 +81,7 @@
   "Place an event on the internal event queue for immediate processing. Only callable from within active runnable content"
   ([env event-name data]
    [::sc/processing-env ::sc/event-name map? => nil?]
-   (raise env {:name event-name :data data}))
+   (raise env (evts/new-event {:name event-name :data data})))
   ([{::sc/keys [vwmem] :as env} event]
    [::sc/processing-env ::sc/event-or-name => nil?]
    (vswap! vwmem update ::sc/internal-queue conj (evts/new-event event))
