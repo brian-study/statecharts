@@ -1,3 +1,24 @@
+2.0.3
+-----
+
+Follow-ups from the post-2.0.2 review.
+
+* **Async processor**: `v20150901_async_impl.cljc` had the same
+  `(merge {defaults} wmem)` metadata-strip bug as the sync impl fixed in
+  2.0.2. Users pairing the async processor with JDBC persistence (e.g.
+  via `integration/fulcro`) still had optimistic locking silently
+  disabled. Fixed by the same `with-meta (meta wmem)` wrapping in both
+  `processing-env` and `process-event!`.
+* **DurableJobInvocationProcessor** now honours the `InvocationProcessor`
+  protocol when `create-job!` throws (e.g. exhausted race retries after
+  2.0.2): returns `false` and emits an `:error.platform` event targeting
+  the parent session, rather than letting the exception leak past the
+  SCXML processor. Matches the pattern in `invocation/statechart.cljc`.
+
+Regression coverage:
+* `async-processing-env-preserves-wmem-metadata-test`
+* `durable-job-start-invocation-survives-create-job-failure-test`
+
 2.0.2
 -----
 

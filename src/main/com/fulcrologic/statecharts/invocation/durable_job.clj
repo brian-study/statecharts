@@ -38,26 +38,51 @@
   sp/InvocationProcessor
   (supports-invocation-type? [_ typ] (= :durable-job typ))
 
-  (start-invocation! [_ env {:keys [invokeid src params]}]
+  (start-invocation! [_ {::sc/keys [event-queue] :as env} {:keys [invokeid src params]}]
     (let [session-id (env/session-id env)
           new-id     (random-uuid)
           job-type   (if (keyword? src) (name src) (str src))
-          job-id     (job-store/create-job! pool
-                       {:id           new-id
-                        :session-id   session-id
-                        :invokeid     invokeid
-                        :job-type     job-type
-                        :payload      params})
-          {:keys [job-id-key job-kind-key]} (invoke-data-keys invokeid)]
-      (log/info "Durable job created"
-                {:job-id job-id :session-id session-id :invokeid invokeid :job-type job-type})
-      (sp/update! (::sc/data-model env) env
-        {:ops [(ops/assign job-id-key (str job-id)
-                           job-kind-key job-type)]})
-      ;; Wake the worker to pick up the new job immediately
-      (when wake-worker-fn
-        (let [f (if (instance? clojure.lang.IDeref wake-worker-fn) @wake-worker-fn wake-worker-fn)]
-          (when f (f))))))
+          ;; Per the InvocationProcessor protocol: return `false` and emit an
+          ;; :error.platform event to the parent session if start fails.
+          ;; create-job! can throw when it exhausts race retries (see v2.0.2
+          ;; change in job-store).
+          [job-id create-error] (try
+                                  [(job-store/create-job! pool
+                                     {:id           new-id
+                                      :session-id   session-id
+                                      :invokeid     invokeid
+                                      :job-type     job-type
+                                      :payload      params})
+                                   nil]
+                                  (catch Exception e
+                                    [nil e]))]
+      (if create-error
+        (do
+          (log/error create-error "start-invocation! failed"
+                     {:session-id session-id :invokeid invokeid :src src})
+          (when event-queue
+            (sp/send! event-queue env
+              {:target            session-id
+               :source-session-id session-id
+               :sendid            (str new-id)
+               :invoke-id         invokeid
+               :event             :error.platform
+               :data              {:message  (.getMessage ^Exception create-error)
+                                   :invokeid invokeid
+                                   :src      src
+                                   :cause    (or (ex-data create-error) {})}}))
+          false)
+        (let [{:keys [job-id-key job-kind-key]} (invoke-data-keys invokeid)]
+          (log/info "Durable job created"
+                    {:job-id job-id :session-id session-id :invokeid invokeid :job-type job-type})
+          (sp/update! (::sc/data-model env) env
+            {:ops [(ops/assign job-id-key (str job-id)
+                               job-kind-key job-type)]})
+          ;; Wake the worker to pick up the new job immediately
+          (when wake-worker-fn
+            (let [f (if (instance? clojure.lang.IDeref wake-worker-fn) @wake-worker-fn wake-worker-fn)]
+              (when f (f))))
+          true))))
 
   (stop-invocation! [_ env {:keys [invokeid]}]
     (let [session-id (env/session-id env)]

@@ -1056,14 +1056,19 @@
       (assoc env
         ::sc/context-element-id :ROOT
         ::sc/statechart statechart
-        ::sc/vwmem (volatile! (merge
-                                {::sc/session-id         (or session-id (genid "session"))
-                                 ::sc/statechart-src     statechart-src
-                                 ::sc/configuration      #{}
-                                 ::sc/initialized-states #{}
-                                 ::sc/history-value      {}
-                                 ::sc/running?           true}
-                                wmem))))
+        ;; Preserve wmem's metadata (e.g. ::version for optimistic locking on
+        ;; persistent stores) through the defaults merge. Same bug/fix as the
+        ;; sync impl — `merge` inherits meta from the leftmost non-nil arg.
+        ::sc/vwmem (volatile! (with-meta
+                                (merge
+                                  {::sc/session-id         (or session-id (genid "session"))
+                                   ::sc/statechart-src     statechart-src
+                                   ::sc/configuration      #{}
+                                   ::sc/initialized-states #{}
+                                   ::sc/history-value      {}
+                                   ::sc/running?           true}
+                                  wmem)
+                                (meta wmem)))))
     (throw (ex-info "Statechart not found" {:src statechart-src}))))
 
 ;; =============================================================================
@@ -1078,12 +1083,15 @@
   (let [event (new-event external-event)
         vwmem (get env ::sc/vwmem)
         statechart (::sc/statechart env)]
-    ;; Set up processing context
-    (vswap! vwmem (fn [m] (merge
-                            {::sc/enabled-transitions (chart/document-ordered-set statechart)
-                             ::sc/states-to-invoke    (chart/document-ordered-set statechart)
-                             ::sc/internal-queue      (com.fulcrologic.statecharts.util/queue)}
-                            m)))
+    ;; Set up processing context — preserve wmem's metadata through the
+    ;; defaults merge (see v20150901_impl for the rationale).
+    (vswap! vwmem (fn [m] (with-meta
+                            (merge
+                              {::sc/enabled-transitions (chart/document-ordered-set statechart)
+                               ::sc/states-to-invoke    (chart/document-ordered-set statechart)
+                               ::sc/internal-queue      (com.fulcrologic.statecharts.util/queue)}
+                              m)
+                            (meta m))))
     (let [body-result (if (cancel? event)
                         (exit-interpreter! env)
                         (do
@@ -1119,12 +1127,15 @@
                                                          (chart/document-ordered-set statechart)))
                       parent-session-id (assoc ::sc/parent-session-id parent-session-id)
                       invokeid (assoc :org.w3.scxml.event/invokeid invokeid))))
-    ;; Set up processing context
-    (vswap! vwmem (fn [m] (merge
-                            {::sc/enabled-transitions (chart/document-ordered-set statechart)
-                             ::sc/states-to-invoke    (chart/document-ordered-set statechart)
-                             ::sc/internal-queue      (com.fulcrologic.statecharts.util/queue)}
-                            m)))
+    ;; Set up processing context — preserve wmem's metadata through the
+    ;; defaults merge (see v20150901_impl for the rationale).
+    (vswap! vwmem (fn [m] (with-meta
+                            (merge
+                              {::sc/enabled-transitions (chart/document-ordered-set statechart)
+                               ::sc/states-to-invoke    (chart/document-ordered-set statechart)
+                               ::sc/internal-queue      (com.fulcrologic.statecharts.util/queue)}
+                              m)
+                            (meta m))))
     (let [init-result
           (let [early-init (when early?
                              (let [all-data-model-nodes (filterv #(= :data-model (:node-type %)) (vals (::sc/elements-by-id statechart)))]

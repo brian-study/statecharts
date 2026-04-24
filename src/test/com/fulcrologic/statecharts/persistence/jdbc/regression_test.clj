@@ -6,9 +6,12 @@
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
    [com.fulcrologic.statecharts :as sc]
+   [com.fulcrologic.statecharts.algorithms.v20150901-async-impl :as async-impl]
    [com.fulcrologic.statecharts.algorithms.v20150901-impl :as impl]
    [com.fulcrologic.statecharts.chart :as chart]
+   [com.fulcrologic.statecharts.data-model.working-memory-data-model :as wmdm]
    [com.fulcrologic.statecharts.elements :refer [state]]
+   [com.fulcrologic.statecharts.invocation.durable-job :as durable-job]
    [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
@@ -67,7 +70,7 @@
 ;; never fires.
 
 (deftest processing-env-preserves-wmem-metadata-test
-  (testing "processing-env must preserve wmem's metadata (e.g. the ::version that JDBC stores attach)"
+  (testing "sync processing-env must preserve wmem's metadata (::version that JDBC stores attach)"
     (let [chart       (chart/statechart {:initial :s1} (state {:id :s1}))
           registry    (mem-reg/new-registry)
           _           (sp/register-statechart! registry :test-chart chart)
@@ -76,7 +79,19 @@
           p-env       (impl/processing-env env :test-chart wmem)
           vwmem-value (some-> p-env ::sc/vwmem deref)]
       (is (= 42 (core/get-version vwmem-value))
-          "processing-env drops wmem's ::version meta via (merge {defaults} wmem); the JDBC store then never triggers optimistic locking"))))
+          "sync processing-env must propagate wmem's ::version meta; JDBC store's optimistic locking depends on it"))))
+
+(deftest async-processing-env-preserves-wmem-metadata-test
+  (testing "async processing-env must preserve wmem's metadata (mirror of sync fix)"
+    (let [chart       (chart/statechart {:initial :s1} (state {:id :s1}))
+          registry    (mem-reg/new-registry)
+          _           (sp/register-statechart! registry :test-chart chart)
+          env         {::sc/statechart-registry registry}
+          wmem        (core/attach-version {::sc/session-id :x ::sc/statechart-src :test-chart} 42)
+          p-env       (async-impl/processing-env env :test-chart wmem)
+          vwmem-value (some-> p-env ::sc/vwmem deref)]
+      (is (= 42 (core/get-version vwmem-value))
+          "async processing-env has the same merge-strips-meta bug as sync did; fulcro integration uses this path"))))
 
 ;; -----------------------------------------------------------------------------
 ;; Finding #3 (HIGH) — create-job! can return nil under terminal-transition race
@@ -107,6 +122,55 @@
         (when error
           (is (re-find #"(?i)exhausted" (.getMessage ^Exception error))
               "race-exhaustion error is informative"))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #3 follow-up — start-invocation! must honour the InvocationProcessor
+;; protocol when create-job! throws.
+;; -----------------------------------------------------------------------------
+;;
+;; protocols.cljc docstring: start-invocation! "Returns `true` if the
+;; invocation was successfully started, or `false` if the invocation failed to
+;; start (e.g., chart not found, invalid function). Implementations SHOULD
+;; send an :error.platform event to the parent session when returning `false`."
+;;
+;; With the v2.0.2 change to make create-job! throw on exhaustion, the
+;; DurableJobInvocationProcessor stopped honouring this contract — the
+;; exception leaked out past the SCXML processor instead of becoming an
+;; error.platform event on the parent.
+
+(deftest durable-job-start-invocation-survives-create-job-failure-test
+  (testing "start-invocation! returns false and emits error.platform when create-job! throws"
+    (let [sent-events (atom [])
+          event-queue (reify sp/EventQueue
+                        (send! [_ _env send-request]
+                          (swap! sent-events conj send-request)
+                          true)
+                        (cancel! [_ _env _session-id _send-id] true)
+                        (receive-events! [_ _env _handler] nil)
+                        (receive-events! [_ _env _handler _options] nil))
+          data-model  (wmdm/new-flat-model)
+          session-id  :parent-session
+          env         {::sc/session-id  session-id
+                       ::sc/event-queue event-queue
+                       ::sc/data-model  data-model
+                       ::sc/vwmem       (volatile! {::sc/session-id session-id
+                                                    ::sc/data-model {}})}
+          processor   (durable-job/->DurableJobInvocationProcessor :fake-pool nil)]
+      (with-redefs [job-store/create-job!
+                    (fn [& _]
+                      (throw (ex-info "create-job! exhausted race retries"
+                                      {:session-id session-id :invokeid :test-invoke})))]
+        (let [result (sp/start-invocation! processor env
+                       {:invokeid :test-invoke
+                        :src      :some-handler
+                        :params   {:quiz-id 42}})]
+          (is (false? result)
+              "start-invocation! must return false on create-job! failure")
+          (let [platform-errors (filter #(= :error.platform (:event %)) @sent-events)]
+            (is (seq platform-errors)
+                "start-invocation! must emit :error.platform to the parent session")
+            (is (= session-id (:target (first platform-errors)))
+                ":error.platform must target the parent session")))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Finding #4 (HIGH) — cancel-by-session! orphans in-flight handler work
