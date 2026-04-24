@@ -12,6 +12,7 @@
    [com.fulcrologic.statecharts.data-model.working-memory-data-model :as wmdm]
    [com.fulcrologic.statecharts.elements :refer [state]]
    [com.fulcrologic.statecharts.invocation.durable-job :as durable-job]
+   [com.fulcrologic.statecharts.jobs.worker :as worker]
    [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
@@ -19,7 +20,8 @@
    [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [com.fulcrologic.statecharts.protocols :as sp]
    [com.fulcrologic.statecharts.registry.local-memory-registry :as mem-reg]
-   [next.jdbc.connection :as jdbc.connection])
+   [next.jdbc.connection :as jdbc.connection]
+   [promesa.core :as p])
   (:import
    [com.zaxxer.hikari HikariDataSource]
    [java.util UUID]))
@@ -847,3 +849,144 @@
         (is (empty? errors)
             (str "cancellation wrapped in ExecutionException must not emit error.invoke.*; got "
                  (pr-str errors)))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #S (P1) — receive-events! ACKs async handlers before they finish
+;; -----------------------------------------------------------------------------
+;;
+;; When a handler returns a Promesa promise (async processor, or any handler
+;; that returns one), the current code calls mark-processed! immediately
+;; without awaiting resolution. A crash after this point loses the event
+;; permanently, and later events for the same session run against stale
+;; working memory.
+
+(deftest ^:integration receive-events-awaits-async-handler-promise-test
+  (testing "receive-events! must not mark a row processed while its handler promise is pending; must mark processed on resolve; must release claim on reject"
+    (let [queue (pg-eq/new-queue *pool* "async-ack-ok")
+          target-id :async-ack-session
+          gate      (promise)]
+      (sp/send! queue {} {:event :happy :target target-id :data {}})
+      (let [worker (future
+                     (sp/receive-events! queue {}
+                       (fn [_env _event]
+                         (p/create
+                           (fn [resolve _reject]
+                             (future
+                               @gate
+                               (resolve :ok)))))))]
+        ;; Give the handler time to start and block on the gate.
+        (Thread/sleep 200)
+        (let [row (core/execute-sql-one! *pool*
+                    "SELECT processed_at FROM statechart_events WHERE target_session_id = ?"
+                    [(core/session-id->str target-id)])]
+          (is (nil? (:processed-at row))
+              "while the handler's promise is pending, the row must not be marked processed"))
+        (deliver gate :go)
+        @worker
+        (let [row (core/execute-sql-one! *pool*
+                    "SELECT processed_at FROM statechart_events WHERE target_session_id = ?"
+                    [(core/session-id->str target-id)])]
+          (is (some? (:processed-at row))
+              "once the handler's promise resolves, the row must be marked processed"))))
+
+    ;; Reject path: the claim should be released (for retry) rather than marked processed.
+    (let [queue (pg-eq/new-queue *pool* "async-ack-reject")
+          target-id :async-ack-reject-session]
+      (sp/send! queue {} {:event :sad :target target-id :data {}})
+      (sp/receive-events! queue {}
+        (fn [_env _event]
+          (p/create
+            (fn [_resolve reject]
+              (reject (ex-info "handler promise rejected" {}))))))
+      (let [row (core/execute-sql-one! *pool*
+                  "SELECT processed_at, claimed_at FROM statechart_events WHERE target_session_id = ?"
+                  [(core/session-id->str target-id)])]
+        (is (nil? (:processed-at row))
+            "a rejected handler promise must NOT be marked processed")
+        (is (nil? (:claimed-at row))
+            "a rejected handler promise must release its claim for retry")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #T (P2) — session-id round-trip mis-types strings that look like
+;;                   UUIDs or keywords
+;; -----------------------------------------------------------------------------
+;;
+;; session-id->str stores strings bare, but str->session-id eagerly parses
+;; the bare form as UUID or keyword. A user that uses a string session-id
+;; whose value happens to look like a UUID or keyword gets a different type
+;; back — downstream `=` checks then fail.
+
+(deftest session-id-roundtrip-preserves-type-test
+  (testing "session-id->str / str->session-id round-trip preserves caller's type for all supported shapes"
+    (let [uuid           (UUID/randomUUID)
+          uuid-as-string (str (UUID/randomUUID))
+          inputs [:kw
+                  :my-ns/kw
+                  uuid                             ; UUID
+                  "just-a-string"                  ; plain string
+                  uuid-as-string                   ; string that happens to look like a UUID
+                  ":not-actually-a-keyword"        ; string that happens to look like a keyword
+                  "42"]]                           ; numeric-looking string
+      (doseq [original inputs]
+        (let [stored    (core/session-id->str original)
+              read-back (core/str->session-id stored)]
+          (is (= original read-back)
+              (str "round-trip for " (pr-str original)
+                   " must preserve value+type; stored=" (pr-str stored)
+                   ", read-back=" (pr-str read-back))))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #U (P2) — parse-event-type misdecodes quoted string types
+;; -----------------------------------------------------------------------------
+;;
+;; SCXML transport types are strings (e.g. URIs). event->row stores them via
+;; pr-str, producing `"\"http://…\""`. parse-event-type only EDN-reads values
+;; starting with `:`, so the stored URI is rebuilt as the ugly keyword
+;; `:"http://…"` instead of the original string.
+
+(deftest ^:integration event-queue-string-type-roundtrips-as-string-test
+  (testing "a string transport type round-trips as a string through the queue"
+    (let [queue     (pg-eq/new-queue *pool* "string-event-type")
+          received  (atom nil)
+          target-id :string-type-session]
+      (sp/send! queue {} {:event  :e
+                          :type   "http://www.w3.org/tr/scxml"
+                          :target target-id
+                          :data   {}})
+      (sp/receive-events! queue {}
+                          (fn [_env event] (reset! received event)))
+      (is (string? (:type @received))
+          "quoted string type should round-trip as a string, not a keyword")
+      (is (= "http://www.w3.org/tr/scxml" (:type @received))
+          "round-trip value preserved"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #V (P2) — dispatch-terminal-event! ignores a nil session-state result
+;; -----------------------------------------------------------------------------
+;;
+;; if-let fails when get-session-state-fn returns nil, and the code falls
+;; through to the "no checker installed" branch and dispatches anyway.
+;; A nil result should be treated as "not ready" — the guard is most
+;; needed exactly when the parent is gone/stale.
+
+(deftest dispatch-terminal-event-treats-nil-session-state-as-not-ready-test
+  (testing "when get-session-state-fn returns nil, no terminal event is dispatched"
+    (let [dispatch-fn @#'worker/dispatch-terminal-event!
+          sent        (atom [])
+          event-queue (reify sp/EventQueue
+                        (send! [_ _env req] (swap! sent conj req) true)
+                        (cancel! [_ _env _sid _sendid] true)
+                        (receive-events! [_ _env _h] nil)
+                        (receive-events! [_ _env _h _opts] nil))
+          job {:id                  (UUID/randomUUID)
+               :session-id          :gone-parent
+               :invokeid            :some-invoke
+               :terminal-event-name ":done.invoke.some-invoke"
+               :terminal-event-data {}}
+          always-nil-checker (fn [_sid _iid _job-id] nil)
+          dispatched? (dispatch-fn event-queue {} job
+                                   {:get-session-state-fn always-nil-checker})]
+      (is (false? dispatched?)
+          "a nil session-state result means 'not ready'; dispatch must be skipped")
+      (is (empty? @sent)
+          "no event should be sent when the parent is absent/stale"))))

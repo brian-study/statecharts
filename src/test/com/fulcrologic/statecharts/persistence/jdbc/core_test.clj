@@ -11,7 +11,8 @@
 
 (deftest session-id->str-test
   (testing "string session IDs"
-    (is (= "my-session" (core/session-id->str "my-session"))))
+    (is (= "\"my-session\"" (core/session-id->str "my-session"))
+        "strings are quoted via pr-str so the decoder can distinguish them from UUID/keyword bare forms"))
 
   (testing "keyword session IDs"
     (is (= ":my-session" (core/session-id->str :my-session)))
@@ -40,7 +41,10 @@
       (is (= uuid (core/str->session-id (str uuid))))))
 
   (testing "plain strings"
-    (is (= "my-session" (core/str->session-id "my-session")))))
+    (is (= "my-session" (core/str->session-id "\"my-session\""))
+        "quoted string form round-trips")
+    (is (= "my-session" (core/str->session-id "my-session"))
+        "legacy bare non-UUID non-keyword strings still decode as strings")))
 
 (deftest session-id-roundtrip-test
   (testing "keyword roundtrip"

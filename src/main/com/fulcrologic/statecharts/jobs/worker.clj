@@ -95,24 +95,37 @@
                       :invoke-id invokeid
                       :data (or terminal-event-data {})})
                    (when wake-event-loop-fn (wake-event-loop-fn)))]
-    (if-let [check-result (when get-session-state-fn
-                            (get-session-state-fn session-id invokeid (str id)))]
-      (if (:ready check-result)
-        (do
-          (do-send!)
-          (log/info "Terminal event dispatched"
-                    {:job-id id :event terminal-event-name :session-id session-id})
-          true)
-        (do
-          (log/debug "Session not ready for terminal event"
-                     {:job-id id :session-id session-id :reason (:reason check-result)})
-          false))
-      ;; No session state checker — dispatch unconditionally
+    (cond
+      ;; No checker installed — dispatch unconditionally.
+      (nil? get-session-state-fn)
       (do
         (do-send!)
         (log/info "Terminal event dispatched (no session check)"
                   {:job-id id :event terminal-event-name :session-id session-id})
-        true))))
+        true)
+
+      :else
+      (let [check-result (get-session-state-fn session-id invokeid (str id))]
+        (cond
+          ;; nil result = parent gone / stale — treat as not ready.
+          (nil? check-result)
+          (do
+            (log/debug "Session missing for terminal event, skipping dispatch"
+                       {:job-id id :session-id session-id})
+            false)
+
+          (:ready check-result)
+          (do
+            (do-send!)
+            (log/info "Terminal event dispatched"
+                      {:job-id id :event terminal-event-name :session-id session-id})
+            true)
+
+          :else
+          (do
+            (log/debug "Session not ready for terminal event"
+                       {:job-id id :session-id session-id :reason (:reason check-result)})
+            false))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Job Execution

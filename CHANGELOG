@@ -1,3 +1,40 @@
+2.0.12
+------
+
+Four correctness findings from the post-2.0.11 review.
+
+* **[P1]** `receive-events!` now awaits the handler's promise before
+  `mark-processed!` / `release-claim!`. Paired with the async processor
+  (or any promise-returning handler), 2.0.11 ACKed the row before the
+  handler actually finished — later events for the same session ran
+  against stale working memory, and a rejected/crashed promise lost the
+  event. Synchronous handlers are unaffected (non-promise return → no
+  wait). Regression:
+  `receive-events-awaits-async-handler-promise-test`.
+
+* **[P2]** `session-id->str` / `str->session-id` round-trip correctly
+  for string session-ids that look like UUIDs or keywords. Strings are
+  now stored with a quoted pr-str form; the decoder shape-inspects
+  (leading `"` → string, leading `:` → keyword, else UUID-or-legacy
+  bare). Legacy bare rows still decode correctly. Regression:
+  `session-id-roundtrip-preserves-type-test`.
+
+* **[P2]** `parse-event-type` handles quoted string types (e.g. the
+  SCXML transport URI `\"http://www.w3.org/tr/scxml\"`) — previously
+  these round-tripped as the keyword `:"http://…"` because only
+  leading-`:` shapes were EDN-read. Regression:
+  `event-queue-string-type-roundtrips-as-string-test`.
+
+* **[P2]** `dispatch-terminal-event!` treats a nil session-state
+  result as "not ready". Previously `if-let` fell through to the
+  "no checker installed" branch and dispatched unconditionally — the
+  guard was ineffective in exactly the cases it was meant to protect
+  (parent session gone or stale). Regression:
+  `dispatch-terminal-event-treats-nil-session-state-as-not-ready-test`.
+
+Tests `core-spec` / `core-test` updated to pin the new session-id
+write format (quoted string); round-trip assertions unchanged.
+
 2.0.11
 ------
 

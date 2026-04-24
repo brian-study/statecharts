@@ -13,6 +13,7 @@
    [com.fulcrologic.statecharts.events :as evts]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.protocols :as sp]
+   [promesa.core :as p]
    [taoensso.timbre :as log])
   (:import
    [java.time OffsetDateTime Duration]))
@@ -35,18 +36,20 @@
 ;; -----------------------------------------------------------------------------
 
 (defn- parse-event-type
-  "Read an event-type from the DB back to a keyword.
+  "Read an event-type from the DB back to its original type.
 
-   New rows store `(pr-str type)` — e.g. `\":external\"` or
-   `\":com.fulcrologic.statecharts/chart\"`. Older rows (pre-2.0.2) stored
-   `(name type)` — e.g. `\"external\"`, namespace stripped. The parser is
-   tolerant: EDN-read anything that starts with `:`, otherwise fall back to
-   `(keyword s)` for the legacy shape."
+   event->row stores types via `pr-str`: keyword `:external` → `\":external\"`,
+   string `\"http://…\"` → `\"\\\"http://…\\\"\"`. The decoder shape-inspects:
+   - leading `:` → keyword (EDN read)
+   - leading `\"` → string (EDN read)
+   - else → `(keyword s)` for legacy pre-2.0.2 rows that stored
+     `(name type)` unquoted (e.g. `\"external\"`)."
   [s]
   (when s
-    (if (str/starts-with? s ":")
-      (edn/read-string s)
-      (keyword s))))
+    (cond
+      (str/starts-with? s ":")  (try (edn/read-string s) (catch Exception _ s))
+      (str/starts-with? s "\"") (try (edn/read-string s) (catch Exception _ s))
+      :else                     (keyword s))))
 
 (defn- parse-invoke-id
   "Read an invoke-id from the DB back to its original type.
@@ -263,8 +266,17 @@
 
                   :else
                   (try
-                    (let [event (row->event row)]
-                      (handler env event)
+                    (let [event (row->event row)
+                          handler-result (handler env event)]
+                      ;; If the handler returns a Promesa promise (async
+                      ;; processor, or any promise-returning handler), wait
+                      ;; for it to resolve BEFORE marking the row processed.
+                      ;; An immediate mark would ACK an event the processor
+                      ;; hasn't actually finished, and a promise that later
+                      ;; rejects would lose the event. Synchronous handlers
+                      ;; return non-promise values — the deref is a no-op.
+                      (when (p/promise? handler-result)
+                        @handler-result)
                       (core/with-tx [tx datasource]
                         (mark-processed! tx event-id))
                       (let [duration-ms (/ (- (System/nanoTime) start-time) 1e6)]

@@ -29,24 +29,36 @@
 
 (defn session-id->str
   "Convert a session ID to a string for database storage.
-   Supports UUIDs, keywords, symbols, numbers, and strings."
+
+   Keywords (`:kw` / `:ns/kw`) and symbols are stored via `pr-str` so
+   they keep their leading `:` / namespace / symbol markers. UUIDs are
+   stored in their bare string form (no tag) — back-compat with pre-
+   2.0.11 deployments. Strings are stored via `pr-str` (quoted) so the
+   decoder can distinguish a user-supplied string that happens to look
+   like a UUID or keyword from a genuine UUID / keyword session id."
   [session-id]
   (cond
-    (string? session-id) session-id
+    (string? session-id)  (pr-str session-id)
     (keyword? session-id) (pr-str session-id)
-    (symbol? session-id) (pr-str session-id)
-    (uuid? session-id) (str session-id)
-    :else (str session-id)))
+    (symbol? session-id)  (pr-str session-id)
+    (uuid? session-id)    (str session-id)
+    :else                 (str session-id)))
 
 (defn str->session-id
   "Convert a string from database back to original session ID type.
-   Attempts to read EDN if it looks like a keyword."
+
+   Shape-inspecting inverse of `session-id->str`:
+   - leading `\"` → EDN read (quoted string form)
+   - leading `:` → EDN read (keyword)
+   - looks like a UUID → UUID
+   - otherwise → bare string (legacy rows pre-2.0.11 that stored strings
+     unquoted)."
   [s]
   (when s
-    (if (.startsWith ^String s ":")
-      (edn/read-string s)
-      ;; Try UUID, fall back to string
-      (or (parse-uuid s) s))))
+    (cond
+      (.startsWith ^String s "\"") (try (edn/read-string s) (catch Exception _ s))
+      (.startsWith ^String s ":")  (try (edn/read-string s) (catch Exception _ s))
+      :else                        (or (parse-uuid s) s))))
 
 ;; -----------------------------------------------------------------------------
 ;; Binary Serialization (nippy)

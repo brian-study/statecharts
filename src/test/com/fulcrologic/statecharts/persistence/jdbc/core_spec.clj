@@ -12,14 +12,14 @@
   (component "session-id->str"
     (behavior "handles string session IDs"
       (assertions
-        "passes through unchanged"
-        (core/session-id->str "my-session") => "my-session"
+        "strings are quoted via pr-str so the decoder can distinguish them from UUID/keyword bare forms"
+        (core/session-id->str "my-session") => "\"my-session\""
         "handles empty string"
-        (core/session-id->str "") => ""
+        (core/session-id->str "") => "\"\""
         "handles strings with special characters"
-        (core/session-id->str "session/with/slashes") => "session/with/slashes"
+        (core/session-id->str "session/with/slashes") => "\"session/with/slashes\""
         "handles strings with spaces"
-        (core/session-id->str "session with spaces") => "session with spaces"))
+        (core/session-id->str "session with spaces") => "\"session with spaces\""))
 
     (behavior "handles keyword session IDs"
       (assertions
@@ -76,11 +76,13 @@
 
     (behavior "handles plain strings"
       (assertions
-        "returns string as-is when not keyword or UUID"
+        "quoted string form (the new write shape) round-trips"
+        (core/str->session-id "\"my-session\"") => "my-session"
+        "legacy bare non-UUID non-keyword strings still decode as strings"
         (core/str->session-id "my-session") => "my-session"
-        "handles empty string"
+        "handles empty string (legacy bare)"
         (core/str->session-id "") => ""
-        "handles strings that look like numbers but aren't UUIDs"
+        "handles strings that look like numbers but aren't UUIDs (legacy bare)"
         (core/str->session-id "12345") => "12345")))
 
   (component "session-id roundtrip"
