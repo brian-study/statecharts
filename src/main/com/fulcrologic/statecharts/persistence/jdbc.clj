@@ -83,6 +83,12 @@
    - :data-model - Custom data model (optional, defaults to flat working memory model)
    - :execution-model - Custom execution model (optional, defaults to lambda model)
    - :invocation-processors - Custom invocation processors (optional)
+   - :processor - Custom processor (optional, defaults to the sync v20150901 algorithm).
+                  **Must match the execution model**: async execution models
+                  (lambda-async, or any model that returns Promesa promises)
+                  need the async processor; otherwise guards/actions evaluating
+                  to unresolved promises are treated as truthy values and the
+                  chart may take false transitions.
 
    Returns an ::sc/env map ready for use with statechart processing.
 
@@ -92,7 +98,7 @@
    (register! env ::my-chart my-chart)
    (start! env ::my-chart \"session-1\")
    ```"
-  [{:keys [datasource node-id data-model execution-model invocation-processors]
+  [{:keys [datasource node-id data-model execution-model invocation-processors processor]
     :or {node-id (str (random-uuid))}}]
   (assert datasource "A javax.sql.DataSource is required under :datasource")
   (let [dm (or data-model (wmdm/new-flat-model))
@@ -109,7 +115,7 @@
      ::sc/data-model dm
      ::sc/event-queue q
      ::sc/working-memory-store wmstore
-     ::sc/processor (alg/new-processor)
+     ::sc/processor (or processor (alg/new-processor))
      ::sc/invocation-processors inv-processors
      ::sc/execution-model ex
      ;; Store datasource and node-id for maintenance functions

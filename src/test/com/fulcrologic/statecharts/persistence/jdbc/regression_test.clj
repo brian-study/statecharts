@@ -708,3 +708,67 @@
 ;; (legacy-invoke-id-decodes-as-string-test from 2.0.5 superseded by finding
 ;; #M — the two decoders are now harmonised on keyword fallback for legacy
 ;; bare rows. See event-queue-legacy-bare-invoke-id-decodes-as-keyword-test.)
+
+;; -----------------------------------------------------------------------------
+;; Finding #N (P1) — future cancellation must not emit error.invoke.*
+;; -----------------------------------------------------------------------------
+;;
+;; stop-invocation! on a future interrupts its thread. Blocking operations
+;; inside the body (Thread/sleep, blocking I/O) surface InterruptedException
+;; in the catch Throwable — which then emits an error.invoke.* send back to
+;; the parent. Cancellation is a normal control-flow exit, not an invocation
+;; failure; spurious errors can drive transitions that should never fire
+;; after the state has already been left.
+
+(deftest future-cancellation-does-not-emit-error-invoke-test
+  (testing "future-cancel must not turn into an :error.invoke.* event"
+    (let [sent        (atom [])
+          event-queue (reify sp/EventQueue
+                        (send! [_ _env req] (swap! sent conj req) true)
+                        (cancel! [_ _env _sid _sendid] true)
+                        (receive-events! [_ _env _h] nil)
+                        (receive-events! [_ _env _h _opts] nil))
+          env         {::sc/session-id  :future-cancel-parent
+                       ::sc/event-queue event-queue
+                       ::sc/vwmem       (volatile! {::sc/session-id :future-cancel-parent})}
+          processor   ((requiring-resolve 'com.fulcrologic.statecharts.invocation.future/new-future-processor))
+          started     (promise)
+          slow-fn     (fn [_params]
+                        (deliver started true)
+                        (Thread/sleep 5000)
+                        {:done :ok})]
+      (sp/start-invocation! processor env
+        {:invokeid :cancel-me :src slow-fn :params {}})
+      (deref started 2000 :timeout)
+      (sp/stop-invocation! processor env {:invokeid :cancel-me})
+      ;; Give the future's catch block a moment to run.
+      (Thread/sleep 300)
+      (let [errors (filter (fn [req]
+                             (let [evt (:event req)]
+                               (and (keyword? evt)
+                                    (clojure.string/starts-with? (name evt) "error.invoke"))))
+                           @sent)]
+        (is (empty? errors)
+            (str "cancellation must not enqueue error.invoke.* events; got " (pr-str errors)))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #O (P2) — pg-env hardcodes the sync processor
+;; -----------------------------------------------------------------------------
+;;
+;; pg-env accepts :data-model, :execution-model, :invocation-processors — but
+;; installs (alg/new-processor) unconditionally. Paired with an async
+;; execution model (lambda-async or any promise-returning expression runner),
+;; the sync processor evaluates unresolved promises as truthy values — guards
+;; take false transitions and the chart can finish before async work
+;; resolves. Accept a caller-supplied :processor.
+
+(deftest pg-env-accepts-custom-processor-test
+  (testing "pg-env installs a caller-supplied :processor rather than forcing the sync algorithm"
+    (let [custom-processor (reify sp/Processor
+                             (start! [_ _ _ _] nil)
+                             (exit! [_ _ _ _] nil)
+                             (process-event! [_ _ _ _] nil))
+          env (pg-sc/pg-env {:datasource :fake-pool
+                             :processor  custom-processor})]
+      (is (identical? custom-processor (::sc/processor env))
+          "pg-env must honour :processor so async execution models can be paired with the async algorithm"))))

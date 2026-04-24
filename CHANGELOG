@@ -1,3 +1,37 @@
+2.0.10
+------
+
+Three findings from the post-2.0.9 review.
+
+* **[P1]** `invocation/future` no longer reports cancellation as an
+  invocation error. `stop-invocation!` cancels the future via
+  `future-cancel`, which interrupts the thread — blocking operations
+  inside the body surface `InterruptedException` / `CancellationException`.
+  The `catch Throwable` branch previously treated these as failures and
+  emitted an `:error.invoke.*` event back to the parent, driving
+  transitions that should never fire after the state was already left.
+  The catch now suppresses the send for interrupt/cancel exceptions and
+  logs a debug line instead. Regression test:
+  `future-cancellation-does-not-emit-error-invoke-test`.
+
+* **[P2]** `pg-env` accepts a caller-supplied `:processor`. Previously
+  the sync `v20150901` processor was installed unconditionally, so
+  consumers pairing an async execution model (`lambda-async`, or any
+  model returning Promesa promises) with `pg-env` got their guards and
+  actions evaluated by the sync algorithm — unresolved promises were
+  treated as truthy values. New option overrides the default.
+  Regression test: `pg-env-accepts-custom-processor-test`.
+
+* **[P2]** `JdbcStatechartRegistry` is deleted. It used `nippy/freeze`
+  on the whole chart definition, which throws `Unfreezable type` for
+  any realistic chart because guards / actions / invoke `:src` values
+  are closures. `pg-env` has used the in-memory `local-memory-registry`
+  since 2.0.0 specifically to sidestep this. Consumers calling
+  `new-registry` from `persistence.jdbc.registry` directly will now get
+  a namespace-not-found error at load time instead of a cryptic runtime
+  `Unfreezable` exception the first time they register a non-trivial
+  chart. `pg-env`'s `::sc/statechart-registry` is unchanged.
+
 2.0.9
 -----
 

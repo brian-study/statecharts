@@ -22,7 +22,6 @@
    [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
-   [com.fulcrologic.statecharts.persistence.jdbc.registry :as pg-reg]
    [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
    [com.fulcrologic.statecharts.protocols :as sp]
@@ -152,35 +151,9 @@
                               (sp/save-working-memory! store {} session-id
                                                        (assoc v2 ::sc/configuration #{:s3}))))))))
 
-;; -----------------------------------------------------------------------------
-;; Registry Tests
-;; -----------------------------------------------------------------------------
-
-(deftest ^:integration registry-basic-test
-  (let [registry (pg-reg/new-registry *pool*)
-        chart (chart/statechart {:initial :s1}
-                                (state {:id :s1}
-                                       (transition {:event :next :target :s2}))
-                                (state {:id :s2}))]
-
-    (testing "get-statechart returns nil for unregistered"
-      (is (nil? (sp/get-statechart registry :unknown))))
-
-    (testing "register and retrieve chart"
-      (sp/register-statechart! registry :my-chart chart)
-      (is (= chart (sp/get-statechart registry :my-chart))))
-
-    (testing "all-charts returns all registered"
-      (sp/register-statechart! registry :another-chart chart)
-      (let [all (sp/all-charts registry)]
-        (is (= 2 (count all)))
-        (is (contains? all :my-chart))
-        (is (contains? all :another-chart))))
-
-    (testing "cache is populated"
-      (pg-reg/clear-cache! registry)
-      (sp/get-statechart registry :my-chart) ; This should populate cache
-      (is (contains? @(:cache registry) :my-chart)))))
+;; (registry-basic-test removed — the JdbcStatechartRegistry was deleted in
+;; 2.0.10 because charts include closures that can't be nippy-frozen, and
+;; pg-env uses the in-memory registry anyway.)
 
 ;; -----------------------------------------------------------------------------
 ;; Event Queue Tests

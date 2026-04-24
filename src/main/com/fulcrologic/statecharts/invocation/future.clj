@@ -49,17 +49,30 @@
                                                        :event             done-event-name
                                                        :data              (if (map? result) result {})}))
                           (catch Throwable t
-                            (log/error t "Future invocation failed" {:invokeid invokeid})
-                            (sp/send! event-queue env {:target            source-session-id
-                                                       :sendid            child-session-id
-                                                       :source-session-id child-session-id
-                                                       ;; Required for handle-external-invocations!
-                                                       ;; to run finalize/autoforward against the
-                                                       ;; correct <invoke> on the error path.
-                                                       :invoke-id         invokeid
-                                                       :event             error-event-name
-                                                       :data              {:message (.getMessage t)
-                                                                           :type    (str (type t))}}))
+                            ;; `stop-invocation!` cancels the future, which
+                            ;; interrupts its thread — blocking operations
+                            ;; inside the body surface as Interrupted /
+                            ;; Cancellation exceptions. That's a normal exit,
+                            ;; not an invocation failure; emitting error.invoke.*
+                            ;; would drive transitions that should never fire
+                            ;; after the state was left.
+                            (if (or (instance? InterruptedException t)
+                                    (instance? java.util.concurrent.CancellationException t)
+                                    (.isInterrupted (Thread/currentThread)))
+                              (log/debug "Future invocation cancelled, suppressing error.invoke.*"
+                                         {:invokeid invokeid})
+                              (do
+                                (log/error t "Future invocation failed" {:invokeid invokeid})
+                                (sp/send! event-queue env {:target            source-session-id
+                                                           :sendid            child-session-id
+                                                           :source-session-id child-session-id
+                                                           ;; Required for handle-external-invocations!
+                                                           ;; to run finalize/autoforward against the
+                                                           ;; correct <invoke> on the error path.
+                                                           :invoke-id         invokeid
+                                                           :event             error-event-name
+                                                           :data              {:message (.getMessage t)
+                                                                               :type    (str (type t))}}))))
                           (finally
                             (swap! active-futures dissoc child-session-id))))]
           (try
