@@ -133,17 +133,25 @@
    invocation is preferable to silently returning nil."
   5)
 
-(defn create-job!
-  "Create a new job, returning the job-id (UUID).
+(defn create-job-result
+  "Create a new job and return a result map — `{:ok <job-id>}` on
+   success, `{:error <ex-info>}` on race-exhaustion.
 
-   Idempotent (I1): if an active job already exists for this session+invokeid,
-   returns the existing job-id instead of creating a duplicate.
-   Uses partial unique index on (session_id, invokeid) WHERE status IN ('pending','running').
+   Idempotent (I1): if an active job already exists for this
+   session+invokeid, returns `{:ok <existing-job-id>}` instead of
+   creating a duplicate. Uses a partial unique index on
+   (session_id, invokeid) WHERE status IN ('pending','running').
 
-   Under adversarial concurrency, the (INSERT-no-op → SELECT) sequence can observe
-   a terminal transition and miss the active job. We loop up to
-   `create-job-max-race-attempts` times and throw on exhaustion rather than
-   returning nil (which callers would stringify to an empty job-id)."
+   Under adversarial concurrency, the (INSERT-no-op → SELECT)
+   sequence can observe a terminal transition and miss the active
+   job. The loop retries up to `create-job-max-race-attempts`
+   times; if all attempts lose the race, returns
+   `{:error <ex-info>}` rather than throwing. Callers that want
+   exception semantics should use `create-job!` (which is a
+   thin wrapper around this fn).
+
+   Exceptions from the JDBC driver or connection layer are NOT
+   caught here — those propagate normally."
   [ds {:keys [id session-id invokeid job-type payload max-attempts]
        :or {max-attempts 3}}]
   (let [sid-str (core/session-id->str session-id)
@@ -167,17 +175,32 @@
                                     [sid-str iid-str]))))]
     (loop [attempt 0]
       (if-let [job-id (or (try-insert!) (find-active))]
-        job-id
+        {:ok job-id}
         (if (< attempt create-job-max-race-attempts)
           (do
             (log/debug "create-job! lost a race, retrying"
                        {:session-id session-id :invokeid invokeid :attempt attempt})
             (recur (inc attempt)))
-          (throw (ex-info "create-job! exhausted race retries"
-                          {:session-id     session-id
-                           :invokeid       invokeid
-                           :attempts       attempt
-                           :max-race-attempts create-job-max-race-attempts})))))))
+          {:error (ex-info "create-job! exhausted race retries"
+                           {:session-id        session-id
+                            :invokeid          invokeid
+                            :attempts          attempt
+                            :max-race-attempts create-job-max-race-attempts})})))))
+
+(defn create-job!
+  "Create a new job, returning the job-id (UUID).
+
+   Backward-compatible wrapper over `create-job-result`: unwraps
+   `{:ok id}` to `id`, throws the captured `ex-info` on `{:error}`.
+   Exception-as-control-flow is sometimes what callers want (fail
+   the enclosing transition outright); when they prefer to branch
+   on the failure — e.g. emit `:error.platform` to the parent
+   session and keep going — use `create-job-result` directly."
+  [ds params]
+  (let [r (create-job-result ds params)]
+    (if-let [id (:ok r)]
+      id
+      (throw (:error r)))))
 
 (defn claim-jobs!
   "Claim up to `limit` claimable jobs for this worker.

@@ -1,3 +1,18 @@
+2.0.23
+------
+
+* **[P2]** New `job-store/create-job-result` — data-returning
+  alternative to `create-job!`. Returns `{:ok <job-id>}` on success,
+  `{:error <ex-info>}` on race-exhaustion. `create-job!` is now a
+  thin wrapper that unwraps / throws, fully backward-compatible.
+  Callers that want to *branch* on race-exhaustion (e.g. emit
+  `:error.platform` to the parent session and keep going rather
+  than abort the enclosing transition) use `create-job-result`
+  directly; callers that want exception-as-control-flow keep using
+  `create-job!` unchanged. Makes the failure mode visible in the
+  type signature and retires one spot of exception-for-control-flow
+  per Moseley/Marks §3.
+
 2.0.22
 ------
 
