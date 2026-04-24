@@ -1,3 +1,46 @@
+2.0.2
+-----
+
+Bug fixes surfaced by the deep review of the JDBC persistence layer. Each
+fix has a regression test in
+`persistence/jdbc/regression_test.clj`.
+
+* **[CRITICAL]** Optimistic locking no longer silently disabled under
+  `process-event!`. `with-processing-context` and `processing-env` in the
+  SCXML algorithm preserved no metadata because `(merge {defaults} wmem)`
+  inherits meta from the leftmost arg; the JDBC store's `::version` meta
+  (attached by `fetch-session`) was therefore dropped on every event
+  processing step, and `save-working-memory!` took the silent
+  `ON CONFLICT DO UPDATE` branch. Fixed by re-attaching `(meta wmem)` after
+  the defaults merge. Two nodes (or two worker threads) processing events
+  for the same session concurrently now correctly surface an
+  optimistic-lock failure on stale writers.
+* `create-job!` no longer silently returns `nil` under adversarial races
+  (INSERT-no-op → terminal transition → retry-INSERT-no-op). Retries up to
+  5 times and throws `ex-info` with a clear message on exhaustion. Callers
+  can no longer end up storing an empty-string job-id.
+* `cancel!` and `cancel-by-session!` now write a terminal event
+  (`error.invoke.<invokeid>` with data `{:reason :cancelled}`) so the
+  reconciler can dispatch it to the parent session. Previously,
+  cancelled-while-running jobs left parents wedged waiting for
+  `done.invoke.X` / `error.invoke.X`.
+* `get-undispatched-terminal-jobs` includes `cancelled` jobs (alongside
+  `succeeded` and `failed`). The partial `idx_jobs_undispatched` index
+  predicate widens to match; new DDL only — existing deployments keep
+  their current index and queries still work (seq scan instead of index
+  scan on cancelled jobs).
+* `datasource-closed?` now falls back to a `getConnection` probe when the
+  DataSource exposes no `isClosed` method. The event loop stops cleanly
+  for plain `javax.sql.DataSource` instances (previously only worked for
+  HikariCP).
+* Event `:type` namespace preserved through queue round-trip. Storage
+  changes from `(name type)` to `(pr-str type)`; decoder is
+  backward-compatible (reads legacy un-namespaced values as unqualified
+  keywords).
+* Removed dead `insert-session!` in `working-memory-store.clj`; tightened
+  the `upsert-session!` docstring.
+* `send!`'s docstring spells out that the wake-signal is intra-JVM only.
+
 2.0.1
 -----
 

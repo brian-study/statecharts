@@ -87,7 +87,7 @@
       ON statechart_jobs (session_id, created_at DESC)"
    "CREATE INDEX IF NOT EXISTS idx_jobs_undispatched
       ON statechart_jobs (status)
-      WHERE terminal_event_dispatched_at IS NULL AND status IN ('succeeded', 'failed')"])
+      WHERE terminal_event_dispatched_at IS NULL AND status IN ('succeeded', 'failed', 'cancelled')"])
 
 ;; -----------------------------------------------------------------------------
 ;; Table Drop DDL

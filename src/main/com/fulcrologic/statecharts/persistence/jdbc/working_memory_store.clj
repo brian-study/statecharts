@@ -45,21 +45,6 @@
           (assoc ::sc/statechart-src src)
           (core/attach-version (:version row))))))
 
-(defn- insert-session!
-  "Insert a new session. Returns true on success."
-  [ds session-id wmem]
-  (let [src (get wmem ::sc/statechart-src)]
-    (core/execute! ds
-                   {:insert-into :statechart-sessions
-                    :values [{:session-id (core/session-id->str session-id)
-                              :statechart-src (pr-str src)
-                              :working-memory (core/freeze wmem)
-                              :version 1}]})
-    (log/debug "Session created"
-               {:session-id session-id
-                :statechart-src src})
-    true))
-
 (defn- update-session!
   "Update an existing session with optimistic locking.
    Throws on version mismatch."
@@ -84,15 +69,17 @@
     true))
 
 (defn- upsert-session!
-  "Insert or update a session with proper version handling."
+  "Insert or update a session with proper version handling.
+
+   - With version metadata: optimistic-lock update via `update-session!`.
+   - Without version metadata (initial save from `start!`): INSERT with
+     `ON CONFLICT DO UPDATE` so concurrent starts of the same session-id
+     deterministically end in the last writer's state rather than one of
+     them surfacing a duplicate-key error."
   [ds session-id wmem]
   (let [expected-version (core/get-version wmem)]
     (if expected-version
-      ;; Has version = existing session, do optimistic lock update
       (update-session! ds session-id wmem expected-version)
-      ;; No version = new session, insert
-      ;; Use ON CONFLICT to handle race condition where session was created
-      ;; between our check and insert
       (let [src (get wmem ::sc/statechart-src)]
         (core/execute! ds
                        {:insert-into :statechart-sessions

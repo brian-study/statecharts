@@ -34,6 +34,20 @@
 ;; Internal Helpers
 ;; -----------------------------------------------------------------------------
 
+(defn- parse-event-type
+  "Read an event-type from the DB back to a keyword.
+
+   New rows store `(pr-str type)` — e.g. `\":external\"` or
+   `\":com.fulcrologic.statecharts/chart\"`. Older rows (pre-2.0.2) stored
+   `(name type)` — e.g. `\"external\"`, namespace stripped. The parser is
+   tolerant: EDN-read anything that starts with `:`, otherwise fall back to
+   `(keyword s)` for the legacy shape."
+  [s]
+  (when s
+    (if (str/starts-with? s ":")
+      (edn/read-string s)
+      (keyword s))))
+
 (defn- event->row
   "Convert a send-request to a database row."
   [{:keys [event data type target source-session-id send-id invoke-id delay]}]
@@ -46,7 +60,7 @@
      :send-id send-id
      :invoke-id (when invoke-id (name invoke-id))
      :event-name (pr-str event)
-     :event-type (name (or type :external))
+     :event-type (pr-str (or type :external))
      :event-data (core/freeze (or data {}))
      :deliver-at deliver-at}))
 
@@ -57,7 +71,7 @@
         data (core/thaw (:event-data row))]
     (evts/new-event
      (cond-> {:name event-name
-              :type (keyword (:event-type row))
+              :type (parse-event-type (:event-type row))
               :target (core/str->session-id (:target-session-id row))
               :data (or data {})}
        (:source-session-id row)

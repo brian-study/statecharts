@@ -30,12 +30,18 @@
 #?(:clj
    (defmacro with-processing-context [env & body]
      `(let [vwmem# (get ~env ::sc/vwmem)]
-        (vswap! vwmem# (fn [m#] (merge
-                                  {::sc/enabled-transitions (chart/document-ordered-set (::sc/statechart ~env))
-                                   ::sc/states-to-invoke    (chart/document-ordered-set (::sc/statechart ~env))
-                                   ;; This belongs elsewhere, I think
-                                   ::sc/internal-queue      (com.fulcrologic.statecharts.util/queue)}
-                                  m#)))
+        ;; Clojure's `merge` inherits metadata from the leftmost non-nil arg.
+        ;; If we put the defaults on the left, wmem's metadata (e.g. the
+        ;; ::version attached by JDBC-backed working memory stores) is silently
+        ;; dropped. We preserve it explicitly via `with-meta`.
+        (vswap! vwmem# (fn [m#] (with-meta
+                                  (merge
+                                    {::sc/enabled-transitions (chart/document-ordered-set (::sc/statechart ~env))
+                                     ::sc/states-to-invoke    (chart/document-ordered-set (::sc/statechart ~env))
+                                     ;; This belongs elsewhere, I think
+                                     ::sc/internal-queue      (com.fulcrologic.statecharts.util/queue)}
+                                    m#)
+                                  (meta m#))))
         (do ~@body)
         (vswap! vwmem# dissoc ::sc/enabled-transitions ::sc/states-to-invoke ::sc/internal-queue))))
 
@@ -847,14 +853,18 @@
       (assoc env
         ::sc/context-element-id :ROOT
         ::sc/statechart statechart
-        ::sc/vwmem (volatile! (merge
-                                {::sc/session-id         (or session-id (genid "session"))
-                                 ::sc/statechart-src     statechart-src
-                                 ::sc/configuration      #{} ; active states
-                                 ::sc/initialized-states #{} ; states that have been entered (initialized data model) before
-                                 ::sc/history-value      {}
-                                 ::sc/running?           true}
-                                wmem))))
+        ;; Preserve wmem's metadata (e.g. ::version for optimistic locking on
+        ;; persistent stores) through the defaults merge — see with-processing-context.
+        ::sc/vwmem (volatile! (with-meta
+                                (merge
+                                  {::sc/session-id         (or session-id (genid "session"))
+                                   ::sc/statechart-src     statechart-src
+                                   ::sc/configuration      #{} ; active states
+                                   ::sc/initialized-states #{} ; states that have been entered (initialized data model) before
+                                   ::sc/history-value      {}
+                                   ::sc/running?           true}
+                                  wmem)
+                                (meta wmem)))))
     (throw (ex-info "Statechart not found" {:src statechart-src}))))
 
 (>defn process-event!

@@ -1,21 +1,21 @@
-(ns com.fulcrologic.statecharts.persistence.jdbc.known-issues-test
-  "Red tests for known issues surfaced by the deep review of the JDBC persistence
-   layer. Each test asserts the CORRECT behaviour and currently FAILS, documenting
-   a real gap in the library. See the review notes for the full writeup.
-
-   Run only these tests:
-     clojure -M:dev:test:clj-tests :known-failing
-
-   Skipped by default in both :unit and :integration runs."
+(ns com.fulcrologic.statecharts.persistence.jdbc.regression-test
+  "Regression tests for issues surfaced by the deep review of the JDBC
+   persistence layer and fixed in 2.0.2. Each test pins behaviour at its
+   correct post-fix state; if one of these turns red, the corresponding fix
+   regressed."
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
    [com.fulcrologic.statecharts :as sc]
+   [com.fulcrologic.statecharts.algorithms.v20150901-impl :as impl]
+   [com.fulcrologic.statecharts.chart :as chart]
+   [com.fulcrologic.statecharts.elements :refer [state]]
    [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
    [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
    [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [com.fulcrologic.statecharts.protocols :as sp]
+   [com.fulcrologic.statecharts.registry.local-memory-registry :as mem-reg]
    [next.jdbc.connection :as jdbc.connection])
   (:import
    [com.zaxxer.hikari HikariDataSource]
@@ -66,12 +66,17 @@
 ;; branch. Concurrent writers silently last-writer-wins; optimistic-lock-failure
 ;; never fires.
 
-(deftest ^:known-failing processing-context-merge-preserves-metadata-test
-  (testing "merge of defaults on the LEFT with wmem on the RIGHT should keep wmem's metadata"
-    (let [wmem   (with-meta {:a 1 :b 2} {::core/version 42})
-          merged (merge {:c 3} wmem)]
-      (is (= {::core/version 42} (meta merged))
-          "with-processing-context's (merge {defaults} wmem) strips wmem's metadata — root cause of finding #1"))))
+(deftest processing-env-preserves-wmem-metadata-test
+  (testing "processing-env must preserve wmem's metadata (e.g. the ::version that JDBC stores attach)"
+    (let [chart       (chart/statechart {:initial :s1} (state {:id :s1}))
+          registry    (mem-reg/new-registry)
+          _           (sp/register-statechart! registry :test-chart chart)
+          env         {::sc/statechart-registry registry}
+          wmem        (core/attach-version {::sc/session-id :x ::sc/statechart-src :test-chart} 42)
+          p-env       (impl/processing-env env :test-chart wmem)
+          vwmem-value (some-> p-env ::sc/vwmem deref)]
+      (is (= 42 (core/get-version vwmem-value))
+          "processing-env drops wmem's ::version meta via (merge {defaults} wmem); the JDBC store then never triggers optimistic locking"))))
 
 ;; -----------------------------------------------------------------------------
 ;; Finding #3 (HIGH) — create-job! can return nil under terminal-transition race
@@ -82,19 +87,26 @@
 ;; (find-active → nil), then a new active job appears before the retry insert
 ;; (retry try-insert! → nil), the `or` yields nil. Caller stringifies to "".
 
-(deftest ^:known-failing create-job-never-returns-nil-under-race-test
-  (testing "create-job! must always return a UUID, even when every DB call models a conflict"
+(deftest create-job-never-returns-nil-under-race-test
+  (testing "create-job! must not silently return nil under adversarial races"
+    ;; After the fix, an exhausted race throws ex-info rather than returning nil.
+    ;; Either behaviour (non-nil return or throw) satisfies the invariant "caller
+    ;; never sees a nil job-id that it would then stringify to ''".
     (with-redefs [core/execute-sql! (fn [& _] [])]
-      (let [result (job-store/create-job!
-                    :fake-pool
-                    {:id           (UUID/randomUUID)
-                     :session-id   :race-session
-                     :invokeid     :race-invoke
-                     :job-type     "http"
-                     :payload      {}
-                     :max-attempts 3})]
-        (is (some? result)
-            "create-job! returns nil under the modeled race; caller then stores job-id as empty string")))))
+      (let [params {:id           (UUID/randomUUID)
+                    :session-id   :race-session
+                    :invokeid     :race-invoke
+                    :job-type     "http"
+                    :payload      {}
+                    :max-attempts 3}
+            {:keys [result error]} (try
+                                     {:result (job-store/create-job! :fake-pool params)}
+                                     (catch Exception e {:error e}))]
+        (is (or (some? result) (some? error))
+            "create-job! should return a UUID or throw; never return nil")
+        (when error
+          (is (re-find #"(?i)exhausted" (.getMessage ^Exception error))
+              "race-exhaustion error is informative"))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Finding #4 (HIGH) — cancel-by-session! orphans in-flight handler work
@@ -106,7 +118,7 @@
 ;; so the reconciler will never emit a terminal event for the cancelled job.
 ;; Parent session wedges waiting for done.invoke.X or error.invoke.X.
 
-(deftest ^:known-failing ^:integration cancel-by-session-job-is-reconcilable-test
+(deftest ^:integration cancel-by-session-job-is-reconcilable-test
   (testing "after cancel-by-session!, the job should still be reachable by the reconciler"
     (let [session-id :cancel-orphan-session
           invokeid   :cancel-orphan-invoke
@@ -144,7 +156,7 @@
 ;; absent. A bare `javax.sql.DataSource` has no isClosed method — the event loop
 ;; will never auto-stop, and a failing DataSource pegs CPU at poll cadence.
 
-(deftest ^:known-failing datasource-closed-detects-all-datasource-shapes-test
+(deftest datasource-closed-detects-all-datasource-shapes-test
   (testing "datasource-closed? should signal closed for any DataSource that cannot issue connections"
     (let [closed?-fn @#'pg-sc/datasource-closed?
           ;; A DataSource whose getConnection always throws — effectively closed.
@@ -163,7 +175,7 @@
 ;; drops the namespace from keyword types like `::sc/chart`. `row->event`
 ;; reconstructs via `(keyword event-type)`, so `::sc/chart` → `:chart`.
 
-(deftest ^:known-failing ^:integration event-type-namespace-preserved-test
+(deftest ^:integration event-type-namespace-preserved-test
   (testing "namespaced keyword event types should round-trip through the queue"
     (let [queue     (pg-eq/new-queue *pool* "ns-roundtrip")
           received  (atom nil)

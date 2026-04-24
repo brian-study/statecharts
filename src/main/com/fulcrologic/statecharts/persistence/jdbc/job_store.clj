@@ -65,12 +65,24 @@
 ;; Job CRUD
 ;; -----------------------------------------------------------------------------
 
+(def ^:private create-job-max-race-attempts
+  "Upper bound on (try-insert! → find-active) retries under adversarial races
+   where the active job flips to terminal between INSERT-no-op and SELECT and
+   a new active job appears before the retry. Exhaustion throws — stranding an
+   invocation is preferable to silently returning nil."
+  5)
+
 (defn create-job!
   "Create a new job, returning the job-id (UUID).
 
    Idempotent (I1): if an active job already exists for this session+invokeid,
    returns the existing job-id instead of creating a duplicate.
-   Uses partial unique index on (session_id, invokeid) WHERE status IN ('pending','running')."
+   Uses partial unique index on (session_id, invokeid) WHERE status IN ('pending','running').
+
+   Under adversarial concurrency, the (INSERT-no-op → SELECT) sequence can observe
+   a terminal transition and miss the active job. We loop up to
+   `create-job-max-race-attempts` times and throw on exhaustion rather than
+   returning nil (which callers would stringify to an empty job-id)."
   [ds {:keys [id session-id invokeid job-type payload max-attempts]
        :or {max-attempts 3}}]
   (let [sid-str (core/session-id->str session-id)
@@ -91,11 +103,19 @@
                                          " WHERE session_id = ? AND invokeid = ?"
                                          " AND status IN ('pending', 'running')")
                                     [sid-str iid-str]))))]
-    (or (try-insert!)
-        (find-active)
-        ;; Race: active job was resolved between INSERT and SELECT.
-        ;; Retry the insert once.
-        (try-insert!))))
+    (loop [attempt 0]
+      (if-let [job-id (or (try-insert!) (find-active))]
+        job-id
+        (if (< attempt create-job-max-race-attempts)
+          (do
+            (log/debug "create-job! lost a race, retrying"
+                       {:session-id session-id :invokeid invokeid :attempt attempt})
+            (recur (inc attempt)))
+          (throw (ex-info "create-job! exhausted race retries"
+                          {:session-id     session-id
+                           :invokeid       invokeid
+                           :attempts       attempt
+                           :max-race-attempts create-job-max-race-attempts})))))))
 
 (defn claim-jobs!
   "Claim up to `limit` claimable jobs for this worker.
@@ -238,38 +258,61 @@
            :failed)
          :ignored)))))
 
+(def ^:private cancelled-event-data
+  (delay (core/freeze {:reason :cancelled})))
+
 (defn cancel!
   "Cancel a job for a specific session+invokeid.
    Status-conditional (I7): only cancels pending/running jobs.
+
+   Also writes a terminal event (`error.invoke.<invokeid>` with data
+   `{:reason :cancelled}`) so the reconciler can dispatch it to the parent
+   session — otherwise an in-flight worker and the parent would deadlock
+   waiting for each other.
+
    Returns the number of rows affected."
   [ds session-id invokeid]
-  (let [result (core/execute-sql! ds
+  (let [iid-str (invokeid->str invokeid)
+        terminal-event-name (str \: "error.invoke." iid-str)
+        result (core/execute-sql! ds
                  (str "UPDATE statechart_jobs"
                       " SET status = 'cancelled',"
                       "     lease_owner = NULL,"
                       "     lease_expires_at = NULL,"
+                      "     terminal_event_name = ?,"
+                      "     terminal_event_data = ?,"
                       "     updated_at = now()"
                       " WHERE session_id = ? AND invokeid = ?"
                       " AND status IN ('pending', 'running')"
                       " RETURNING id")
-                 [(core/session-id->str session-id)
-                  (invokeid->str invokeid)])]
+                 [terminal-event-name
+                  @cancelled-event-data
+                  (core/session-id->str session-id)
+                  iid-str])]
     (core/affected-row-count result)))
 
 (defn cancel-by-session!
   "Cancel all active jobs for a session (I6).
-   Used when session is being deleted or reset."
+   Used when session is being deleted or reset.
+
+   Writes a terminal event per job so the reconciler dispatches
+   `error.invoke.<invokeid>` to the parent. `invokeid` is concatenated
+   server-side (safe: `invokeid` is library-serialised via `invokeid->str`,
+   never user input)."
   [ds session-id]
   (let [result (core/execute-sql! ds
                  (str "UPDATE statechart_jobs"
                       " SET status = 'cancelled',"
                       "     lease_owner = NULL,"
                       "     lease_expires_at = NULL,"
+                      "     terminal_event_name = ':error.invoke.' || invokeid,"
+                      "     terminal_event_data = ?,"
                       "     updated_at = now()"
                       " WHERE session_id = ?"
                       " AND status IN ('pending', 'running')"
                       " RETURNING id")
-                 [(core/session-id->str session-id)])]
+                 [@cancelled-event-data
+                  (core/session-id->str session-id)])]
     (core/affected-row-count result)))
 
 (defn get-active-job
@@ -293,13 +336,16 @@
     (= "cancelled" (:status row))))
 
 (defn get-undispatched-terminal-jobs
-  "Get jobs that completed/failed but whose terminal event hasn't been dispatched yet.
-   Used by the reconciliation loop."
+  "Get jobs in a terminal state whose terminal event hasn't been dispatched yet.
+   Used by the reconciliation loop.
+
+   Includes succeeded, failed, and cancelled jobs (the latter always have a
+   `terminal_event_name` written by `cancel!` / `cancel-by-session!`)."
   [ds limit]
   (let [limit (long limit) ;; ensure numeric — prevent SQL injection
         rows (core/execute-sql! ds
                (str "SELECT * FROM statechart_jobs"
-                    " WHERE status IN ('succeeded', 'failed')"
+                    " WHERE status IN ('succeeded', 'failed', 'cancelled')"
                     " AND terminal_event_dispatched_at IS NULL"
                     " AND terminal_event_name IS NOT NULL"
                     " ORDER BY updated_at"

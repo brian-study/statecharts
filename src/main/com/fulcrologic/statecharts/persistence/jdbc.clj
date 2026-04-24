@@ -168,8 +168,14 @@
    - A keyword (event name) with optional target
    - A map with :event, :data, :target, :delay, etc.
 
-   If an event loop is running on this env (via start-event-loop!), and the event
-   is not delayed, the loop will be woken up immediately to process it."
+   If an event loop is running on THIS env (via `start-event-loop!`) AND the
+   event is not delayed, the loop will be woken up immediately to process it.
+
+   NOTE: the wake-up mechanism is intra-JVM only — the `::wake-signal` is set
+   up inside the `start-event-loop!` closure, so a `send!` from a different
+   JVM (or one targeting an env other than the one the loop is running on)
+   will only be picked up at the next poll interval. For cross-node wake-up,
+   use LISTEN/NOTIFY or another signalling channel."
   [{::sc/keys [event-queue] ::keys [wake-signal] :as env} event-or-request]
   (let [result (sp/send! event-queue env event-or-request)
         ;; Check if this is an immediate event (no delay)
@@ -186,16 +192,32 @@
 ;; -----------------------------------------------------------------------------
 
 (defn- datasource-closed?
-  "Return true if the datasource exposes an `isClosed` method that reports true.
-   Works with HikariDataSource and any other pool following the convention.
-   Returns false for datasources without an `isClosed` method."
+  "Return true if the datasource cannot serve connections.
+
+   Checks, in order:
+   1. Reflective `isClosed()` — works for `HikariDataSource` and any pool
+      following the JDBC pool convention.
+   2. Connection probe — if no `isClosed` method is exposed (plain
+      `javax.sql.DataSource` instances), briefly open and close a connection.
+      If that throws, treat the datasource as closed.
+
+   Ensures the event loop stops cleanly for any DataSource shape, and that a
+   permanently-failing pool doesn't spin indefinitely at poll cadence."
   [ds]
   (when ds
-    (try
-      (let [m (.getMethod (class ds) "isClosed" (into-array Class []))]
-        (boolean (.invoke m ds (object-array 0))))
-      (catch NoSuchMethodException _ false)
-      (catch Exception _ false))))
+    (let [isClosed-m (try
+                       (.getMethod (class ds) "isClosed" (into-array Class []))
+                       (catch NoSuchMethodException _ nil)
+                       (catch Exception _ nil))]
+      (if isClosed-m
+        (try
+          (boolean (.invoke isClosed-m ds (object-array 0)))
+          (catch Exception _ false))
+        ;; Fallback: probe a connection. Success → open; any throw → closed.
+        (try
+          (with-open [_conn (.getConnection ^javax.sql.DataSource ds)]
+            false)
+          (catch Exception _ true))))))
 
 (defn start-event-loop!
   "Start a background event processing loop.
