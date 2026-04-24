@@ -113,20 +113,42 @@
   true)
 
 (defn- cancel-events!
-  "Cancel pending delayed events matching session-id and send-id."
+  "Cancel pending delayed events matching session-id and send-id.
+
+   Races with delivery: a delayed event whose `deliver_at` just crossed
+   `now()` may already be claimable by a worker (the claim predicate is
+   `deliver_at <= now()`), and this DELETE's `deliver_at > now()`
+   predicate excludes it. SCXML permits this race, but callers
+   reasonably expect cancel-wins — we log at DEBUG when the delete
+   affected zero rows so operators can correlate with a subsequent
+   delivery."
   [ds session-id send-id]
-  (core/execute! ds
-                 {:delete-from :statechart-events
-                  :where [:and
-                          [:= :source-session-id (core/session-id->str session-id)]
-                          [:= :send-id send-id]
-                          [:is :processed-at nil]
-                          [:> :deliver-at [:now]]]})
-  true)
+  (let [result (core/execute! ds
+                              {:delete-from :statechart-events
+                               :where [:and
+                                       [:= :source-session-id (core/session-id->str session-id)]
+                                       [:= :send-id send-id]
+                                       [:is :processed-at nil]
+                                       [:> :deliver-at [:now]]]})]
+    (when (zero? (core/affected-row-count result))
+      (log/debug "cancel-events! affected 0 rows (event may have already been delivered, cancelled, or never queued)"
+                 {:session-id session-id :send-id send-id}))
+    true))
 
 (defn- claim-events!
   "Claim events ready for delivery using SELECT FOR UPDATE SKIP LOCKED.
-   Returns the claimed event rows."
+   Returns the claimed event rows.
+
+   Per-session FIFO guard: the subquery excludes any target session
+   with at least one event already claimed by another worker
+   (`claimed_at IS NOT NULL AND processed_at IS NULL`). Without this a
+   second worker can claim event 2 for session S while the first worker
+   still holds event 1 — breaking the per-session ordering that the
+   `receive-events!` comment promises. The guard is best-effort across
+   simultaneous claim evaluations (two workers racing on the exact same
+   instant can both see no in-flight claim and both win the
+   `FOR UPDATE SKIP LOCKED` lottery); callers who need strict ordering
+   should partition workers by `:session-id` or run a single worker."
   [conn node-id {:keys [session-id batch-size]
                  :or {batch-size 10}}]
   (let [batch-size (long batch-size)] ;; ensure numeric — prevent SQL injection
@@ -135,7 +157,7 @@
         (str "UPDATE statechart_events "
              "SET claimed_at = now(), claimed_by = ? "
              "WHERE id IN ("
-             "  SELECT id FROM statechart_events "
+             "  SELECT id FROM statechart_events e "
              "  WHERE processed_at IS NULL "
              "    AND claimed_at IS NULL "
              "    AND deliver_at <= now() "
@@ -145,15 +167,26 @@
              "  FOR UPDATE SKIP LOCKED"
              ") "
              "RETURNING *")
+        ;; Session-filtered path is already single-session; no cross-
+        ;; session FIFO to preserve — drop the NOT EXISTS guard so a
+        ;; session-scoped worker can continue to claim the next event
+        ;; for its own session even while the previous event is in
+        ;; flight in the same process.
         [node-id (core/session-id->str session-id)])
       (core/execute-sql! conn
         (str "UPDATE statechart_events "
              "SET claimed_at = now(), claimed_by = ? "
              "WHERE id IN ("
-             "  SELECT id FROM statechart_events "
+             "  SELECT id FROM statechart_events e "
              "  WHERE processed_at IS NULL "
              "    AND claimed_at IS NULL "
              "    AND deliver_at <= now() "
+             "    AND NOT EXISTS ("
+             "      SELECT 1 FROM statechart_events e2 "
+             "      WHERE e2.target_session_id = e.target_session_id "
+             "        AND e2.claimed_at IS NOT NULL "
+             "        AND e2.processed_at IS NULL"
+             "    ) "
              "  ORDER BY deliver_at, id "
              "  LIMIT " batch-size " "
              "  FOR UPDATE SKIP LOCKED"
@@ -252,6 +285,20 @@
                   :else
                   (try
                     (let [event           (row->event row)
+                          ;; `::sc/save-attempted?` flips inside
+                          ;; `JdbcWorkingMemoryStore/save-working-memory!`
+                          ;; before its tx opens. The fallback ACK below
+                          ;; uses it to distinguish:
+                          ;;  - handler never called save (terminated /
+                          ;;    missing session) — fallback is the correct
+                          ;;    path to ACK so we don't loop on a zombie.
+                          ;;  - handler called save but the tx rolled
+                          ;;    back (OCC conflict, constraint violation,
+                          ;;    connection loss) and the handler swallowed
+                          ;;    the exception — fallback would silently
+                          ;;    ACK a lost event, so we skip it and let
+                          ;;    the next poll retry.
+                          save-attempted? (atom false)
                           ;; Inject an on-save hook so that the handler's
                           ;; working-memory save and the event ACK commit
                           ;; in the same transaction. Without this the
@@ -261,8 +308,10 @@
                           ;; event unacked, and stale-claim recovery then
                           ;; re-delivers it against already-advanced state
                           ;; — non-idempotent actions run twice.
-                          env-with-ack    (update env ::sc/on-save-hooks
-                                                  (fnil conj []) #(mark-processed! % event-id))
+                          env-with-ack    (-> env
+                                              (update ::sc/on-save-hooks
+                                                      (fnil conj []) #(mark-processed! % event-id))
+                                              (assoc ::sc/save-attempted? save-attempted?))
                           handler-result  (handler env-with-ack event)]
                       ;; If the handler returns a Promesa promise (async
                       ;; processor, or any promise-returning handler), wait
@@ -273,19 +322,22 @@
                       ;; return non-promise values — the deref is a no-op.
                       (when (p/promise? handler-result)
                         @handler-result)
-                      ;; Fallback ACK for handlers that succeed without
-                      ;; ever calling `save-working-memory!` (e.g. session
-                      ;; already terminated / session gone). `mark-processed!`
-                      ;; is idempotent (UPDATE by event-id), so a hook-path
-                      ;; ACK already committed makes this a no-op.
-                      (core/with-tx [tx datasource]
-                        (mark-processed! tx event-id))
+                      ;; Fallback ACK ONLY when the handler never attempted
+                      ;; a save. If a save was attempted, the on-save hook
+                      ;; either committed the ACK (save succeeded) or
+                      ;; rolled back with it (save failed) — in the latter
+                      ;; case running a separate ACK tx here would silently
+                      ;; lose the event.
+                      (when-not @save-attempted?
+                        (core/with-tx [tx datasource]
+                          (mark-processed! tx event-id)))
                       (let [duration-ms (/ (- (System/nanoTime) start-time) 1e6)]
                         (log/debug "Event processed"
                                    {:event-id event-id
                                     :event event-name
                                     :target target
                                     :duration-ms duration-ms
+                                    :save-attempted? @save-attempted?
                                     :node-id node-id}))
                       blocked-sessions)
                     (catch Exception e

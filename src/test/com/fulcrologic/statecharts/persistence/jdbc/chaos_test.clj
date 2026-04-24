@@ -19,6 +19,7 @@
    [com.fulcrologic.statecharts.persistence.jdbc.chaos :as chaos]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
+   [com.fulcrologic.statecharts.persistence.jdbc.fixtures :as fixtures :refer [*pool*]]
    [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
    [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
@@ -28,26 +29,17 @@
    [com.zaxxer.hikari HikariDataSource]))
 
 ;; =============================================================================
-;; Test Configuration
-;; =============================================================================
-
-(def ^:private test-config
-  {:dbtype "postgres"
-   :dbname (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :host (or (System/getenv "PG_TEST_HOST") "localhost")
-   :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :username (or (System/getenv "PG_TEST_USER") "postgres")
-   :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
-
-(def ^:dynamic *pool* nil)
-
-;; =============================================================================
 ;; Fixtures
 ;; =============================================================================
+;;
+;; Chaos tests need a larger pool to exercise concurrent access patterns,
+;; so we override `fixtures/with-pool`'s sizing here. Table setup calls
+;; `chaos/setup-tables!` (which adds chaos-specific helpers) rather than
+;; the bare `schema/create-tables!`.
 
 (defn with-pool [f]
   (let [ds (jdbc.connection/->pool HikariDataSource
-             (assoc test-config
+             (assoc fixtures/test-config
                     :minimumIdle 3
                     :maximumPoolSize 8))]
     (try
@@ -302,7 +294,7 @@
   (testing "operations survive pool contention with small pool"
     (let [;; Create a tiny pool to force contention
           tiny-pool (jdbc.connection/->pool HikariDataSource
-                      (assoc test-config
+                      (assoc fixtures/test-config
                              :minimumIdle 1
                              :maximumPoolSize 2))
           store (pg-wms/new-store tiny-pool)

@@ -79,7 +79,13 @@
 
    Options:
    - :datasource - javax.sql.DataSource (REQUIRED). HikariCP is the standard choice.
-   - :node-id - Unique identifier for this worker node (optional, auto-generated if not provided)
+   - :node-id - Unique identifier for this worker node (optional, auto-generated
+                if not provided). **Must be globally unique across running
+                worker processes.** Collisions confuse stale-claim recovery
+                (workers can't tell whose claim a stuck row is). The default is
+                a `random-uuid`; callers overriding with a hostname-derived
+                string should ensure uniqueness themselves (e.g.
+                `<hostname>-<pid>-<random-uuid>`).
    - :data-model - Custom data model (optional, defaults to flat working memory model)
    - :execution-model - Custom execution model (optional, defaults to lambda model)
    - :invocation-processors - Custom invocation processors (optional)

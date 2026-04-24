@@ -22,50 +22,14 @@
    [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
-   [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.fixtures :as fixtures :refer [*pool*]]
    [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
-   [com.fulcrologic.statecharts.protocols :as sp]
-   [next.jdbc.connection :as jdbc.connection])
+   [com.fulcrologic.statecharts.protocols :as sp])
   (:import
-   [com.zaxxer.hikari HikariDataSource]
    [java.time OffsetDateTime]))
 
-;; -----------------------------------------------------------------------------
-;; Test Configuration
-;; -----------------------------------------------------------------------------
-
-(def ^:private test-config
-  {:dbtype "postgres"
-   :dbname (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :host (or (System/getenv "PG_TEST_HOST") "localhost")
-   :port (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :username (or (System/getenv "PG_TEST_USER") "postgres")
-   :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
-
-(def ^:dynamic *pool* nil)
-
-;; -----------------------------------------------------------------------------
-;; Test Fixtures
-;; -----------------------------------------------------------------------------
-
-(defn with-pool [f]
-  (let [ds (jdbc.connection/->pool HikariDataSource test-config)]
-    (try
-      (binding [*pool* ds]
-        (f))
-      (finally
-        (.close ^HikariDataSource ds)))))
-
-(defn with-clean-tables [f]
-  (schema/create-tables! *pool*)
-  (schema/truncate-tables! *pool*)
-  (try
-    (f)
-    (finally
-      (schema/truncate-tables! *pool*))))
-
-(use-fixtures :once with-pool)
-(use-fixtures :each with-clean-tables)
+(use-fixtures :once fixtures/with-pool)
+(use-fixtures :each fixtures/with-clean-tables)
 
 ;; -----------------------------------------------------------------------------
 ;; Column Conversion Tests

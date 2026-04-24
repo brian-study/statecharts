@@ -18,49 +18,18 @@
    [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
+   [com.fulcrologic.statecharts.persistence.jdbc.fixtures :as fixtures :refer [*pool*]]
    [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
    [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
    [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
    [com.fulcrologic.statecharts.protocols :as sp]
    [com.fulcrologic.statecharts.registry.local-memory-registry :as mem-reg]
-   [next.jdbc.connection :as jdbc.connection]
    [promesa.core :as p])
   (:import
-   [com.zaxxer.hikari HikariDataSource]
    [java.util UUID]))
 
-;; -----------------------------------------------------------------------------
-;; Shared Fixtures (mirror integration_test.clj)
-;; -----------------------------------------------------------------------------
-
-(def ^:private test-config
-  {:dbtype   "postgres"
-   :dbname   (or (System/getenv "PG_TEST_DATABASE") "statecharts_test")
-   :host     (or (System/getenv "PG_TEST_HOST") "localhost")
-   :port     (parse-long (or (System/getenv "PG_TEST_PORT") "5432"))
-   :username (or (System/getenv "PG_TEST_USER") "postgres")
-   :password (or (System/getenv "PG_TEST_PASSWORD") "postgres")})
-
-(def ^:dynamic *pool* nil)
-
-(defn with-pool [f]
-  (let [ds (jdbc.connection/->pool HikariDataSource test-config)]
-    (try
-      (binding [*pool* ds]
-        (f))
-      (finally
-        (.close ^HikariDataSource ds)))))
-
-(defn with-clean-tables [f]
-  (schema/create-tables! *pool*)
-  (schema/truncate-tables! *pool*)
-  (try
-    (f)
-    (finally
-      (schema/truncate-tables! *pool*))))
-
-(use-fixtures :once with-pool)
-(use-fixtures :each with-clean-tables)
+(use-fixtures :once fixtures/with-pool)
+(use-fixtures :each fixtures/with-clean-tables)
 
 ;; -----------------------------------------------------------------------------
 ;; Finding #1 (CRITICAL) — Optimistic locking disabled under process-event!
@@ -1834,3 +1803,394 @@
                          [job-id]))]
         (is (some? (:terminal-event-dispatched-at row))
             "after the ready-path dispatch, the row is marked dispatched")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AF (P1, post-2.0.20 review) — fallback ACK fires after silently-
+;; rolled-back save
+;; -----------------------------------------------------------------------------
+;;
+;; `receive-events!` installs `::sc/on-save-hooks` so the event ACK commits
+;; atomically with the handler's working-memory save. After the handler
+;; returns it ALSO unconditionally runs `(mark-processed! tx event-id)` as a
+;; fallback ACK for handlers that completed without ever calling
+;; `save-working-memory!` (terminated / missing session case).
+;;
+;; Bug: the fallback does not know whether the handler attempted a save that
+;; rolled back. If the handler calls `save-working-memory!`, catches the
+;; resulting exception (e.g. optimistic-lock failure, constraint violation,
+;; connection loss), and returns normally, the hook never fired but the
+;; fallback still ACKs. The event is silently lost: the handler's effects
+;; rolled back, WM is unchanged, but the queue row is marked processed and
+;; the next poll cycle excludes it.
+;;
+;; Fix: gate the fallback on "did the handler actually attempt to save?".
+;; An `::sc/save-attempted?` atom in env is flipped by
+;; `save-working-memory!` before it opens its tx. After the handler returns,
+;; the fallback only fires when the atom is still `false` (no save
+;; attempted) — which preserves the terminated-session path while closing
+;; the rollback window.
+
+(deftest ^:integration receive-events-does-not-silently-ack-when-save-rolls-back-test
+  (testing "fallback mark-processed! must NOT fire if the handler's save-working-memory! call rolled back"
+    (let [q          (pg-eq/new-queue *pool* "fallback-ack-worker")
+          wms        (pg-wms/new-store *pool*)
+          session-id :fallback-ack-session
+          _          (sp/save-working-memory! wms {} session-id
+                       {::sc/session-id         session-id
+                        ::sc/statechart-src     :any-chart
+                        ::sc/configuration      #{:s1}
+                        ::sc/initialized-states #{:s1}
+                        ::sc/history-value      {}
+                        ::sc/running?           true
+                        ::sc/data-model         {}})
+          handler-ran? (atom false)
+          handler    (fn [env _event]
+                       (reset! handler-ran? true)
+                       ;; Simulate a real-world handler that attempts a save that
+                       ;; rolls back (here: force OCC failure), then catches the
+                       ;; exception and returns normally.
+                       (try
+                         (let [wmem     (sp/get-working-memory wms env session-id)
+                               bad-wmem (core/attach-version wmem 9999)]
+                           (sp/save-working-memory! wms env session-id bad-wmem))
+                         (catch Exception _ nil))
+                       :handler-returned-normally)]
+      (sp/send! q {} {:event             :test
+                      :target            session-id
+                      :source-session-id session-id})
+      (sp/receive-events! q {} handler)
+      (is (true? @handler-ran?) "handler actually ran")
+      (let [row (first (core/execute-sql! *pool*
+                         "SELECT processed_at FROM statechart_events WHERE target_session_id = ?"
+                         [(core/session-id->str session-id)]))]
+        (is (nil? (:processed-at row))
+            "event must stay unacked when the handler's save rolled back — the unconditional fallback mark-processed! silently loses the event")))))
+
+(deftest ^:integration receive-events-fallback-ack-still-fires-when-no-save-attempted-test
+  (testing "handlers that deliberately don't save (terminated / missing session) must still have their events ACKed via the fallback"
+    (let [q          (pg-eq/new-queue *pool* "no-save-worker")
+          session-id :no-save-session
+          handler    (fn [_env _event]
+                       ;; no save-working-memory! call — simulates handler
+                       ;; returning on a session that is gone / terminated.
+                       :no-op)]
+      (sp/send! q {} {:event             :test
+                      :target            session-id
+                      :source-session-id session-id})
+      (sp/receive-events! q {} handler)
+      (let [row (first (core/execute-sql! *pool*
+                         "SELECT processed_at FROM statechart_events WHERE target_session_id = ?"
+                         [(core/session-id->str session-id)]))]
+        (is (some? (:processed-at row))
+            "when the handler never attempted to save, the fallback ACK must still fire so zombie events for gone sessions don't loop forever")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AG (P1, post-2.0.20 review) — async start-invocation! leaks unresolved
+;; promise; parent ACK can commit before child is durable
+;; -----------------------------------------------------------------------------
+;;
+;; `StatechartInvocationProcessor/start-invocation!` returns `(p/then result
+;; save!)` on the async path — a promise that resolves when the child's WM
+;; save completes. The caller (statechart processor) may proceed to save the
+;; parent's own WM before that chained promise resolves. Since 2.0.16 the
+;; parent save carries `::sc/on-save-hooks`, so the parent event is ACKed
+;; when the parent save commits — potentially BEFORE the async child save
+;; has committed to the DB. If the child save then rejects (DB error, OCC),
+;; the parent event is already ACKed, the child was never persisted, and
+;; the next poll won't retry.
+;;
+;; Fix: `start-invocation!` must block on the chained save promise before
+;; returning. It always returns `true`/`false`, never a raw promise.
+
+(deftest statechart-invocation-async-child-save-completes-before-return-test
+  (testing "start-invocation! on the async path must block until the child save commits"
+    (let [saved-wms          (atom {})
+          child-save-latch   (java.util.concurrent.CountDownLatch. 1)
+          wm-store           (reify sp/WorkingMemoryStore
+                               (get-working-memory [_ _env sid] (get @saved-wms sid))
+                               (save-working-memory! [_ _env sid wmem]
+                                 ;; Simulate slow DB commit on a different thread.
+                                 (Thread/sleep 40)
+                                 (swap! saved-wms assoc sid wmem)
+                                 (.countDown child-save-latch)
+                                 true)
+                               (delete-working-memory! [_ _env sid]
+                                 (swap! saved-wms dissoc sid)
+                                 true))
+          registry           (mem-reg/new-registry)
+          _                  (sp/register-statechart! registry :child-chart
+                               (chart/statechart {:initial :c1} (state {:id :c1})))
+          async-processor    (reify sp/Processor
+                               ;; `start!` returns a promise that resolves asynchronously.
+                               (start! [_ _env _src {::sc/keys [session-id]}]
+                                 (p/create
+                                   (fn [resolve _reject]
+                                     (future
+                                       (Thread/sleep 10)
+                                       (resolve
+                                         {::sc/session-id     session-id
+                                          ::sc/statechart-src :child-chart
+                                          ::sc/configuration  #{:c1}})))))
+                               (process-event! [_ _env wmem _event] wmem)
+                               (exit! [_ _env _wmem _terminal?] nil))
+          inv-proc           (i.statechart/new-invocation-processor)
+          parent-sid         :async-child-save-parent
+          env                {::sc/session-id           parent-sid
+                              ::sc/vwmem                (volatile! {::sc/session-id parent-sid})
+                              ::sc/event-queue          (reify sp/EventQueue
+                                                          (send! [_ _ _] true)
+                                                          (cancel! [_ _ _ _] true)
+                                                          (receive-events! [_ _ _] nil)
+                                                          (receive-events! [_ _ _ _] nil))
+                              ::sc/working-memory-store wm-store
+                              ::sc/processor            async-processor
+                              ::sc/statechart-registry  registry}
+          result             (sp/start-invocation! inv-proc env
+                               {:invokeid :my-child
+                                :src      :child-chart
+                                :params   {}})]
+      (testing "start-invocation! returns a boolean, not a raw promise"
+        (is (not (p/promise? result))
+            "callers that do NOT await the return value (sync processors, wiring code) would proceed to save the parent's WM — which ACKs the parent event — before the child was durable. start-invocation! must block internally."))
+      (testing "child save has committed by the time start-invocation! returns"
+        (is (pos? (count @saved-wms))
+            "child WM must be in the store synchronously with start-invocation! returning; a raw unresolved promise return lets the caller's parent save ACK before the child is persisted")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AH (P1, post-2.0.20 review) — release-terminal-dispatch-claim! must
+;; be guarded so it only clears actual claims
+;; -----------------------------------------------------------------------------
+;;
+;; `release-terminal-dispatch-claim!` currently updates `WHERE id = ?` with no
+;; ownership or state guard. Its docstring rationalises this as "the caller
+;; owns the claim by construction" — but any stray call (same id from two
+;; code paths, or the wrong id) silently rewrites the column. The fix makes
+;; the update a no-op unless `terminal_event_dispatched_at IS NOT NULL`, so
+;; double-release is a 0-row update and releasing an unclaimed row cannot
+;; accidentally corrupt state.
+
+(deftest ^:integration release-terminal-dispatch-claim-only-affects-claimed-rows-test
+  (let [session-id :release-guard-session
+        job-id     (UUID/randomUUID)]
+    (job-store/create-job! *pool* {:id           job-id
+                                   :session-id   session-id
+                                   :invokeid     :iv
+                                   :job-type     "http"
+                                   :payload      {}
+                                   :max-attempts 3})
+    (core/execute-sql! *pool*
+      (str "UPDATE statechart_jobs"
+           " SET status = 'succeeded',"
+           "     terminal_event_name = ?,"
+           "     terminal_event_data = ?,"
+           "     lease_owner = NULL,"
+           "     updated_at = now()"
+           " WHERE id = ?")
+      [(pr-str :done.invoke.iv) (core/freeze {}) job-id])
+
+    (testing "release on an UNclaimed row affects 0 rows"
+      (let [result (job-store/release-terminal-dispatch-claim! *pool* job-id)]
+        (is (zero? (core/affected-row-count result))
+            "release must be idempotent / guarded: a stray release on a row whose dispatched_at is already nil must not count as a modification (current bug: WHERE id=? matches all; guard needs WHERE dispatched_at IS NOT NULL)")))
+
+    (testing "release on a CLAIMED row reverts the timestamp (1-row update)"
+      (is (true? (job-store/claim-terminal-dispatch! *pool* job-id)))
+      (let [result (job-store/release-terminal-dispatch-claim! *pool* job-id)]
+        (is (= 1 (core/affected-row-count result))
+            "release of a claimed row affects exactly 1 row")))
+
+    (testing "double-release is idempotent (second call is a no-op)"
+      (let [result (job-store/release-terminal-dispatch-claim! *pool* job-id)]
+        (is (zero? (core/affected-row-count result))
+            "a second release against an already-cleared row must be a 0-row update — makes misuse silently safe rather than silently corrupt")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AI (P1, post-2.0.20 review) — delete-working-memory! must purge
+;; pending events
+;; -----------------------------------------------------------------------------
+;;
+;; `delete-working-memory!` deletes the session row and cancels in-flight
+;; durable jobs, but leaves pending/delayed rows in `statechart_events` with
+;; `target_session_id = <deleted-session>`. Workers then claim and process
+;; those zombie events against a WM that doesn't exist, wasting cycles and
+;; polluting logs (the fallback ACK eventually clears them, but they should
+;; be gone from the moment the session is deleted — the tx promise in the
+;; docstring implies atomic cleanup). The fix DELETEs pending events in the
+;; same tx as the session row.
+
+(deftest ^:integration delete-working-memory-purges-pending-events-test
+  (testing "delete-working-memory! must remove queued events for the deleted session in the same tx"
+    (let [session-id :delete-events-session
+          wms        (pg-wms/new-store *pool*)
+          q          (pg-eq/new-queue *pool* "purge-test-worker")]
+      (sp/save-working-memory! wms {} session-id
+        {::sc/session-id         session-id
+         ::sc/statechart-src     :any
+         ::sc/configuration      #{}
+         ::sc/initialized-states #{}
+         ::sc/history-value      {}
+         ::sc/running?           true
+         ::sc/data-model         {}})
+      ;; Queue two events: one immediate, one delayed.
+      (sp/send! q {} {:event             :e1
+                      :target            session-id
+                      :source-session-id session-id})
+      (sp/send! q {} {:event             :e2
+                      :target            session-id
+                      :source-session-id session-id
+                      :delay             60000})
+      (is (= 2 (pg-eq/queue-depth *pool* {:session-id session-id}))
+          "setup: two events queued")
+
+      (sp/delete-working-memory! wms {} session-id)
+
+      (is (zero? (pg-eq/queue-depth *pool* {:session-id session-id}))
+          "after delete, no queued events remain for the deleted session — currently pending rows linger and get claimed by workers against a missing WM"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AJ (P2, post-2.0.20 review) — fetch-session must not crash on
+;; corrupted statechart_src
+;; -----------------------------------------------------------------------------
+;;
+;; `working_memory_store/fetch-session` calls `edn/read-string` on
+;; `:statechart-src` with no try/catch. A row with malformed EDN (corrupted
+;; write, mixed-writer deployment, bad migration) throws and the session is
+;; permanently unreadable. The fix wraps the read, logs once, and falls back
+;; to the raw string so callers can recover / triage.
+
+(deftest ^:integration fetch-session-survives-corrupted-statechart-src-test
+  (testing "get-working-memory must not throw on a malformed :statechart-src"
+    (let [session-id    :corrupt-src-session
+          wms           (pg-wms/new-store *pool*)]
+      (core/execute-sql! *pool*
+        (str "INSERT INTO statechart_sessions"
+             " (session_id, statechart_src, working_memory, version)"
+             " VALUES (?, ?, ?, 1)")
+        [(core/session-id->str session-id)
+         "{{{ not valid edn"
+         (core/freeze {::sc/session-id session-id})])
+      (let [outcome (try
+                      {:ok (sp/get-working-memory wms {} session-id)}
+                      (catch Exception e {:error e}))]
+        (is (nil? (:error outcome))
+            "corrupted statechart_src row must not crash fetch-session — one bad row currently wedges the entire session")
+        (is (some? (:ok outcome))
+            "fetch returns a working-memory map (possibly with a string :statechart-src fallback) so callers can surface the corruption")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AK (P2, post-2.0.20 review) — hook-stripping must be pattern-based,
+;; not a single-key denylist
+;; -----------------------------------------------------------------------------
+;;
+;; `start-invocation!` currently does `(dissoc env ::sc/on-save-hooks)` with
+;; an explicit comment warning future maintainers to add each new
+;; `::sc/on-*-hooks` key to the dissoc. Relying on a human to remember is a
+;; silent trap: a missed keyword means child saves run parent-session
+;; bookkeeping. The fix sweeps all `::sc/*-hooks` keys in one pass so any
+;; future hook is automatically excluded from the child env.
+
+(deftest statechart-invocation-strips-all-sc-hooks-keys-from-child-env-test
+  (testing "every ::sc/*-hooks key in the parent env must be stripped before the child save"
+    (let [captured-env      (atom nil)
+          saved-wms         (atom {})
+          event-queue       (reify sp/EventQueue
+                              (send! [_ _env _req] true)
+                              (cancel! [_ _env _sid _sendid] true)
+                              (receive-events! [_ _env _h] nil)
+                              (receive-events! [_ _env _h _opts] nil))
+          registry          (mem-reg/new-registry)
+          _                 (sp/register-statechart! registry :child-chart
+                              (chart/statechart {:initial :c1} (state {:id :c1})))
+          wm-store          (reify sp/WorkingMemoryStore
+                              (get-working-memory [_ _env sid] (get @saved-wms sid))
+                              (save-working-memory! [_ env sid wmem]
+                                (reset! captured-env env)
+                                (swap! saved-wms assoc sid wmem)
+                                true)
+                              (delete-working-memory! [_ _env sid]
+                                (swap! saved-wms dissoc sid)
+                                true))
+          processor         (reify sp/Processor
+                              (start! [_ _env _src {::sc/keys [session-id]}]
+                                {::sc/session-id session-id ::sc/configuration #{:c1}})
+                              (process-event! [_ _env wmem _event] wmem)
+                              (exit! [_ _env _wmem _terminal?] nil))
+          inv-proc          (i.statechart/new-invocation-processor)
+          parent-sid        :hook-sweep-parent
+          future-hook       (fn [_tx] :fired)
+          env               {::sc/session-id            parent-sid
+                             ::sc/vwmem                 (volatile! {::sc/session-id parent-sid})
+                             ::sc/event-queue           event-queue
+                             ::sc/working-memory-store  wm-store
+                             ::sc/processor             processor
+                             ::sc/statechart-registry   registry
+                             ::sc/on-save-hooks         [future-hook]
+                             ;; Simulate a hypothetical future hook key the
+                             ;; current explicit denylist has not been
+                             ;; updated for.
+                             ::sc/on-delete-hooks       [future-hook]
+                             ::sc/pre-save-hooks        [future-hook]}]
+      (sp/start-invocation! inv-proc env
+        {:invokeid :my-child
+         :src      :child-chart
+         :params   {}})
+      (let [child-env @captured-env]
+        (is (some? child-env) "child save ran and captured the env")
+        (is (nil? (::sc/on-save-hooks child-env))
+            "on-save-hooks already stripped by the 2.0.19 fix")
+        (is (nil? (::sc/on-delete-hooks child-env))
+            "any ::sc/*-hooks key must be stripped — currently only the explicit on-save-hooks dissoc is done, future hooks silently leak into child saves and trigger parent bookkeeping")
+        (is (nil? (::sc/pre-save-hooks child-env))
+            "pattern-based sweep must cover pre-save-hooks and any other ::sc/*-hooks key")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AL (P1, post-2.0.20 review) — cross-worker per-session FIFO
+;; -----------------------------------------------------------------------------
+;;
+;; `event_queue/receive-events!`'s docstring asserts a per-session FIFO
+;; invariant within a batch. Across workers it does NOT hold: worker A can
+;; claim event 1 for session S, worker B polls and sees event 2 for S as
+;; unclaimed, claims it, and processes 2 before A finishes 1. The fix adds a
+;; NOT-EXISTS guard so the claim query excludes sessions whose events are
+;; currently claimed by anyone. This closes the common window (doesn't fully
+;; eliminate the race under simultaneous claim evaluation — users who need
+;; strict FIFO should partition by `:session-id` or run a single worker).
+
+(deftest ^:integration claim-skips-sessions-with-in-flight-claims-test
+  (testing "once a worker has claimed an event for session S, another worker must not claim a later event for the same S until the first event is processed"
+    (let [session-id   :fifo-session
+          other-sid    :other-session
+          worker-a-id  "worker-a"]
+      ;; Seed the queue:
+      ;;  - session-id has an in-flight claim by worker-a on event #1
+      ;;  - session-id ALSO has an unclaimed event #2
+      ;;  - other-sid has an unclaimed event
+      (core/execute-sql! *pool*
+        (str "INSERT INTO statechart_events "
+             "(target_session_id, source_session_id, event_name, event_type, event_data, deliver_at, claimed_at, claimed_by)"
+             " VALUES (?, ?, ?, ?, ?, now(), now(), ?)")
+        [(core/session-id->str session-id) (core/session-id->str session-id)
+         (pr-str :e1-in-flight) (pr-str :external) (core/freeze {}) worker-a-id])
+      (core/execute-sql! *pool*
+        (str "INSERT INTO statechart_events "
+             "(target_session_id, source_session_id, event_name, event_type, event_data, deliver_at)"
+             " VALUES (?, ?, ?, ?, ?, now())")
+        [(core/session-id->str session-id) (core/session-id->str session-id)
+         (pr-str :e2-same-session) (pr-str :external) (core/freeze {})])
+      (core/execute-sql! *pool*
+        (str "INSERT INTO statechart_events "
+             "(target_session_id, source_session_id, event_name, event_type, event_data, deliver_at)"
+             " VALUES (?, ?, ?, ?, ?, now())")
+        [(core/session-id->str other-sid) (core/session-id->str other-sid)
+         (pr-str :other) (pr-str :external) (core/freeze {})])
+
+      (let [q          (pg-eq/new-queue *pool* "worker-b")
+            received   (atom [])
+            handler    (fn [_env event] (swap! received conj (:name event)) :ok)]
+        (sp/receive-events! q {} handler)
+        (let [names (set @received)]
+          (is (not (contains? names :e2-same-session))
+              "worker-b must NOT claim e2 while worker-a has e1 in flight — cross-worker per-session FIFO is broken without this guard")
+          (is (contains? names :other)
+              "worker-b still makes progress on events for other sessions (no global lock)"))))))
+

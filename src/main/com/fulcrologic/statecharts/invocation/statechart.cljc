@@ -14,6 +14,31 @@
     [promesa.core :as p]
     [taoensso.timbre :as log]))
 
+(defn- parent-hook-key?
+  "Any `::sc/` key whose name ends with `-hooks` OR whose name is the
+   event queue's save-attempted? marker is parent-session bookkeeping
+   that must not leak into a child env. Pattern-based so a future hook
+   (e.g. `::sc/on-delete-hooks`, `::sc/pre-save-hooks`) is stripped
+   automatically without an explicit denylist update."
+  [k]
+  (and (keyword? k)
+       (= (namespace k) (namespace ::sc/placeholder))
+       (let [n (name k)]
+         (or (str/ends-with? n "-hooks")
+             (= n "save-attempted?")))))
+
+(defn strip-parent-hooks
+  "Remove every `::sc/*-hooks` key (and the event queue's
+   `::sc/save-attempted?` signal) from `env`. The child save must not
+   trigger parent-session bookkeeping."
+  [env]
+  (reduce-kv (fn [acc k v]
+               (if (parent-hook-key? k)
+                 acc
+                 (assoc acc k v)))
+             {}
+             env))
+
 (defn- resolve-child-session-id
   "Choose the child session-id for an invocation.
 
@@ -76,18 +101,22 @@
                                      :data              {:message "Could not invoke child chart. Not registered."
                                                          :target  src}})
           false)
-        ;; Strip any parent-event ACK hooks from env before starting the
-        ;; child. The JDBC event queue installs `::sc/on-save-hooks` so the
-        ;; parent event is ACKed atomically with the parent WM save — but
-        ;; the child's first save uses this same env, which would fire the
+        ;; Strip ALL parent-event side-effect hooks from env before
+        ;; starting the child. The JDBC event queue installs
+        ;; `::sc/on-save-hooks` / `::sc/save-attempted?` so the parent
+        ;; event is ACKed atomically with the parent WM save — but the
+        ;; child's first save uses this same env, which would fire the
         ;; parent's hook prematurely and mark the parent event processed
-        ;; before the parent itself has saved. A later parent save failure
-        ;; (e.g. optimistic-lock conflict) then silently loses the event.
+        ;; before the parent itself has saved. A later parent save
+        ;; failure (e.g. optimistic-lock conflict) then silently loses
+        ;; the event.
         ;;
-        ;; Any future env-carried side-effect hook (e.g. `::sc/on-delete-hooks`,
-        ;; `::sc/pre-save-hooks`) MUST be added to this dissoc for the same
-        ;; reason — a child save should never trigger parent-session bookkeeping.
-        (let [child-env (dissoc env ::sc/on-save-hooks)
+        ;; Pattern-based sweep (not an explicit denylist): any `::sc/`
+        ;; key whose name ends with `-hooks` OR whose name is
+        ;; `save-attempted?` is parent-session bookkeeping. Adding a new
+        ;; hook to the event queue does NOT require remembering to
+        ;; update this dissoc — the sweep catches it automatically.
+        (let [child-env (strip-parent-hooks env)
               result    (sp/start! processor child-env src {::sc/invocation-data         (or params {})
                                                              ::sc/session-id              child-session-id
                                                              ::sc/parent-session-id       source-session-id
@@ -95,8 +124,16 @@
               save!     (fn [wmem]
                           (sp/save-working-memory! working-memory-store child-env child-session-id wmem)
                           true)]
+          ;; Block until the child save commits, whether sync or async.
+          ;; Returning a raw Promise<true> to the SCXML processor lets
+          ;; the caller's subsequent parent save commit — and therefore
+          ;; ACK the parent event — before the child has been persisted.
+          ;; If the async save then rejects, the parent event is already
+          ;; ACKed, the child was never written, and the next poll
+          ;; won't retry. `@(p/then ...)` waits for the chained save
+          ;; before `start-invocation!` returns `true`/`false`.
           (if (p/promise? result)
-            (p/then result save!)
+            @(p/then result save!)
             (save! result))))))
   (stop-invocation! [this {::sc/keys [event-queue processor working-memory-store] :as env} {:keys [invokeid explicit-id?] :as data}]
     (log/debug "Stop invocation" invokeid)

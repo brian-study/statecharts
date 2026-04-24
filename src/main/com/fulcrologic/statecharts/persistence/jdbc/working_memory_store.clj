@@ -33,6 +33,24 @@
 ;; Internal Helpers
 ;; -----------------------------------------------------------------------------
 
+(defn- read-statechart-src
+  "Decode the stored `statechart_src` column back to its original shape.
+
+   Written via `pr-str` (see `upsert-session!` below), so a keyword like
+   `::my-chart` round-trips as a qualified keyword, a UUID as a `#uuid`
+   tagged literal, etc. Callers must tolerate a string fallback when the
+   row on disk is malformed — a corrupted or partially-written row
+   shouldn't wedge the entire session. The fallback preserves the raw
+   string so callers can surface the corruption rather than silently
+   dropping it."
+  [s]
+  (try
+    (edn/read-string s)
+    (catch Exception e
+      (log/error e "Malformed statechart_src in session row — falling back to raw string"
+                 {:raw s})
+      s)))
+
 (defn- fetch-session
   "Fetch a session by ID, returning working memory with version metadata."
   [ds session-id]
@@ -40,7 +58,7 @@
                                     {:select [:working-memory :version :statechart-src]
                                      :from [:statechart-sessions]
                                      :where [:= :session-id (core/session-id->str session-id)]})]
-    (let [src (edn/read-string (:statechart-src row))]
+    (let [src (read-statechart-src (:statechart-src row))]
       (-> (:working-memory row)
           core/thaw
           (assoc ::sc/statechart-src src)
@@ -109,14 +127,19 @@
       (write! ds))))
 
 (defn- delete-session!
-  "Delete a session by ID and cancel any durable jobs it owns.
+  "Delete a session by ID, cancel any durable jobs it owns, and purge
+   pending events targeted at it.
 
    Cancellation writes a terminal event per job so the reconciler can
-   dispatch `error.invoke.<invokeid>` for observers. Both happen inside
-   one transaction so either both commit or neither does — if a
-   mid-delete failure leaves active jobs running for a deleted session,
-   workers would keep executing side effects for a session that no
-   longer exists and later emit terminal events pointed at nothing.
+   dispatch `error.invoke.<invokeid>` for observers. The event purge
+   removes queued rows whose `target_session_id` points at the deleted
+   session (both immediate and delayed / already-claimed rows) — without
+   it, workers keep claiming zombie events against a missing WM, waste
+   cycles, and pollute logs until the fallback ACK path eventually clears
+   them. All three operations share one transaction so either everything
+   commits or nothing does; a mid-delete failure must not leave jobs
+   cancelled but the session row intact, and must not leave queued events
+   pointing at a session that's about to be deleted.
 
    Calls `job-store/cancel-by-session-in-tx!` directly (NOT the
    tx-opening `cancel-by-session!` variant) because nested
@@ -127,6 +150,11 @@
   [ds session-id]
   (core/with-tx [tx ds]
     (job-store/cancel-by-session-in-tx! tx session-id)
+    (core/execute! tx
+                   {:delete-from :statechart-events
+                    :where [:and
+                            [:= :target-session-id (core/session-id->str session-id)]
+                            [:is :processed-at nil]]})
     (let [result (core/execute! tx
                                 {:delete-from :statechart-sessions
                                  :where [:= :session-id (core/session-id->str session-id)]})]
@@ -147,6 +175,15 @@
   (save-working-memory! [_ env session-id wmem]
     ;; `::sc/on-save-hooks` in env lets callers (e.g. the JDBC event queue)
     ;; participate in the save's transaction so ACK-on-save is atomic.
+    ;;
+    ;; `::sc/save-attempted?` is an atom the event queue installs to
+    ;; distinguish "handler never tried to save" (fallback ACK is safe —
+    ;; session gone / terminated) from "handler tried to save but the
+    ;; tx rolled back" (fallback ACK is a bug — would silently lose the
+    ;; event). Flipped BEFORE the upsert runs so a rollback still counts
+    ;; as "attempted".
+    (when-let [a (::sc/save-attempted? env)]
+      (reset! a true))
     (upsert-session! datasource session-id wmem (::sc/on-save-hooks env)))
 
   (delete-working-memory! [_ _env session-id]

@@ -43,7 +43,13 @@
 (def ^:private events-indexes-ddl
   ["CREATE INDEX IF NOT EXISTS idx_events_target_deliver ON statechart_events(target_session_id, deliver_at) WHERE processed_at IS NULL"
    "CREATE INDEX IF NOT EXISTS idx_events_cancel ON statechart_events(source_session_id, send_id, deliver_at) WHERE processed_at IS NULL"
-   "CREATE INDEX IF NOT EXISTS idx_events_claimed ON statechart_events(claimed_at) WHERE claimed_at IS NOT NULL AND processed_at IS NULL"])
+   "CREATE INDEX IF NOT EXISTS idx_events_claimed ON statechart_events(claimed_at) WHERE claimed_at IS NOT NULL AND processed_at IS NULL"
+   ;; Supports the unfiltered `claim-events!` path (no :session-id option).
+   ;; `idx_events_target_deliver` leads with `target_session_id`, so a
+   ;; worker polling without a session filter has to scan it; a partial
+   ;; index on `(deliver_at, id)` over unclaimed pending rows lets the
+   ;; order-by run as an index scan.
+   "CREATE INDEX IF NOT EXISTS idx_events_unclaimed_deliver ON statechart_events(deliver_at, id) WHERE processed_at IS NULL AND claimed_at IS NULL"])
 
 (def ^:private jobs-ddl
   "CREATE TABLE IF NOT EXISTS statechart_jobs (

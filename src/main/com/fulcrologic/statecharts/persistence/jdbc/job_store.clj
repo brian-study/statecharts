@@ -155,19 +155,22 @@
    Uses SELECT FOR UPDATE SKIP LOCKED to prevent concurrent claims.
    Sets status='running', increments attempt, sets lease.
 
+   `lease_expires_at` is computed server-side via `now() + interval`
+   rather than app-side so application clock skew against the DB server
+   cannot stretch or compress the lease window.
+
    Returns claimed job rows with thawed payload."
   [ds {:keys [owner-id lease-duration-seconds limit]
        :or {lease-duration-seconds 60 limit 5}}]
   (core/with-tx [tx ds]
     (let [limit (long limit) ;; ensure numeric
-          now (OffsetDateTime/now)
-          lease-until (.plus now (Duration/ofSeconds lease-duration-seconds))
+          lease-secs (long lease-duration-seconds) ;; numeric — prevent SQL injection
           rows (core/execute-sql! tx
                  (str "UPDATE statechart_jobs"
                       " SET status = 'running',"
                       "     attempt = attempt + 1,"
                       "     lease_owner = ?,"
-                      "     lease_expires_at = ?,"
+                      "     lease_expires_at = now() + interval '" lease-secs " seconds',"
                       "     updated_at = now()"
                       " WHERE id IN ("
                       "   SELECT id FROM statechart_jobs"
@@ -178,7 +181,7 @@
                       "   FOR UPDATE SKIP LOCKED"
                       " )"
                       " RETURNING *")
-                 [owner-id lease-until])]
+                 [owner-id])]
       (->> rows
            ;; UPDATE ... RETURNING does not guarantee row order in all plans.
            ;; Re-apply deterministic ordering for predictable claims/tests.
@@ -188,17 +191,25 @@
 (defn heartbeat!
   "Extend the lease for a running job owned by this worker.
 
+   `lease_expires_at` is computed server-side (`now() + interval`) so
+   application clock skew against the DB server cannot extend the
+   lease past its intended deadline — a skew of +5s on the worker
+   would otherwise buy it 5s of extra ownership it shouldn't have.
+   `lease-duration-seconds` = 0 (or negative) yields a lease that has
+   already expired server-side, which is the intended 'retire' path.
+
    Returns true if lease was extended (we still own it).
    Returns false if lease was taken over by another worker (I8) or job is
    no longer running. On false, the worker must abandon execution immediately."
   [ds job-id owner-id lease-duration-seconds]
-  (let [lease-until (.plus (OffsetDateTime/now) (Duration/ofSeconds lease-duration-seconds))
+  (let [lease-secs (long lease-duration-seconds) ;; numeric — prevent SQL injection
         result (core/execute-sql! ds
                  (str "UPDATE statechart_jobs"
-                      " SET lease_expires_at = ?, updated_at = now()"
+                      " SET lease_expires_at = now() + interval '" lease-secs " seconds',"
+                      "     updated_at = now()"
                       " WHERE id = ? AND lease_owner = ? AND status = 'running'"
                       " RETURNING id")
-                 [lease-until job-id owner-id])]
+                 [job-id owner-id])]
     (pos? (core/affected-row-count result))))
 
 (defn complete!
@@ -480,12 +491,11 @@
 
 (defn release-terminal-dispatch-claim!
   "Reverse a `claim-terminal-dispatch!` after a failed send so the next
-   reconciliation pass retries. Sets `terminal_event_dispatched_at` back
-   to `nil` unconditionally on `id`; the caller owns the claim by
-   construction (they just made it and the row can't have been
-   re-claimed while they held it — `terminal_event_dispatched_at` was
-   set to `now()` and no one else can claim until this column is
-   cleared).
+   reconciliation pass retries. Guarded so the UPDATE only hits rows
+   whose `terminal_event_dispatched_at` is actually set — a stray
+   release call against an unclaimed row (double-release, wrong call
+   path) is a 0-row no-op rather than a silent rewrite that could
+   shadow the claim state from other callers.
 
    Intended usage:
 
@@ -500,7 +510,9 @@
     {:update :statechart-jobs
      :set {:terminal-event-dispatched-at nil
            :updated-at                   [:now]}
-     :where [:= :id job-id]}))
+     :where [:and
+             [:= :id job-id]
+             [:is-not :terminal-event-dispatched-at nil]]}))
 
 (defn store-partial-result!
   "Store intermediate result for idempotent retry (I9).

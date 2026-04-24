@@ -334,11 +334,7 @@
   (cond
     (nil? result) 0
     (number? result) result
-    (map? result) (long (or (:next.jdbc/update-count result)
-                            (:updated result)
-                            (:deleted result)
-                            (:inserted result)
-                            0))
+    (map? result) (long (or (:next.jdbc/update-count result) 0))
     (sequential? result)
     (let [n (count result)]
       (if (and (= 1 n)

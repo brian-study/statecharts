@@ -261,12 +261,15 @@
         (core/affected-row-count nil) => 0
         (core/affected-row-count 3) => 3))
 
-    (behavior "handles summary maps from mutation queries"
+    (behavior "handles next.jdbc update-count maps from mutation queries"
       (assertions
-        (core/affected-row-count {:updated 2}) => 2
-        (core/affected-row-count {:deleted 5}) => 5
-        (core/affected-row-count {:inserted 1}) => 1
-        (core/affected-row-count {:next.jdbc/update-count 4}) => 4))
+        ;; next.jdbc returns `{:next.jdbc/update-count N}` for mutations
+        ;; without RETURNING. Legacy pg2-era keys (`:updated`/`:deleted`/
+        ;; `:inserted`) are no longer produced by next.jdbc and were
+        ;; removed from affected-row-count; a map without the
+        ;; next.jdbc key returns 0.
+        (core/affected-row-count {:next.jdbc/update-count 4}) => 4
+        (core/affected-row-count {:some-other-key 42}) => 0))
 
     (behavior "handles row sequences"
       (assertions

@@ -1,3 +1,142 @@
+2.0.21
+------
+
+Seven correctness / robustness findings from the post-2.0.20 review.
+
+* **[P1]** Fallback event-ACK no longer fires when the handler's
+  save-working-memory! call rolled back. Since 2.0.16 the JDBC event
+  queue installs `::sc/on-save-hooks` so the event ACK commits atomically
+  with the WM save; after the handler returns it ALSO ran a separate
+  unconditional `mark-processed!` as a fallback ACK for handlers that
+  never called save (terminated / missing session). That fallback had
+  no visibility into whether a save was attempted: a handler that
+  called `save-working-memory!`, had the tx roll back (OCC conflict,
+  constraint violation, connection loss), caught the exception, and
+  returned normally would still be ACKed by the fallback — silently
+  losing the event. The new contract threads an `::sc/save-attempted?`
+  atom through env that `save-working-memory!` flips before opening its
+  tx; the fallback fires only when the atom is still `false`. Both
+  shapes are pinned: `receive-events-does-not-silently-ack-when-save-
+  rolls-back-test` (new) closes the hole; `receive-events-fallback-ack-
+  still-fires-when-no-save-attempted-test` protects the
+  terminated-session path the fallback exists for.
+
+* **[P1]** `StatechartInvocationProcessor/start-invocation!` now blocks
+  on the async child save instead of leaking an unresolved
+  `Promise<true>` to the caller. Previously `(p/then result save!)` on
+  the async path returned a pending promise that resolved when the
+  child's WM save committed — but the SCXML processor calling
+  `start-invocation!` would proceed to save the parent's own WM (and
+  therefore ACK the parent event via the on-save hook) before the
+  chained save resolved. If the child save then rejected (DB error,
+  OCC), the parent event was already ACKed, the child was never
+  persisted, and the next poll couldn't retry. `start-invocation!`
+  now `@`-derefs the chained promise so it always returns a boolean
+  and the child is durable by the time control returns to the
+  processor. Regression:
+  `statechart-invocation-async-child-save-completes-before-return-test`.
+
+* **[P1]** `release-terminal-dispatch-claim!` is guarded against
+  accidental clears of unclaimed rows. The UPDATE previously matched
+  `WHERE id = ?` with no state guard; the docstring rationalised this
+  as "the caller owns the claim by construction," but a stray
+  release (double-call from racing catch blocks, or wrong job-id) would
+  silently rewrite `terminal_event_dispatched_at` to nil on an
+  unrelated row. New WHERE clause adds `AND terminal_event_dispatched_at
+  IS NOT NULL`, making the release a 0-row no-op on unclaimed rows
+  and idempotent for double-release. Regression:
+  `release-terminal-dispatch-claim-only-affects-claimed-rows-test`.
+
+* **[P1]** `JdbcWorkingMemoryStore/delete-working-memory!` now purges
+  queued events for the deleted session in the same tx as the session
+  DELETE and the job cancellation. Previously pending rows in
+  `statechart_events` with `target_session_id = <deleted-session>`
+  lingered until a worker claimed them, ran the handler against a
+  missing WM, and eventually cleared them via the fallback ACK — waste
+  of worker cycles and a contradiction of the atomic-cleanup promise
+  in the docstring. Three writes now commit atomically:
+  `cancel-by-session-in-tx!`, `DELETE FROM statechart_events WHERE
+  target_session_id = ? AND processed_at IS NULL`, and the session
+  row DELETE. Regression:
+  `delete-working-memory-purges-pending-events-test`.
+
+* **[P1 / best-effort]** `event_queue/claim-events!` unfiltered path
+  now excludes sessions that already have an in-flight claim by any
+  worker, via a `NOT EXISTS` subquery. The function's docstring
+  claimed per-session FIFO within a batch; cross-worker FIFO was
+  silently broken — worker A claiming event 1 for session S did not
+  prevent worker B from claiming event 2 for S in the same instant.
+  The guard closes the common window. It is **not a global lock**:
+  two workers racing on the exact same instant can both see the
+  session as un-claimed and both win the `FOR UPDATE SKIP LOCKED`
+  lottery. Callers who need strict ordering should partition workers
+  by `:session-id` (already supported) or run a single worker;
+  docstrings updated to say so explicitly. The session-filtered claim
+  path omits the guard so a session-scoped worker can continue to
+  make progress on its own session. Regression:
+  `claim-skips-sessions-with-in-flight-claims-test`.
+
+* **[P2]** `StatechartInvocationProcessor/start-invocation!`
+  hook-stripping is now pattern-based, not a single-key denylist.
+  Previously only `::sc/on-save-hooks` was dissoced and a code comment
+  warned future maintainers to add each new hook keyword. The new
+  `strip-parent-hooks` sweeps every `::sc/*-hooks` key (plus the event
+  queue's `::sc/save-attempted?` signal) in one pass, so a future
+  hook is automatically excluded from child env without a manual
+  update. Regression:
+  `statechart-invocation-strips-all-sc-hooks-keys-from-child-env-test`
+  covers the hypothetical `::sc/on-delete-hooks` and `::sc/pre-save-
+  hooks` keys.
+
+* **[P2]** `working_memory_store/fetch-session` no longer crashes on a
+  malformed `statechart_src` row. Previously `edn/read-string` was
+  called without try/catch, so a corrupted or partially-written row
+  threw and that session became permanently unreadable. The decode
+  now falls back to the raw string with an error log so callers can
+  surface the corruption rather than silently wedge. Regression:
+  `fetch-session-survives-corrupted-statechart-src-test`.
+
+Also in this release:
+
+* **Partial index** `idx_events_unclaimed_deliver ON statechart_events
+  (deliver_at, id) WHERE processed_at IS NULL AND claimed_at IS NULL`
+  supports the unfiltered `claim-events!` path directly, replacing the
+  previous index-backward scan on `idx_events_target_deliver`.
+
+* **Lease expiry is server-side.** `claim-jobs!` and `heartbeat!` now
+  compute `lease_expires_at = now() + interval` in SQL rather than
+  application-side (`OffsetDateTime/now + Duration/ofSeconds`). App
+  clock skew against the DB server no longer stretches or compresses
+  the lease window.
+
+* **`cancel-events!`** logs at DEBUG when its DELETE affected zero
+  rows — SCXML permits the race between "cancel a delayed event" and
+  "event delivery," but the silence was misleading. The log lets
+  operators correlate a "cancelled" event with its subsequent
+  delivery.
+
+* **`pg-env`'s `:node-id`** docstring now explicitly requires global
+  uniqueness across worker processes and recommends a
+  `<hostname>-<pid>-<random-uuid>` shape for operator-supplied values.
+
+* **`affected-row-count`** no longer checks the legacy pg2-era
+  `:updated` / `:deleted` / `:inserted` keys. `next.jdbc` produces
+  only `:next.jdbc/update-count`, so the branches were dead and
+  misleading anyone reading the function for "what shapes might I
+  receive."
+
+* **Property-based round-trip tests** over `[:or uuid? number?
+   keyword? string?]` cover all three encode/decode pairs
+  (session-id, event-queue invoke-id, durable-job invoke-id) with 200
+  examples per property. The CHANGELOG since 2.0.13 kept patching
+  newly-discovered `::sc/id` subtypes one case at a time; a generator
+  now fails before the subtype slips through.
+
+* **Shared test fixtures** extracted into
+  `persistence.jdbc.fixtures` (test-config, with-pool, with-clean-
+  tables). Previously the same block was copy-pasted across four
+  files; a PG-config change needed four edits.
+
 2.0.20
 ------
 
