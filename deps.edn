@@ -21,6 +21,9 @@
 
            :guardrails-stubs {:override-deps {com.fulcrologic/guardrails {:mvn/version "1.2-stubs-SNAPSHOT"}}}
 
+           :build            {:deps       {io.github.clojure/tools.build {:mvn/version "0.10.5"}}
+                              :ns-default build}
+
            :nrepl            {:extra-paths ["src/main" "src/test"]
                               :extra-deps  {nrepl/nrepl {:mvn/version "1.5.1"}}
                               ;; this allows nrepl to interrupt runaway repl evals
