@@ -81,9 +81,20 @@
         "legacy bare non-UUID non-keyword strings still decode as strings"
         (core/str->session-id "my-session") => "my-session"
         "handles empty string (legacy bare)"
-        (core/str->session-id "") => ""
-        "handles strings that look like numbers but aren't UUIDs (legacy bare)"
-        (core/str->session-id "12345") => "12345")))
+        (core/str->session-id "") => ""))
+
+    (behavior "handles numeric strings (SCXML numeric session-ids)"
+      (assertions
+        "bare integer → long"
+        (core/str->session-id "42") => 42
+        "bare long"
+        (core/str->session-id "9999999999999") => 9999999999999
+        "bare negative integer"
+        (core/str->session-id "-1") => -1
+        "bare double → double"
+        (core/str->session-id "3.14") => 3.14
+        "strings that need to stay as strings must be written via pr-str (quoted)"
+        (core/str->session-id "\"42\"") => "42")))
 
   (component "session-id roundtrip"
     (behavior "preserves keyword identity"
@@ -100,7 +111,20 @@
 
     (behavior "preserves string identity"
       (assertions
-        (-> "plain-string" core/session-id->str core/str->session-id) => "plain-string"))))
+        (-> "plain-string" core/session-id->str core/str->session-id) => "plain-string"
+        "string that looks like a number stays a string via pr-str marker"
+        (-> "42" core/session-id->str core/str->session-id) => "42"))
+
+    (behavior "preserves numeric identity"
+      (assertions
+        "integer"
+        (-> 42 core/session-id->str core/str->session-id) => 42
+        "long"
+        (-> (long 9999999999999) core/session-id->str core/str->session-id) => 9999999999999
+        "double"
+        (-> 3.14 core/session-id->str core/str->session-id) => 3.14
+        "negative number"
+        (-> -1 core/session-id->str core/str->session-id) => -1))))
 
 (specification "Nippy Serialization (freeze/thaw)"
   (component "freeze"

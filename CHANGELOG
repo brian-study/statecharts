@@ -1,3 +1,37 @@
+2.0.13
+------
+
+Two correctness findings from the post-2.0.12 review.
+
+* **[P1]** JDBC session-id serialization preserves numeric
+  session-ids. SCXML `::sc/id` permits numbers; `session-id->str`
+  already wrote them as bare strings (`(str n)`), but
+  `str->session-id` had no branch for them — it returned a bare string
+  like `"42"`. Subsequent saves then went through the string `pr-str`
+  path and wrote `"\"42\""`, so the row written under `"42"` never got
+  read again and event delivery silently stopped. `str->session-id`
+  now tries `parse-long` / `parse-double` before `parse-uuid` in the
+  bare-string branch. Strings must be written via `pr-str` (quoted)
+  to survive round-tripping, which has been the stored shape since
+  2.0.11. Regression: `numeric-session-id-round-trip-test` plus
+  updates to `core-spec` covering numeric round-trip and the
+  legacy-bare-digits → number tradeoff. Migration note: legacy
+  pre-2.0.11 rows that stored a *string* session-id whose contents
+  happened to be digit-only (e.g. `"12345"`) will now decode as the
+  number `12345`. Post-2.0.11 rows are unaffected because strings are
+  stored with the `pr-str` marker.
+
+* **[P2]** `integration.fulcro/resolve-invocation-session-id` prefers
+  the fork's scoped child session (`<parent-session-id>.<invokeid>`)
+  over a top-level session whose id collides with the raw
+  `stored-id`. Previously the `cond` checked `stored-id` first, so a
+  pre-existing top-level session with the same name as the invokeid
+  would shadow the real scoped child — cross-chart routing and
+  invocation event-forwarding would send events to the wrong session.
+  Now the scoped child wins whenever it exists in `state-map`.
+  Regression: `resolve-invocation-session-id` specification in
+  `fulcro-api-spec` with an explicit collision case.
+
 2.0.12
 ------
 

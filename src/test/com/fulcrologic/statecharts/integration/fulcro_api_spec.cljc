@@ -393,6 +393,56 @@
           "lookup works with app"
           (scf/lookup-statechart app ::component-chart) => chart2)))))
 
+(specification {:covers {`scf/resolve-invocation-session-id "PLACEHOLDER"}} "resolve-invocation-session-id"
+  (behavior "returns nil when stored-id is nil"
+    (assertions
+      "nil stored-id"
+      (scf/resolve-invocation-session-id {} "parent" nil) => nil))
+
+  (behavior "returns scoped child when only scoped child exists in state"
+    (let [parent-id "parent-sess"
+          stored-id "invoke-key"
+          scoped-id (str parent-id "." stored-id)
+          state-map {::sc/session-id {scoped-id {:dummy :child}}}]
+      (assertions
+        "scoped child session wins"
+        (scf/resolve-invocation-session-id state-map parent-id stored-id) => scoped-id)))
+
+  (behavior "returns stored-id when only stored-id session exists in state"
+    (let [parent-id "parent-sess"
+          stored-id "top-level-sess"
+          state-map {::sc/session-id {stored-id {:dummy :top}}}]
+      (assertions
+        "stored-id session is used"
+        (scf/resolve-invocation-session-id state-map parent-id stored-id) => stored-id)))
+
+  (behavior "prefers the scoped child session when both collide"
+    ;; Regression: previously the first cond branch checked stored-id first, so
+    ;; a pre-existing top-level session whose id happened to match the raw
+    ;; invokeid would be selected instead of the real scoped child
+    ;; `<parent-session-id>.<invokeid>` that the fork actually started.
+    (let [parent-id "parent-sess"
+          stored-id "colliding-id"
+          scoped-id (str parent-id "." stored-id)
+          state-map {::sc/session-id {stored-id {:dummy :unrelated-top-level}
+                                      scoped-id {:dummy :real-child}}}]
+      (assertions
+        "scoped child wins over a colliding top-level session with same id as the invokeid"
+        (scf/resolve-invocation-session-id state-map parent-id stored-id) => scoped-id)))
+
+  (behavior "falls back to scoped-id when neither session is in state but parent is known"
+    (let [parent-id "parent-sess"
+          stored-id "invoke-key"
+          scoped-id (str parent-id "." stored-id)]
+      (assertions
+        "scoped child is constructed from parent + stored"
+        (scf/resolve-invocation-session-id {} parent-id stored-id) => scoped-id)))
+
+  (behavior "falls back to stored-id when no parent provided"
+    (assertions
+      "no parent → cannot scope, keep raw stored-id"
+      (scf/resolve-invocation-session-id {} nil "some-id") => "some-id")))
+
 (specification {:covers {`scf/install-fulcro-statecharts! "PLACEHOLDER"}} "install-fulcro-statecharts!"
   (behavior "installs statechart system on app"
     (let [app (app/fulcro-app)]

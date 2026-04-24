@@ -50,6 +50,7 @@
    Shape-inspecting inverse of `session-id->str`:
    - leading `\"` → EDN read (quoted string form)
    - leading `:` → EDN read (keyword)
+   - parses as long/double → number (SCXML `::sc/id` allows numbers)
    - looks like a UUID → UUID
    - otherwise → bare string (legacy rows pre-2.0.11 that stored strings
      unquoted)."
@@ -58,7 +59,7 @@
     (cond
       (.startsWith ^String s "\"") (try (edn/read-string s) (catch Exception _ s))
       (.startsWith ^String s ":")  (try (edn/read-string s) (catch Exception _ s))
-      :else                        (or (parse-uuid s) s))))
+      :else                        (or (parse-long s) (parse-double s) (parse-uuid s) s))))
 
 ;; -----------------------------------------------------------------------------
 ;; Binary Serialization (nippy)

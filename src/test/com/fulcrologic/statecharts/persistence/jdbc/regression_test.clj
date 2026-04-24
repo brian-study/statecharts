@@ -990,3 +990,29 @@
           "a nil session-state result means 'not ready'; dispatch must be skipped")
       (is (empty? @sent)
           "no event should be sent when the parent is absent/stale"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #W (P1) — numeric session-id types must round-trip through JDBC
+;; -----------------------------------------------------------------------------
+;;
+;; `::sc/id` allows numbers. Pre-fix: (session-id->str 42) = "42" bare;
+;; str->session-id "42" = "42" STRING (not Long). Worker hydrates event with
+;; :target "42", subsequent save-working-memory! then serializes that string
+;; to "\"42\"" (quoted) and misses the row stored under "42". Event delivery
+;; silently stops reaching the session.
+
+(deftest numeric-session-id-round-trip-test
+  (testing "numeric session-ids round-trip as numbers through session-id->str / str->session-id"
+    (doseq [n [42 -1 0 (long 9999999999999) 3.14 -2.5]]
+      (let [stored    (core/session-id->str n)
+            read-back (core/str->session-id stored)]
+        (is (= n read-back)
+            (str "numeric session-id " (pr-str n)
+                 " must round-trip as a number; stored=" (pr-str stored)
+                 " read-back=" (pr-str read-back))))))
+  (testing "strings that look like numbers stay strings (disambiguated via pr-str marker)"
+    (doseq [s ["42" "-1" "3.14"]]
+      (let [stored    (core/session-id->str s)
+            read-back (core/str->session-id stored)]
+        (is (= s read-back)
+            (str "string session-id " (pr-str s) " must not be coerced to a number"))))))

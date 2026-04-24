@@ -67,16 +67,18 @@
   "Resolve a stored SCXML invokeid to the actual child session ID.
 
    `stored-id` is typically the raw value written to `:idlocation`. If Fulcro
-   `state-map` is available, this prefers whichever session actually exists in
-   state. If no matching session is present, it falls back to the fork's scoped
-   child-session convention: `<parent-session-id>.<invokeid>`."
+   `state-map` is available, this prefers the fork's scoped child-session
+   convention (`<parent-session-id>.<invokeid>`) whenever such a session exists,
+   so a top-level session whose id happens to collide with the invokeid never
+   shadows the real child. Falls back to `stored-id` only when no scoped child
+   is present but a top-level session with `stored-id` is."
   [state-map parent-session-id stored-id]
   (when stored-id
     (let [scoped-id (when parent-session-id
                       (str parent-session-id "." (str stored-id)))]
       (cond
-        (and state-map (get-in state-map (statechart-session-ident stored-id))) stored-id
         (and state-map scoped-id (get-in state-map (statechart-session-ident scoped-id))) scoped-id
+        (and state-map (get-in state-map (statechart-session-ident stored-id))) stored-id
         scoped-id scoped-id
         :else stored-id))))
 
