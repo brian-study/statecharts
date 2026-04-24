@@ -325,47 +325,69 @@
                   iid-str])]
     (core/affected-row-count result)))
 
+(defn cancel-by-session-in-tx!
+  "Internal helper: SELECT pending/running jobs for `session-id` and
+   issue a guarded UPDATE per row to cancel them, writing a terminal
+   event per job so the reconciler dispatches
+   `error.invoke.<invokeid>` to observers.
+
+   Runs against an already-open `Connection` (`tx`). Use this when you
+   need cancellation to participate in a caller's existing transaction
+   — `delete-session!` in `working_memory_store.clj` is the load-bearing
+   example: session delete + job cancel must be atomic, but the
+   top-level `with-tx` lives in `delete-session!`.
+
+   Nested `core/with-tx` is forbidden in this codebase; the `-in-tx`
+   variant is how helpers cooperate with a caller's open transaction.
+
+   Since invokeid storage is typed (keyword/UUID/number/string via
+   `invokeid->str` / `str->invokeid`), we can't reconstruct the terminal
+   event name server-side via SQL concat — we fetch each row,
+   reconstruct the original invokeid in Clojure, and issue a guarded
+   UPDATE per row."
+  [tx session-id]
+  (let [sid-str        (core/session-id->str session-id)
+        cancelled-data @cancelled-event-data
+        rows           (core/execute-sql! tx
+                         (str "SELECT id, invokeid FROM statechart_jobs"
+                              " WHERE session_id = ?"
+                              " AND status IN ('pending', 'running')")
+                         [sid-str])]
+    (reduce
+      (fn [n {:keys [id invokeid]}]
+        (let [orig-invokeid (str->invokeid invokeid)
+              terminal-event-name (terminal-event-name-for orig-invokeid)
+              result (core/execute-sql! tx
+                       (str "UPDATE statechart_jobs"
+                            " SET status = 'cancelled',"
+                            "     lease_owner = NULL,"
+                            "     lease_expires_at = NULL,"
+                            "     terminal_event_name = ?,"
+                            "     terminal_event_data = ?,"
+                            "     updated_at = now()"
+                            " WHERE id = ?"
+                            " AND status IN ('pending', 'running')"
+                            " RETURNING id")
+                       [terminal-event-name cancelled-data id])]
+          (+ n (core/affected-row-count result))))
+      0
+      rows)))
+
 (defn cancel-by-session!
   "Cancel all active jobs for a session (I6).
    Used when session is being deleted or reset.
 
    Writes a terminal event per job so the reconciler dispatches
-   `error.invoke.<invokeid>` to the parent. Since invokeid storage is
-   typed (keyword/UUID/number/string via `invokeid->str`/`str->invokeid`),
-   we can't reconstruct the terminal event name server-side via SQL
-   concat — we fetch each row, reconstruct the original invokeid in
-   Clojure, and issue a guarded UPDATE per row. The SELECT and every
-   UPDATE run inside a single transaction so cancellation is atomic:
-   either every pending/running job in the session is cancelled or
-   none of them are."
+   `error.invoke.<invokeid>` to the parent. Opens its own transaction
+   so cancellation is atomic: either every pending/running job in the
+   session is cancelled or none of them are.
+
+   If you need cancellation to participate in a caller's existing
+   transaction, call `cancel-by-session-in-tx!` directly instead —
+   nested `core/with-tx` is forbidden."
   [ds session-id]
-  (let [sid-str        (core/session-id->str session-id)
-        cancelled-data @cancelled-event-data]
-    (core/with-tx [tx ds]
-      (let [rows (core/execute-sql! tx
-                   (str "SELECT id, invokeid FROM statechart_jobs"
-                        " WHERE session_id = ?"
-                        " AND status IN ('pending', 'running')")
-                   [sid-str])]
-        (reduce
-          (fn [n {:keys [id invokeid]}]
-            (let [orig-invokeid (str->invokeid invokeid)
-                  terminal-event-name (terminal-event-name-for orig-invokeid)
-                  result (core/execute-sql! tx
-                           (str "UPDATE statechart_jobs"
-                                " SET status = 'cancelled',"
-                                "     lease_owner = NULL,"
-                                "     lease_expires_at = NULL,"
-                                "     terminal_event_name = ?,"
-                                "     terminal_event_data = ?,"
-                                "     updated_at = now()"
-                                " WHERE id = ?"
-                                " AND status IN ('pending', 'running')"
-                                " RETURNING id")
-                           [terminal-event-name cancelled-data id])]
-              (+ n (core/affected-row-count result))))
-          0
-          rows)))))
+  (core/with-tx [tx ds]
+    (cancel-by-session-in-tx! tx session-id)))
 
 (defn get-active-job
   "Get the active (pending/running) job for a session+invokeid, or nil."
@@ -428,12 +450,24 @@
    reconcilers and the gap between a worker's `succeed!` / `fail!` and
    its own `mark-terminal-event-dispatched!`.
 
+   **Callers must check session readiness before claiming.** If the
+   parent session is not yet ready to receive the terminal event, the
+   caller should skip the claim entirely and let a subsequent
+   reconciliation pass retry. Claiming then finding the session not
+   ready would permanently lose the event. See
+   `worker/reconcile-undispatched!` for the intended pattern.
+
+   **If `send!` throws after a successful claim**, call
+   `release-terminal-dispatch-claim!` to roll back the claim so the
+   next reconciliation pass retries. Without a release, the event
+   would be silently lost.
+
    Trade-off: a crash between the claim committing and the subsequent
-   `send!` commit now loses the terminal event (previously that same
-   crash produced a duplicate). The loss is auditable — query for rows
-   with `terminal_event_dispatched_at IS NOT NULL` but no matching
-   entry in `statechart_events`. Duplicate dispatch drove divergent
-   parent transitions and was the greater harm."
+   `send!` commit still loses the terminal event (previously that
+   same crash produced a duplicate). The loss is auditable — query
+   for rows with `terminal_event_dispatched_at IS NOT NULL` but no
+   matching entry in `statechart_events`. Duplicate dispatch drove
+   divergent parent transitions and was the greater harm."
   [ds job-id]
   (pos? (core/affected-row-count
           (core/execute! ds
@@ -443,6 +477,30 @@
              :where [:and
                      [:= :id job-id]
                      [:= :terminal-event-dispatched-at nil]]}))))
+
+(defn release-terminal-dispatch-claim!
+  "Reverse a `claim-terminal-dispatch!` after a failed send so the next
+   reconciliation pass retries. Sets `terminal_event_dispatched_at` back
+   to `nil` unconditionally on `id`; the caller owns the claim by
+   construction (they just made it and the row can't have been
+   re-claimed while they held it — `terminal_event_dispatched_at` was
+   set to `now()` and no one else can claim until this column is
+   cleared).
+
+   Intended usage:
+
+       (when (claim-terminal-dispatch! ds job-id)
+         (try
+           (send-terminal-event! …)
+           (catch Exception e
+             (release-terminal-dispatch-claim! ds job-id)
+             (throw e))))"
+  [ds job-id]
+  (core/execute! ds
+    {:update :statechart-jobs
+     :set {:terminal-event-dispatched-at nil
+           :updated-at                   [:now]}
+     :where [:= :id job-id]}))
 
 (defn store-partial-result!
   "Store intermediate result for idempotent retry (I9).

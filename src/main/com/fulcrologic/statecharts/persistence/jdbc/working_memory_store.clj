@@ -116,10 +116,17 @@
    one transaction so either both commit or neither does — if a
    mid-delete failure leaves active jobs running for a deleted session,
    workers would keep executing side effects for a session that no
-   longer exists and later emit terminal events pointed at nothing."
+   longer exists and later emit terminal events pointed at nothing.
+
+   Calls `job-store/cancel-by-session-in-tx!` directly (NOT the
+   tx-opening `cancel-by-session!` variant) because nested
+   `core/with-tx` is forbidden in this codebase — `next.jdbc`'s
+   default `:nested-tx :commit` would cause the inner cancellation's
+   UPDATEs to commit independently, so a failing outer session DELETE
+   would leave jobs cancelled but the session row intact."
   [ds session-id]
   (core/with-tx [tx ds]
-    (job-store/cancel-by-session! tx session-id)
+    (job-store/cancel-by-session-in-tx! tx session-id)
     (let [result (core/execute! tx
                                 {:delete-from :statechart-sessions
                                  :where [:= :session-id (core/session-id->str session-id)]})]

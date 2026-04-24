@@ -359,7 +359,16 @@
        (with-tx [tx ds]
          (do-stuff tx))
 
-   Semantics match `next.jdbc/with-transaction`."
+   Semantics match `next.jdbc/with-transaction`.
+
+   **Do not nest `with-tx` calls.** `next.jdbc/with-transaction`'s nested
+   semantics are treacherous (default `:commit` writes the inner body
+   even if the outer block throws; `:ignore` makes the inner block a
+   no-op but still looks like a transaction to readers; `:savepoint`
+   is untested in this codebase). If a helper needs to run inside a
+   caller's existing transaction, expose it as an `in-tx` variant that
+   takes the open `Connection` directly — see `job-store/cancel-by-session-in-tx!`
+   for the pattern."
   [[sym src] & body]
   `(jdbc/with-transaction [~sym ~src]
      ~@body))

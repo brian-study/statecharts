@@ -1,3 +1,77 @@
+2.0.20
+------
+
+Close the critical regression introduced by 2.0.19's claim-before-dispatch
+rewrite, plus the four follow-up recommendations on 2.0.19.
+
+* **[P1 — fixes 2.0.19 regression]** Terminal-event dispatch checks
+  session readiness BEFORE claiming the dispatch slot. 2.0.19 moved the
+  claim in front of the send to eliminate duplicate dispatch, but the
+  pre-existing `dispatch-terminal-event!` returned `false` without
+  sending whenever `get-session-state-fn` indicated the parent wasn't
+  yet ready (a normal retry condition — parents routinely start
+  observing an invocation only after the child has begun). Under 2.0.19
+  the claim committed anyway in that path, marking the row dispatched
+  even though no event had been enqueued, and the reconciler never
+  picked it up again → terminal event permanently lost, parent stuck.
+  The fix splits `dispatch-terminal-event!` into a pure
+  `session-ready-for-dispatch?` check plus a pure `send-terminal-event!`
+  call, and composes them as `claim-and-send-terminal-event!`:
+
+      (if-not (session-ready-for-dispatch? exec-opts job)     ; no side effects
+        false
+        (if-not (job-store/claim-terminal-dispatch! pool id)  ; atomic claim
+          false
+          (try
+            (send-terminal-event! …)
+            true
+            (catch Exception e
+              (job-store/release-terminal-dispatch-claim! pool id)  ; roll back
+              (throw e)))))
+
+  Not-ready rows stay un-claimed for the next reconciliation pass.
+  Send failures roll back the claim. Duplicate dispatch across
+  concurrent callers remains impossible (claim is atomic). All four
+  call sites (execute-job! success, execute-job! fail,
+  execute-claimed-job! unhandled-type, reconcile-undispatched!) go
+  through the single composite helper. Regressions:
+  `reconcile-not-ready-session-keeps-job-retryable-test`,
+  `worker-terminal-send-includes-invoke-id-test` and
+  `session-ready-for-dispatch-treats-nil-as-not-ready-test`
+  (both renamed from their pre-split names).
+
+* **Nested `core/with-tx` is forbidden in this codebase.** 2.0.19's
+  `delete-session!` wrapped `cancel-by-session!` + the session DELETE
+  in an outer `with-tx`, then let `cancel-by-session!` open its own
+  inner `with-tx`. `next.jdbc/with-transaction`'s default
+  `:nested-tx :commit` commits the inner body's writes regardless of
+  what happens in the outer block — so a failing outer DELETE left
+  every pending job cancelled but the session row intact, which is the
+  exact atomicity property we thought we were ensuring. `:nested-tx
+  :ignore` would have hidden the issue; `:savepoint` is untested in
+  this codebase; neither is appropriate. Fix: `cancel-by-session!` is
+  split into `cancel-by-session-in-tx!` (takes an open Connection, no
+  `with-tx`) and the public `cancel-by-session!` (opens its own tx and
+  calls the `-in-tx` helper). `delete-session!` calls the `-in-tx`
+  variant directly so cancellation participates in its own outer
+  transaction. `core/with-tx`'s docstring now states that nesting is
+  forbidden and points to the `-in-tx` pattern for helpers that need
+  to cooperate with a caller's open transaction. Regression:
+  `delete-working-memory-rolls-back-job-cancellation-on-failure-test`.
+
+* **Async invocation path covered by test.** 2.0.19's hook-stripping
+  fix preserves the `(dissoc env ::sc/on-save-hooks)` in the
+  `p/then` continuation by closure capture, but there was no test
+  exercising a promise-returning `sp/start!`. Added
+  `statechart-invocation-async-path-strips-parent-ack-hooks-test`.
+
+* **Comments pointing out future hazards.** `start-invocation!`'s
+  hook-stripping site now notes that any future env-carried
+  side-effect hook (e.g. `::sc/on-delete-hooks`) must be added to the
+  dissoc. `delete-session!` calls out that it calls
+  `cancel-by-session-in-tx!` rather than `cancel-by-session!`
+  specifically because nested `with-tx` is forbidden.
+
 2.0.19
 ------
 

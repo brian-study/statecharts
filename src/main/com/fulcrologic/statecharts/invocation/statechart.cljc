@@ -83,6 +83,10 @@
         ;; parent's hook prematurely and mark the parent event processed
         ;; before the parent itself has saved. A later parent save failure
         ;; (e.g. optimistic-lock conflict) then silently loses the event.
+        ;;
+        ;; Any future env-carried side-effect hook (e.g. `::sc/on-delete-hooks`,
+        ;; `::sc/pre-save-hooks`) MUST be added to this dissoc for the same
+        ;; reason — a child save should never trigger parent-session bookkeeping.
         (let [child-env (dissoc env ::sc/on-save-hooks)
               result    (sp/start! processor child-env src {::sc/invocation-data         (or params {})
                                                              ::sc/session-id              child-session-id

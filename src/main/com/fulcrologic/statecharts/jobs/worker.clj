@@ -75,57 +75,78 @@
 ;; Terminal Event Dispatch
 ;; -----------------------------------------------------------------------------
 
-(defn- dispatch-terminal-event!
-  "Dispatch a terminal event via the event queue.
-   Verifies the parent session is in the expected state with matching job-id
-   before dispatching (I3, I4).
+(defn- session-ready-for-dispatch?
+  "Pure readiness check (no side effects). Used by callers before
+   `claim-terminal-dispatch!` so that not-ready rows keep their claim
+   slot open for a later reconciliation pass.
 
-   Returns true if dispatched, false if session not ready (will be retried by reconciler)."
-  [event-queue env job {:keys [get-session-state-fn wake-event-loop-fn]}]
+   Returns true if the parent session is ready to receive the terminal
+   event, false otherwise. A nil `get-session-state-fn` means no checker
+   is installed — dispatch unconditionally."
+  [{:keys [get-session-state-fn]} {:keys [id session-id invokeid]}]
+  (if (nil? get-session-state-fn)
+    true
+    (let [check-result (get-session-state-fn session-id invokeid (str id))]
+      (cond
+        ;; nil result = parent gone / stale — treat as not ready.
+        (nil? check-result)
+        (do
+          (log/debug "Session missing for terminal event, skipping dispatch"
+                     {:job-id id :session-id session-id})
+          false)
+
+        (:ready check-result)
+        true
+
+        :else
+        (do
+          (log/debug "Session not ready for terminal event"
+                     {:job-id id :session-id session-id :reason (:reason check-result)})
+          false)))))
+
+(defn- send-terminal-event!
+  "Enqueue the terminal event. Caller must have already verified readiness
+   via `session-ready-for-dispatch?` and claimed the dispatch slot via
+   `job-store/claim-terminal-dispatch!`. Throws on send failure — the
+   caller is responsible for calling
+   `job-store/release-terminal-dispatch-claim!` so the next
+   reconciliation pass retries."
+  [event-queue env job {:keys [wake-event-loop-fn]}]
   (let [{:keys [id session-id invokeid terminal-event-name terminal-event-data]} job
-        event-name (clojure.edn/read-string terminal-event-name)
-        do-send! (fn []
-                   (sp/send! event-queue env
-                     {:event event-name
-                      :target session-id
-                      ;; The InvocationProcessor contract requires terminal
-                      ;; events to carry the originating invoke-id so
-                      ;; handle-external-invocations! can run finalize and
-                      ;; autoforward against the right <invoke> element.
-                      :invoke-id invokeid
-                      :data (or terminal-event-data {})})
-                   (when wake-event-loop-fn (wake-event-loop-fn)))]
-    (cond
-      ;; No checker installed — dispatch unconditionally.
-      (nil? get-session-state-fn)
-      (do
-        (do-send!)
-        (log/info "Terminal event dispatched (no session check)"
-                  {:job-id id :event terminal-event-name :session-id session-id})
-        true)
+        event-name (clojure.edn/read-string terminal-event-name)]
+    (sp/send! event-queue env
+      {:event event-name
+       :target session-id
+       ;; The InvocationProcessor contract requires terminal events to
+       ;; carry the originating invoke-id so handle-external-invocations!
+       ;; can run finalize and autoforward against the right <invoke>.
+       :invoke-id invokeid
+       :data (or terminal-event-data {})})
+    (when wake-event-loop-fn (wake-event-loop-fn))
+    (log/info "Terminal event dispatched"
+              {:job-id id :event terminal-event-name :session-id session-id})))
 
-      :else
-      (let [check-result (get-session-state-fn session-id invokeid (str id))]
-        (cond
-          ;; nil result = parent gone / stale — treat as not ready.
-          (nil? check-result)
-          (do
-            (log/debug "Session missing for terminal event, skipping dispatch"
-                       {:job-id id :session-id session-id})
-            false)
+(defn- claim-and-send-terminal-event!
+  "Full dispatch protocol. Returns true if the terminal event was sent,
+   false if the session isn't ready yet (next reconciliation pass
+   retries) or another caller already claimed the slot.
 
-          (:ready check-result)
-          (do
-            (do-send!)
-            (log/info "Terminal event dispatched"
-                      {:job-id id :event terminal-event-name :session-id session-id})
-            true)
-
-          :else
-          (do
-            (log/debug "Session not ready for terminal event"
-                       {:job-id id :session-id session-id :reason (:reason check-result)})
-            false))))))
+   If `send!` throws after the claim commits, the claim is released so
+   the event isn't silently lost."
+  [pool event-queue env job exec-opts]
+  (if-not (session-ready-for-dispatch? exec-opts job)
+    false
+    (if-not (job-store/claim-terminal-dispatch! pool (:id job))
+      false
+      (try
+        (send-terminal-event! event-queue env job exec-opts)
+        true
+        (catch Exception e
+          (try (job-store/release-terminal-dispatch-claim! pool (:id job))
+               (catch Exception release-e
+                 (log/error release-e "Failed to release terminal dispatch claim — event may be permanently lost"
+                            {:job-id (:id job)})))
+          (throw e))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Job Execution
@@ -155,17 +176,16 @@
                                   {:job-id (str id)})]
             ;; Store terminal state + event in one write
             (if (job-store/complete! pool id owner-id result done-event-name event-data)
-              ;; Atomically claim the dispatch slot before send!ing — the
-              ;; reconciler can also see this row, and without the claim
-              ;; a race would double-fire done.invoke.*. The claim +
-              ;; dispatch ordering means a crash between them loses the
-              ;; terminal event (auditable via dispatched_at set with no
-              ;; event row) — the lesser evil vs duplicate transitions.
-              (when (job-store/claim-terminal-dispatch! pool id)
-                (dispatch-terminal-event! event-queue env
-                  (assoc job :terminal-event-name done-event-name
-                             :terminal-event-data event-data)
-                  exec-opts))
+              ;; Readiness check first, then atomic claim, then send. This
+              ;; ordering is load-bearing: claiming before the readiness
+              ;; check silently loses the event whenever the parent isn't
+              ;; yet observing (the reconciler would never retry the row
+              ;; because dispatched_at is already set). Send exceptions
+              ;; roll back the claim so the reconciler picks it up again.
+              (claim-and-send-terminal-event! pool event-queue env
+                (assoc job :terminal-event-name done-event-name
+                           :terminal-event-data event-data)
+                exec-opts)
               (log/info "Skipping completion write; job no longer active/owned"
                         {:job-id id :session-id session-id :owner-id owner-id})))
           (log/info "Job lease lost after execution, abandoning"
@@ -180,12 +200,12 @@
           (case (job-store/fail! pool id owner-id attempt max-attempts error
                                  error-event-name event-data)
             :failed
-            ;; Same atomic-claim pattern as the success branch.
-            (when (job-store/claim-terminal-dispatch! pool id)
-              (dispatch-terminal-event! event-queue env
-                (assoc job :terminal-event-name error-event-name
-                           :terminal-event-data event-data)
-                exec-opts))
+            ;; Same readiness-check + claim + send pattern as the success
+            ;; branch.
+            (claim-and-send-terminal-event! pool event-queue env
+              (assoc job :terminal-event-name error-event-name
+                         :terminal-event-data event-data)
+              exec-opts)
             :retry-scheduled nil
             :ignored
             (log/info "Skipping fail update; job no longer active/owned"
@@ -211,8 +231,7 @@
     (let [jobs (job-store/get-undispatched-terminal-jobs pool limit)]
       (doseq [job jobs]
         (try
-          (when (job-store/claim-terminal-dispatch! pool (:id job))
-            (dispatch-terminal-event! event-queue env job exec-opts))
+          (claim-and-send-terminal-event! pool event-queue env job exec-opts)
           (catch Exception e
             (log/warn e "Failed to reconcile terminal event"
                       {:job-id (:id job)})))))
@@ -238,14 +257,12 @@
                                     (:max-attempts job)
                                     (:max-attempts job)
                                     error error-event-name event-data))
-            ;; Same atomic-claim pattern as execute-job!'s terminal paths —
-            ;; the reconciler can race this dispatch and the claim keeps
-            ;; it single-delivery.
-            (when (job-store/claim-terminal-dispatch! pool (:id job))
-              (dispatch-terminal-event! event-queue env
-                (assoc job :terminal-event-name error-event-name
-                           :terminal-event-data event-data)
-                exec-opts))))))))
+            ;; Same readiness-check + claim + send pattern as
+            ;; execute-job!'s terminal paths.
+            (claim-and-send-terminal-event! pool event-queue env
+              (assoc job :terminal-event-name error-event-name
+                         :terminal-event-data event-data)
+              exec-opts)))))))
 
 (defn- shutdown-executor!
   [^ExecutorService executor owner-id shutdown-timeout-ms]

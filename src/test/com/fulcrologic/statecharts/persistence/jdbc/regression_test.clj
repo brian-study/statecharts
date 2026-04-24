@@ -336,16 +336,18 @@
       (is (= 5 (pg-eq/queue-depth *pool*))))))
 
 ;; -----------------------------------------------------------------------------
-;; Finding #D (P2) — dispatch-terminal-event! drops :invoke-id
+;; Finding #D (P2) — worker's terminal send must propagate :invoke-id
 ;; -----------------------------------------------------------------------------
 ;;
 ;; The InvocationProcessor contract depends on completion/error events
 ;; carrying the originating `:invoke-id` so `handle-external-invocations!` can
-;; run finalize and autoforward. The worker's terminal dispatch omits it.
+;; run finalize and autoforward. Worker dispatch used to omit it.
 
-(deftest dispatch-terminal-event-includes-invoke-id-test
+(deftest worker-terminal-send-includes-invoke-id-test
   (testing "terminal events emitted by the job worker carry the originating :invoke-id"
-    (let [dispatch-fn @#'com.fulcrologic.statecharts.jobs.worker/dispatch-terminal-event!
+    (let [;; 2.0.20 split `dispatch-terminal-event!` into a readiness
+          ;; check + a send; the send is what this test pins.
+          send-fn     @#'com.fulcrologic.statecharts.jobs.worker/send-terminal-event!
           sent        (atom nil)
           event-queue (reify sp/EventQueue
                         (send! [_ _env send-request]
@@ -359,7 +361,7 @@
                :invokeid :durable-job-invocation
                :terminal-event-name ":done.invoke.durable-job-invocation"
                :terminal-event-data {:result 42}}]
-      (dispatch-fn event-queue {} job {})
+      (send-fn event-queue {} job {})
       (is (= :durable-job-invocation
              (or (:invoke-id @sent) (:invokeid @sent)))
           "terminal send! must include the invoke-id for finalize/autoforward handling"))))
@@ -964,35 +966,33 @@
           "round-trip value preserved"))))
 
 ;; -----------------------------------------------------------------------------
-;; Finding #V (P2) — dispatch-terminal-event! ignores a nil session-state result
+;; Finding #V (P2) — readiness check treats nil session-state as "not ready"
 ;; -----------------------------------------------------------------------------
 ;;
-;; if-let fails when get-session-state-fn returns nil, and the code falls
-;; through to the "no checker installed" branch and dispatches anyway.
-;; A nil result should be treated as "not ready" — the guard is most
+;; if-let fails when get-session-state-fn returns nil, and the code fell
+;; through to the "no checker installed" branch and dispatched anyway.
+;; A nil result must be treated as "not ready" — the guard is most
 ;; needed exactly when the parent is gone/stale.
 
-(deftest dispatch-terminal-event-treats-nil-session-state-as-not-ready-test
-  (testing "when get-session-state-fn returns nil, no terminal event is dispatched"
-    (let [dispatch-fn @#'worker/dispatch-terminal-event!
-          sent        (atom [])
-          event-queue (reify sp/EventQueue
-                        (send! [_ _env req] (swap! sent conj req) true)
-                        (cancel! [_ _env _sid _sendid] true)
-                        (receive-events! [_ _env _h] nil)
-                        (receive-events! [_ _env _h _opts] nil))
+(deftest session-ready-for-dispatch-treats-nil-as-not-ready-test
+  (testing "when get-session-state-fn returns nil, the readiness check returns false"
+    (let [;; 2.0.20 moved the nil-is-not-ready guard into a pure
+          ;; `session-ready-for-dispatch?` helper. Pinned here.
+          ready? @#'worker/session-ready-for-dispatch?
           job {:id                  (UUID/randomUUID)
                :session-id          :gone-parent
                :invokeid            :some-invoke
                :terminal-event-name ":done.invoke.some-invoke"
                :terminal-event-data {}}
-          always-nil-checker (fn [_sid _iid _job-id] nil)
-          dispatched? (dispatch-fn event-queue {} job
-                                   {:get-session-state-fn always-nil-checker})]
-      (is (false? dispatched?)
-          "a nil session-state result means 'not ready'; dispatch must be skipped")
-      (is (empty? @sent)
-          "no event should be sent when the parent is absent/stale"))))
+          always-nil-checker (fn [_sid _iid _job-id] nil)]
+      (is (false? (ready? {:get-session-state-fn always-nil-checker} job))
+          "a nil session-state result means 'not ready'")
+      (is (true? (ready? {:get-session-state-fn (fn [_ _ _] {:ready true})} job))
+          "a :ready true result means 'ready'")
+      (is (false? (ready? {:get-session-state-fn (fn [_ _ _] {:ready false})} job))
+          "a :ready false result means 'not ready'")
+      (is (true? (ready? {} job))
+          "no checker installed at all → dispatch unconditionally"))))
 
 ;; -----------------------------------------------------------------------------
 ;; Finding #W (P1) — numeric session-id types must round-trip through JDBC
@@ -1489,6 +1489,61 @@
         (is (empty? child-hook-calls)
             "child save must not carry parent's on-save hooks into its env at all")))))
 
+(deftest statechart-invocation-async-path-strips-parent-ack-hooks-test
+  ;; Same contract as the sync path above, but exercises the branch
+  ;; where `sp/start!` returns a Promesa promise and `save!` runs inside
+  ;; a `p/then` continuation. The parent's hook must still not fire
+  ;; when the async child save resolves.
+  (let [saved-wms   (atom {})
+        event-queue (reify sp/EventQueue
+                      (send! [_ _env _req] true)
+                      (cancel! [_ _env _sid _sendid] true)
+                      (receive-events! [_ _env _h] nil)
+                      (receive-events! [_ _env _h _opts] nil))
+        registry    (mem-reg/new-registry)
+        _           (sp/register-statechart! registry :child-chart
+                      (chart/statechart {:initial :c1} (state {:id :c1})))
+        wm-store    (reify sp/WorkingMemoryStore
+                      (get-working-memory [_ _env sid] (get @saved-wms sid))
+                      (save-working-memory! [_ env sid wmem]
+                        (when-let [hooks (:com.fulcrologic.statecharts/on-save-hooks env)]
+                          (doseq [h hooks] (h :fake-tx)))
+                        (swap! saved-wms assoc sid wmem)
+                        true)
+                      (delete-working-memory! [_ _env sid]
+                        (swap! saved-wms dissoc sid)
+                        true))
+        async-processor (reify sp/Processor
+                          ;; `start!` returns a Promesa promise. The
+                          ;; invocation processor pipes its result into
+                          ;; `save!` via `p/then`.
+                          (start! [_ _env _src {::sc/keys [session-id]}]
+                            (p/resolved {::sc/session-id session-id ::sc/configuration #{:c1}}))
+                          (process-event! [_ _env wmem _event] wmem)
+                          (exit! [_ _env _wmem _terminal?] nil))
+        inv-proc    (i.statechart/new-invocation-processor)
+        parent-sid  :async-parent-session
+        parent-hook-calls (atom 0)
+        parent-hook (fn [_tx] (swap! parent-hook-calls inc))
+        env         {::sc/session-id            parent-sid
+                     ::sc/vwmem                 (volatile! {::sc/session-id parent-sid})
+                     ::sc/event-queue           event-queue
+                     ::sc/working-memory-store  wm-store
+                     ::sc/processor             async-processor
+                     ::sc/statechart-registry   registry
+                     ::sc/on-save-hooks         [parent-hook]}
+        result      (sp/start-invocation! inv-proc env
+                      {:invokeid :my-child
+                       :src      :child-chart
+                       :params   {}})]
+
+    ;; Wait for the promise's chained save! to complete.
+    (when (p/promise? result) @result)
+
+    (testing "parent hook MUST not fire during async child save"
+      (is (zero? @parent-hook-calls)
+          "the `(dissoc env ::sc/on-save-hooks)` must survive into the p/then continuation so async child saves don't trigger the parent's ACK hook either"))))
+
 ;; -----------------------------------------------------------------------------
 ;; Finding #AB (P1) — FlatWorkingMemoryDataModel must read legacy key after upgrade
 ;; -----------------------------------------------------------------------------
@@ -1596,6 +1651,55 @@
         (is (some? (:terminal-event-name row))
             "terminal_event_name set so reconciliation can dispatch error.invoke.*")))))
 
+(deftest ^:integration delete-working-memory-rolls-back-job-cancellation-on-failure-test
+  (let [store      (pg-wms/new-store *pool*)
+        session-id :rollback-test-session
+        _          (sp/save-working-memory! store {} session-id
+                     {::sc/session-id session-id
+                      ::sc/configuration #{:s1}})
+        job-id     (UUID/randomUUID)
+        _          (job-store/create-job! *pool*
+                     {:id           job-id
+                      :session-id   session-id
+                      :invokeid     :rollback-invoke
+                      :job-type     "http"
+                      :payload      {}
+                      :max-attempts 3})
+        original-execute! @#'core/execute!
+        ;; Let cancel-by-session!'s UPDATEs succeed, but fail the final
+        ;; DELETE. The outer tx must roll back so the job returns to
+        ;; 'pending' and the session row stays.
+        call-count (atom 0)
+        failing-execute!
+        (fn [& args]
+          (let [n (swap! call-count inc)
+                sql (first (when (map? (second args)) [(second args)]))]
+            ;; Only fail the :delete-from statement.
+            (if (and (map? (second args)) (:delete-from (second args)))
+              (throw (ex-info "simulated failure after cancellation"
+                       {:expected :rollback}))
+              (apply original-execute! args))))]
+
+    (testing "mid-delete failure rolls back cancel-by-session! too"
+      (with-redefs [core/execute! failing-execute!]
+        (is (thrown? Exception
+              (sp/delete-working-memory! store {} session-id))
+            "mid-delete failure must propagate"))
+
+      ;; After rollback, we expect the session still present and the
+      ;; job still 'pending' (its pre-delete state).
+      (let [session-row (sp/get-working-memory store {} session-id)
+            job-status  (:status (first (core/execute-sql! *pool*
+                                          "SELECT status FROM statechart_jobs WHERE id = ?"
+                                          [job-id])))]
+        (is (some? session-row)
+            "session row must still exist — outer tx rolled back")
+        (is (= "pending" job-status)
+            "job must be back to 'pending' — cancel-by-session!'s UPDATEs must have been rolled back along with the failed delete")))
+
+    ;; Clean up so the fixture's truncate doesn't trip on it.
+    (sp/delete-working-memory! store {} session-id)))
+
 ;; -----------------------------------------------------------------------------
 ;; Finding #AD (P2) — terminal job dispatch must atomically claim
 ;; -----------------------------------------------------------------------------
@@ -1654,3 +1758,79 @@
       (let [undispatched (job-store/get-undispatched-terminal-jobs *pool* 10)]
         (is (not-any? #(= job-id (:id %)) undispatched)
             "claimed+dispatched jobs are not re-surfaced")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AE (P1 — 2.0.19 regression) — not-ready session must stay re-claimable
+;; -----------------------------------------------------------------------------
+;;
+;; 2.0.19 moved the dispatch claim BEFORE the send, to prevent duplicate
+;; dispatch across racing reconcilers. But the pre-existing
+;; `dispatch-terminal-event!` returned `false` (without sending) when
+;; `get-session-state-fn` indicated the parent wasn't ready to receive
+;; the event — that was the retry mechanism for parents that start
+;; observing an invocation before the child has terminated. 2.0.19's
+;; claim-first ordering silently marks dispatched_at in this case, and
+;; the reconciler never picks the row up again → terminal event
+;; permanently lost, parent state machine stuck.
+;;
+;; Fix: split `dispatch-terminal-event!` into a pure readiness check and
+;; a pure send; claim only when ready; release the claim if send throws.
+;; Pinned here via the reconciler loop so a future regression at any
+;; dispatch call site is caught.
+
+(deftest ^:integration reconcile-not-ready-session-keeps-job-retryable-test
+  (let [session-id :not-ready-test-session
+        job-id     (UUID/randomUUID)
+        _          (job-store/create-job! *pool*
+                     {:id           job-id
+                      :session-id   session-id
+                      :invokeid     :some-invoke
+                      :job-type     "http"
+                      :payload      {}
+                      :max-attempts 3})
+        _ (core/execute-sql! *pool*
+            (str "UPDATE statechart_jobs"
+                 " SET status = 'succeeded',"
+                 "     terminal_event_name = ?,"
+                 "     terminal_event_data = ?,"
+                 "     lease_owner = NULL,"
+                 "     updated_at = now()"
+                 " WHERE id = ?")
+            [(pr-str :done.invoke.some-invoke) (core/freeze {}) job-id])
+        sent-events (atom [])
+        event-queue (reify sp/EventQueue
+                      (send! [_ _env req] (swap! sent-events conj req) true)
+                      (cancel! [_ _env _sid _sendid] true)
+                      (receive-events! [_ _env _h] nil)
+                      (receive-events! [_ _env _h _opts] nil))
+        not-ready-fn (fn [_sid _iid _job-id] {:ready false :reason :parent-not-observing-yet})
+        reconcile!   @#'worker/reconcile-undispatched!]
+
+    (reconcile! *pool* event-queue {}
+      {:limit                10
+       :get-session-state-fn not-ready-fn})
+
+    (testing "send! must NOT have been called for the not-ready session"
+      (is (empty? @sent-events)
+          "no event is enqueued when the parent isn't ready"))
+
+    (testing "the row must remain re-claimable (terminal_event_dispatched_at stays nil)"
+      (let [row (first (core/execute-sql! *pool*
+                         "SELECT terminal_event_dispatched_at FROM statechart_jobs WHERE id = ?"
+                         [job-id]))]
+        (is (nil? (:terminal-event-dispatched-at row))
+            "if we claim dispatched_at before sending, a not-ready session silently permanently loses the terminal event — dispatched_at must stay nil when the send did not happen")))
+
+    (testing "a subsequent pass with a ready session can still dispatch the same job"
+      (reset! sent-events [])
+      (let [ready-fn (fn [_sid _iid _job-id] {:ready true})]
+        (reconcile! *pool* event-queue {}
+          {:limit                10
+           :get-session-state-fn ready-fn}))
+      (is (= 1 (count @sent-events))
+          "once the parent becomes ready the event is dispatched exactly once")
+      (let [row (first (core/execute-sql! *pool*
+                         "SELECT terminal_event_dispatched_at FROM statechart_jobs WHERE id = ?"
+                         [job-id]))]
+        (is (some? (:terminal-event-dispatched-at row))
+            "after the ready-path dispatch, the row is marked dispatched")))))
