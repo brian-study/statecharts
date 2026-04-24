@@ -448,6 +448,9 @@
     (let [uuid   (UUID/randomUUID)
           inputs [:kw
                   :my-ns/kw
+                  :42                      ; digit-starting keyword (ambiguous with Long)
+                  :3.14                    ; digit-starting keyword (ambiguous with Double)
+                  :-dashy                  ; sign-starting keyword (ambiguous with -number)
                   "report"
                   "looks-like-a/ns"
                   42
@@ -460,6 +463,87 @@
               (str "round-trip for " (pr-str original)
                    " must preserve value+type; stored as " (pr-str stored)
                    ", read back as " (pr-str read-back))))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #L (P1) — cancel-by-session! lost atomicity in 2.0.8
+;; -----------------------------------------------------------------------------
+;;
+;; The 2.0.8 rewrite from a single UPDATE to SELECT + per-row UPDATE is
+;; functionally correct for typed invokeids but drops atomicity: if the DB
+;; fails mid-loop, some jobs end up cancelled and others don't. Cancellation
+;; must be all-or-nothing.
+
+(deftest ^:integration cancel-by-session-atomic-on-midway-failure-test
+  (testing "cancel-by-session! is atomic — a mid-loop UPDATE failure rolls back every cancellation"
+    (let [session-id :atomic-cancel-session
+          job-ids (mapv (fn [i]
+                          (let [job-id (UUID/randomUUID)]
+                            (job-store/create-job! *pool*
+                              {:id           job-id
+                               :session-id   session-id
+                               :invokeid     (keyword (str "inv-" i))
+                               :job-type     "http"
+                               :payload      {}
+                               :max-attempts 3})
+                            job-id))
+                        (range 3))
+          original-execute-sql! @#'core/execute-sql!
+          update-call-count (atom 0)]
+      (try
+        (with-redefs [core/execute-sql!
+                      (fn [ds sql & params]
+                        (if (clojure.string/starts-with? sql "UPDATE statechart_jobs")
+                          (do
+                            (swap! update-call-count inc)
+                            (if (= 2 @update-call-count)
+                              (throw (ex-info "simulated DB error mid-loop" {}))
+                              (apply original-execute-sql! ds sql params)))
+                          (apply original-execute-sql! ds sql params)))]
+          (is (thrown? Exception (job-store/cancel-by-session! *pool* session-id))
+              "simulated DB error must propagate"))
+        (catch Exception _ nil))
+      ;; All three jobs should still be in their original state — nothing
+      ;; partially cancelled.
+      (let [statuses (mapv (fn [id]
+                             (:status
+                               (core/execute-sql-one! *pool*
+                                 "SELECT status FROM statechart_jobs WHERE id = ?"
+                                 [id])))
+                           job-ids)]
+        (is (every? #(= "pending" %) statuses)
+            (str "all jobs must remain pending after failed cancel-by-session!; got " statuses))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #M (P2) — event_queue and job_store disagree on legacy bare rows
+;; -----------------------------------------------------------------------------
+;;
+;; Pre-2.0.4 event_queue rows and pre-2.0.8 job_store rows both stored bare
+;; keyword-typed invoke-ids (e.g. "my-invoke"). Post-fix decoders must agree —
+;; both modules should reconstruct these as keywords so downstream matching
+;; (handle-external-invocations! via `=`) works uniformly.
+
+(deftest ^:integration event-queue-legacy-bare-invoke-id-decodes-as-keyword-test
+  (testing "a bare-string invoke_id row in statechart_events decodes as a keyword via receive-events!"
+    (let [queue     (pg-eq/new-queue *pool* "legacy-bare-ns-invoke-id")
+          target-id :legacy-bare-invoke-session
+          received  (atom nil)]
+      ;; Directly insert a row shaped like pre-2.0.4: invoke_id stored via
+      ;; `(name x)` — bare string, no leading marker.
+      (core/execute! *pool*
+        {:insert-into :statechart-events
+         :values [{:target-session-id (core/session-id->str target-id)
+                   :source-session-id nil
+                   :send-id           nil
+                   :invoke-id         "my-invoke"
+                   :event-name        (pr-str :legacy-event)
+                   :event-type        "external"
+                   :event-data        (core/freeze {})}]})
+      (sp/receive-events! queue {}
+                          (fn [_env event] (reset! received event)))
+      (is (keyword? (:invokeid @received))
+          "bare legacy invoke_id should decode as a keyword — job_store's str->invokeid does the same, so handle-external-invocations! matches consistently")
+      (is (= :my-invoke (:invokeid @received))
+          "legacy :my-invoke stored bare must come back as :my-invoke (not the string \"my-invoke\")"))))
 
 (deftest invokeid->str-preserves-non-keyword-values-test
   (testing "invokeid->str must not corrupt non-keyword invoke-ids (no leading-char stripping)"
@@ -621,25 +705,6 @@
       (is (false? (closed?-fn transient-ds))
           "bare DataSource without isClosed must NOT be reported as closed — we can't distinguish transient outages from shutdown"))))
 
-(deftest ^:integration legacy-invoke-id-decodes-as-string-test
-  (testing "rows written pre-2.0.4 with bare-string invoke-id still decode as strings"
-    (let [queue     (pg-eq/new-queue *pool* "legacy-invoke-id")
-          target-id :legacy-invoke-id-session
-          received  (atom nil)]
-      ;; Directly insert a row shaped like pre-2.0.4: invoke_id stored via
-      ;; `(name x)` — no leading ':' or '"' or '#'. Bypass the queue's writer.
-      (core/execute! *pool*
-        {:insert-into :statechart-events
-         :values [{:target-session-id (core/session-id->str target-id)
-                   :source-session-id nil
-                   :send-id           nil
-                   :invoke-id         "legacy-bare-id"
-                   :event-name        (pr-str :legacy-event)
-                   :event-type        "external"
-                   :event-data        (core/freeze {})}]})
-      (sp/receive-events! queue {}
-                          (fn [_env event] (reset! received event)))
-      (is (string? (:invokeid @received))
-          "legacy bare-string invoke-id must decode to a string, not a symbol")
-      (is (= "legacy-bare-id" (:invokeid @received))
-          "legacy invoke-id value must be preserved unchanged"))))
+;; (legacy-invoke-id-decodes-as-string-test from 2.0.5 superseded by finding
+;; #M — the two decoders are now harmonised on keyword fallback for legacy
+;; bare rows. See event-queue-legacy-bare-invoke-id-decodes-as-keyword-test.)

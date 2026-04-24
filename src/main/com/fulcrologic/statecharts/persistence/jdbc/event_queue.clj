@@ -53,18 +53,32 @@
 
    New rows (2.0.4+) store `(pr-str invoke-id)` — keywords, UUIDs, numbers,
    and strings all round-trip through EDN. Legacy rows (pre-2.0.4) stored
-   `(name invoke-id)` as a bare string, which EDN would parse as a SYMBOL —
-   not what callers expect. We only EDN-read shapes that start with a
-   recognisable new-format marker; anything else is treated as a legacy bare
-   string and returned as-is."
+   `(name invoke-id)` as a bare string — but the original was always a
+   keyword (pre-2.0.4 write path used `(name x)` which only accepts
+   keyword/string/symbol, and the dominant case was keyword), so we
+   restore the keyword shape on readback.
+
+   Matches `job_store/str->invokeid`'s legacy fallback so both decoders
+   agree on the type of a legacy bare row; `handle-external-invocations!`
+   matches by `=` against the original idlocation value and a string vs
+   keyword mismatch would silently skip finalize/autoforward."
   [s]
   (when s
-    (if (or (str/starts-with? s ":")                ; keyword (incl. namespaced)
-            (str/starts-with? s "\"")               ; quoted string
-            (str/starts-with? s "#")                ; tagged literal, e.g. #uuid "..."
-            (re-matches #"-?\d+(?:\.\d+)?" s))      ; number
+    (cond
+      (str/starts-with? s ":")                ; keyword (incl. namespaced)
       (try (edn/read-string s) (catch Exception _ s))
-      s)))
+
+      (str/starts-with? s "\"")               ; quoted string
+      (try (edn/read-string s) (catch Exception _ s))
+
+      (str/starts-with? s "#")                ; tagged literal, e.g. #uuid "..."
+      (try (edn/read-string s) (catch Exception _ s))
+
+      (re-matches #"-?\d+(?:\.\d+)?" s)       ; number
+      (try (edn/read-string s) (catch Exception _ s))
+
+      :else                                   ; legacy bare row — always keyword
+      (keyword s))))
 
 (defn- event->row
   "Convert a send-request to a database row."

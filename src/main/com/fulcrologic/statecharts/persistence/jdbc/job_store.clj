@@ -17,36 +17,59 @@
 ;; Invokeid Serialization
 ;; -----------------------------------------------------------------------------
 
+(defn- numeric-bare-name?
+  "Does the bare keyword/symbol name look like a number? If so its bare
+   serialisation would be indistinguishable from a Long/Double on
+   readback — we must disambiguate by storing the leading `:`."
+  [bare]
+  (boolean
+    (or (parse-long bare)
+        (parse-double bare))))
+
 (defn invokeid->str
   "Serialize an invokeid to a string for DB storage, preserving type
    information so `str->invokeid` can reconstruct the original value.
 
-   - Keywords (including namespaced) are stored bare (`:kw` → `\"kw\"`,
-     `:my-ns/k` → `\"my-ns/k\"`). Back-compat with rows written pre-2.0.8.
-   - Symbols are stored bare (`'my-sym` → `\"my-sym\"`). Round-trip is
-     lossy — symbols reconstruct as keywords (rare use case).
+   - Keywords/symbols with non-numeric names are stored bare (`:kw` →
+     `\"kw\"`, `:my-ns/k` → `\"my-ns/k\"`) — back-compat with rows
+     written pre-2.0.8.
+   - Keywords whose name would parse as a number (`:42`, `:3.14`,
+     `:-dashy`) are stored with the leading `:` via `pr-str` so the
+     decoder can tell them apart from real numbers.
    - Everything else (string, UUID, Long, Double, etc.) is stored via
-     `pr-str` so the leading marker distinguishes it from a bare keyword
-     on readback. `\"report\"` → `\"\\\"report\\\"\"`, `42` → `\"42\"`,
-     `#uuid \"…\"` → `\"#uuid \\\"…\\\"\"`.
+     `pr-str` so the leading marker distinguishes it from a bare keyword.
 
    Why it matters: `handle-external-invocations!` matches terminal
    events to `<invoke>` elements by `=` against the original
    `idlocation` value. A string invokeid silently coerced to a keyword
-   on readback misses finalize/autoforward even though the terminal
-   event name looks right."
+   on readback (or a `:42` keyword silently coerced to the Long 42)
+   misses finalize/autoforward even though the terminal event name
+   looks right."
   [invokeid]
   (cond
-    (keyword? invokeid) (subs (str invokeid) 1)
-    (symbol? invokeid)  (str invokeid)
-    :else               (pr-str invokeid)))
+    (keyword? invokeid)
+    (let [bare (subs (str invokeid) 1)]
+      (if (numeric-bare-name? bare)
+        (pr-str invokeid)              ; ":42" — leading marker disambiguates
+        bare))
+
+    (symbol? invokeid)
+    (let [bare (str invokeid)]
+      (if (numeric-bare-name? bare)
+        (pr-str invokeid)              ; same as for keywords
+        bare))
+
+    :else
+    (pr-str invokeid)))
 
 (defn str->invokeid
   "Deserialize an invokeid from the DB back to its original type.
 
    Shape-aware inverse of `invokeid->str`:
-   - quoted string form (`\"…\"`) or tagged literal (`#uuid …`) → EDN read.
-   - integer/decimal string → `parse-long` / `parse-double`.
+   - leading `:` (keyword literal) → EDN read,
+   - leading `\"` (quoted string) or `#` (tagged literal, e.g. `#uuid`) →
+     EDN read,
+   - integer/decimal string → `parse-long` / `parse-double`,
    - anything else → `(keyword s)` (bare keyword form, legacy rows).
 
    Symbols round-trip as keywords — the bare form can't be distinguished
@@ -54,6 +77,9 @@
   [s]
   (when s
     (cond
+      (str/starts-with? s ":")
+      (try (edn/read-string s) (catch Exception _ s))
+
       (str/starts-with? s "\"")
       (try (edn/read-string s) (catch Exception _ s))
 
@@ -343,34 +369,38 @@
    typed (keyword/UUID/number/string via `invokeid->str`/`str->invokeid`),
    we can't reconstruct the terminal event name server-side via SQL
    concat — we fetch each row, reconstruct the original invokeid in
-   Clojure, and issue a guarded UPDATE per row."
+   Clojure, and issue a guarded UPDATE per row. The SELECT and every
+   UPDATE run inside a single transaction so cancellation is atomic:
+   either every pending/running job in the session is cancelled or
+   none of them are."
   [ds session-id]
-  (let [sid-str (core/session-id->str session-id)
-        rows (core/execute-sql! ds
-               (str "SELECT id, invokeid FROM statechart_jobs"
-                    " WHERE session_id = ?"
-                    " AND status IN ('pending', 'running')")
-               [sid-str])
+  (let [sid-str        (core/session-id->str session-id)
         cancelled-data @cancelled-event-data]
-    (reduce
-      (fn [n {:keys [id invokeid]}]
-        (let [orig-invokeid (str->invokeid invokeid)
-              terminal-event-name (terminal-event-name-for orig-invokeid)
-              result (core/execute-sql! ds
-                       (str "UPDATE statechart_jobs"
-                            " SET status = 'cancelled',"
-                            "     lease_owner = NULL,"
-                            "     lease_expires_at = NULL,"
-                            "     terminal_event_name = ?,"
-                            "     terminal_event_data = ?,"
-                            "     updated_at = now()"
-                            " WHERE id = ?"
-                            " AND status IN ('pending', 'running')"
-                            " RETURNING id")
-                       [terminal-event-name cancelled-data id])]
-          (+ n (core/affected-row-count result))))
-      0
-      rows)))
+    (core/with-tx [tx ds]
+      (let [rows (core/execute-sql! tx
+                   (str "SELECT id, invokeid FROM statechart_jobs"
+                        " WHERE session_id = ?"
+                        " AND status IN ('pending', 'running')")
+                   [sid-str])]
+        (reduce
+          (fn [n {:keys [id invokeid]}]
+            (let [orig-invokeid (str->invokeid invokeid)
+                  terminal-event-name (terminal-event-name-for orig-invokeid)
+                  result (core/execute-sql! tx
+                           (str "UPDATE statechart_jobs"
+                                " SET status = 'cancelled',"
+                                "     lease_owner = NULL,"
+                                "     lease_expires_at = NULL,"
+                                "     terminal_event_name = ?,"
+                                "     terminal_event_data = ?,"
+                                "     updated_at = now()"
+                                " WHERE id = ?"
+                                " AND status IN ('pending', 'running')"
+                                " RETURNING id")
+                           [terminal-event-name cancelled-data id])]
+              (+ n (core/affected-row-count result))))
+          0
+          rows)))))
 
 (defn get-active-job
   "Get the active (pending/running) job for a session+invokeid, or nil."

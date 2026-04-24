@@ -1,3 +1,32 @@
+2.0.9
+-----
+
+Three more findings from the post-2.0.8 review.
+
+* **[P1]** `cancel-by-session!` is atomic again. 2.0.8's switch from a
+  single SQL UPDATE to SELECT + per-row UPDATE dropped atomicity — a
+  mid-loop DB error could leave a session partially cancelled. The
+  SELECT and every UPDATE now run inside a single `with-tx`, so
+  cancellation is all-or-nothing. Regression test:
+  `cancel-by-session-atomic-on-midway-failure-test`.
+
+* **[P2]** Digit-starting keyword invokeids (`:42`, `:3.14`, `:-dashy`)
+  now round-trip to their original keyword instead of being decoded as
+  numbers. `invokeid->str` detects names that would parse as a number
+  and stores them via `pr-str` (with the leading `:`) so the decoder
+  can disambiguate. Extended `invokeid-roundtrip-preserves-all-
+  supported-types-test`.
+
+* **[P2]** `event_queue/parse-invoke-id` and `job_store/str->invokeid`
+  now agree on the type of legacy bare-string rows: both return
+  keywords. Pre-2.0.4 / pre-2.0.8 rows were always keyword-typed (the
+  old write paths only accepted keyword/string/symbol and keywords were
+  the dominant case), so keyword is the correct guess for bare form.
+  `handle-external-invocations!`'s `=` match now works uniformly
+  regardless of which decoder the chart goes through. Regression test:
+  `event-queue-legacy-bare-invoke-id-decodes-as-keyword-test`. The
+  obsoleted 2.0.5 `legacy-invoke-id-decodes-as-string-test` is removed.
+
 2.0.8
 -----
 
