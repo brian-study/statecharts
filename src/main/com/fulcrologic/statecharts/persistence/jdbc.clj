@@ -192,32 +192,26 @@
 ;; -----------------------------------------------------------------------------
 
 (defn- datasource-closed?
-  "Return true if the datasource cannot serve connections.
+  "Return true if the datasource exposes `isClosed()` and it reports true.
 
-   Checks, in order:
-   1. Reflective `isClosed()` — works for `HikariDataSource` and any pool
-      following the JDBC pool convention.
-   2. Connection probe — if no `isClosed` method is exposed (plain
-      `javax.sql.DataSource` instances), briefly open and close a connection.
-      If that throws, treat the datasource as closed.
-
-   Ensures the event loop stops cleanly for any DataSource shape, and that a
-   permanently-failing pool doesn't spin indefinitely at poll cadence."
+   Works with `HikariDataSource` and any pool following the JDBC pool
+   convention. For DataSources that do NOT expose `isClosed()` (plain
+   `javax.sql.DataSource`, custom wrappers), returns false — a single
+   failed connection attempt cannot distinguish a permanent shutdown from
+   a transient outage, and mis-identifying transient failures as
+   permanent would stop the event loop forever. Callers relying on those
+   DataSources must invoke the `:stop!` returned by `start-event-loop!`
+   explicitly on shutdown."
   [ds]
-  (when ds
-    (let [isClosed-m (try
-                       (.getMethod (class ds) "isClosed" (into-array Class []))
-                       (catch NoSuchMethodException _ nil)
-                       (catch Exception _ nil))]
-      (if isClosed-m
+  (boolean
+    (when ds
+      (when-let [isClosed-m (try
+                              (.getMethod (class ds) "isClosed" (into-array Class []))
+                              (catch NoSuchMethodException _ nil)
+                              (catch Exception _ nil))]
         (try
-          (boolean (.invoke isClosed-m ds (object-array 0)))
-          (catch Exception _ false))
-        ;; Fallback: probe a connection. Success → open; any throw → closed.
-        (try
-          (with-open [_conn (.getConnection ^javax.sql.DataSource ds)]
-            false)
-          (catch Exception _ true))))))
+          (.invoke isClosed-m ds (object-array 0))
+          (catch Exception _ false))))))
 
 (defn start-event-loop!
   "Start a background event processing loop.
@@ -233,10 +227,15 @@
    Returns a map with:
    - :stop! - Function that stops the loop when called
    - :wake! - Function that wakes the loop to process events immediately
+   - :env   - The env with the loop's wake-signal attached. Callers who want
+              `send!` to auto-wake the loop must use this env for subsequent
+              `send!` calls (the original env has no wake-signal). See #J.
 
    Example:
    ```clojure
    (def event-loop (start-event-loop! env 100))
+   ;; Use the returned env so send! wakes the loop immediately.
+   (def env (:env event-loop))
    ;; ... later
    ((:stop! event-loop))
    ```"
@@ -269,8 +268,11 @@
                      (.poll wake-signal poll-interval-ms java.util.concurrent.TimeUnit/MILLISECONDS))
                    (log/info "Event loop stopped" {:node-id node-id}))]
      (future (loop-fn))
-     ;; Return map with stop and wake functions
-     {:stop! (fn []
+     ;; Return map with stop/wake fns AND the env-with-signal so callers
+     ;; can route subsequent send! calls through it (the wake-signal is
+     ;; otherwise invisible outside this closure).
+     {:env   env-with-signal
+      :stop! (fn []
                (log/debug "Event loop stop requested" {:node-id node-id})
                (reset! running false)
                (.offer wake-signal :stop))

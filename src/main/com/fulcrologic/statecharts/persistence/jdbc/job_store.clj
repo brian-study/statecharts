@@ -15,11 +15,24 @@
 ;; -----------------------------------------------------------------------------
 
 (defn invokeid->str
-  "Serialize an invokeid keyword to a string, preserving namespace.
-   Simple keywords: :content-generation → \"content-generation\"
-   Qualified keywords: :my-ns/gen → \"my-ns/gen\""
+  "Serialize an invokeid to a string for DB storage.
+
+   Keywords (including namespaced) strip the leading `:` so legacy rows
+   stay compatible: `:content-generation` → `\"content-generation\"`,
+   `:my-ns/gen` → `\"my-ns/gen\"`.
+
+   Strings/UUIDs/numbers (all valid `::sc/id` shapes, reachable via
+   idlocation) use their plain string form unchanged. Previously the
+   blanket `(subs (str x) 1)` stripped the first character from every
+   non-keyword value — corrupting storage.
+
+   Readback via `str->invokeid` is lossy for non-keyword originals: they
+   reconstruct as keywords (the dominant case)."
   [invokeid]
-  (subs (str invokeid) 1))
+  (cond
+    (keyword? invokeid) (subs (str invokeid) 1)
+    (symbol? invokeid)  (str invokeid)
+    :else               (str invokeid)))
 
 (defn str->invokeid
   "Deserialize a string back to an invokeid keyword.

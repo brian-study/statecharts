@@ -45,6 +45,7 @@
                             (sp/send! event-queue env {:target            source-session-id
                                                        :sendid            child-session-id
                                                        :source-session-id child-session-id
+                                                       :invoke-id         invokeid
                                                        :event             done-event-name
                                                        :data              (if (map? result) result {})}))
                           (catch Throwable t
@@ -52,6 +53,10 @@
                             (sp/send! event-queue env {:target            source-session-id
                                                        :sendid            child-session-id
                                                        :source-session-id child-session-id
+                                                       ;; Required for handle-external-invocations!
+                                                       ;; to run finalize/autoforward against the
+                                                       ;; correct <invoke> on the error path.
+                                                       :invoke-id         invokeid
                                                        :event             error-event-name
                                                        :data              {:message (.getMessage t)
                                                                            :type    (str (type t))}}))

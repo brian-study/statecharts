@@ -1,3 +1,39 @@
+2.0.6
+-----
+
+Five more correctness fixes. Regression tests in `regression_test.clj`
+findings #G–#K.
+
+* **[P1]** `job_store/invokeid->str` no longer strips the first character
+  of non-keyword invoke-ids. `(subs (str invokeid) 1)` was only correct
+  for keywords; for string/UUID/number invoke-ids (all valid `::sc/id`
+  shapes reachable via `idlocation`), it corrupted storage (`"report"` →
+  `"eport"`, `42` → `"2"`). Workers built `done.invoke.*` /
+  `error.invoke.*` from the corrupted string, and parents never saw
+  their terminal event. Now branches on type — keywords unchanged,
+  others use plain `str`.
+* **[P2]** `durable-job/invoke-data-keys` no longer throws on UUID/
+  number invoke-ids. `(name x)` only accepts keyword/string/symbol;
+  previous code crashed AFTER `create-job!` had inserted a pending row,
+  leaving orphaned jobs in `statechart_jobs`. Now dispatches on type and
+  flattens qualified keywords to a dotted form.
+* **[P2]** `invocation/future` now includes `:invoke-id` on both the
+  done and error sends. `handle-external-invocations!` matches terminal
+  events to `<invoke>` elements by `:invokeid`, so finalize content and
+  autoforward were skipped on the failure path.
+* **[P2]** `start-event-loop!` now returns `:env` alongside `:stop!` /
+  `:wake!`. Callers who want `send!` to auto-wake the loop must use this
+  env — previously `env-with-signal` was trapped inside the closure, so
+  `send!` on the caller's original env saw `::wake-signal=nil` and new
+  events waited the full `poll-interval-ms`.
+* **[P1]** `datasource-closed?` no longer treats a single failed
+  `getConnection` call as permanent closure. The 2.0.2 fallback probe
+  couldn't distinguish transient outages from shutdown; a transient DB
+  blip on a non-Hikari DataSource flipped `running=false` and stopped
+  the event loop forever. Now only `isClosed()` signals closure;
+  DataSources without that method return `false`, and operators call
+  `(:stop! loop-handle)` explicitly on shutdown.
+
 2.0.5
 -----
 

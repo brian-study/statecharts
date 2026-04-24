@@ -28,10 +28,20 @@
 
 (defn invoke-data-keys
   "Returns the data model keys for tracking a durable job invoke.
-   Keys are namespaced by invokeid to support multiple concurrent invokes."
+   Keys are namespaced by invokeid to support multiple concurrent invokes.
+
+   Accepts any `::sc/id` shape (keyword, namespaced keyword, symbol,
+   string, UUID, number). `(name x)` only works for keyword/string/symbol
+   and would throw on UUID/number — leaving an orphaned row in
+   `statechart_jobs` because `create-job!` has already inserted by the
+   time this runs."
   [invokeid]
-  (let [ns-str (name invokeid)]
-    {:job-id-key  (keyword ns-str "job-id")
+  (let [ns-str (cond
+                 (qualified-keyword? invokeid) (str (namespace invokeid) "." (name invokeid))
+                 (keyword? invokeid)           (name invokeid)
+                 (symbol? invokeid)            (name invokeid)
+                 :else                         (str invokeid))]
+    {:job-id-key   (keyword ns-str "job-id")
      :job-kind-key (keyword ns-str "job-kind")}))
 
 (defrecord DurableJobInvocationProcessor [pool wake-worker-fn]

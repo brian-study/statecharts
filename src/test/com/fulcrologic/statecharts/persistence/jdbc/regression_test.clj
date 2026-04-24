@@ -213,23 +213,14 @@
             "cancelled jobs should be visible to the reconciler for terminal event dispatch")))))
 
 ;; -----------------------------------------------------------------------------
-;; Finding #5 (MEDIUM) — datasource-closed? doesn't handle non-HikariCP DataSources
+;; Finding #5 (MEDIUM) — superseded by #K
 ;; -----------------------------------------------------------------------------
 ;;
-;; `datasource-closed?` reflects for an `isClosed` method and returns false if
-;; absent. A bare `javax.sql.DataSource` has no isClosed method — the event loop
-;; will never auto-stop, and a failing DataSource pegs CPU at poll cadence.
-
-(deftest datasource-closed-detects-all-datasource-shapes-test
-  (testing "datasource-closed? should signal closed for any DataSource that cannot issue connections"
-    (let [closed?-fn @#'pg-sc/datasource-closed?
-          ;; A DataSource whose getConnection always throws — effectively closed.
-          ;; Does not expose an isClosed method.
-          perma-closed-ds (reify javax.sql.DataSource
-                            (getConnection [_]
-                              (throw (java.sql.SQLException. "pool closed"))))]
-      (is (true? (closed?-fn perma-closed-ds))
-          "datasource-closed? should recognise a DataSource whose getConnection consistently fails as closed"))))
+;; The original #5 fix added a getConnection probe fallback to treat
+;; non-Hikari DataSources as "closed" when their connections throw. That's
+;; wrong: a single failed getConnection call can't distinguish a permanent
+;; shutdown from a transient outage. #K (below) inverts the expectation —
+;; bare DataSources return false, and the caller can use `stop!` explicitly.
 
 ;; -----------------------------------------------------------------------------
 ;; Finding #8 (LOW) — Event :type namespace stripped on queue round-trip
@@ -438,6 +429,120 @@
 ;; strings: `(edn/read-string "my-invoke")` returns the SYMBOL `my-invoke`, not
 ;; a string, so no exception fires. The pre-2.0.4 behaviour was to hand back
 ;; the raw string. A legacy-shaped row must still decode to the string.
+;; -----------------------------------------------------------------------------
+;; Finding #G (P1) — invokeid->str strips the first char from non-keyword values
+;; -----------------------------------------------------------------------------
+;;
+;; `(subs (str invokeid) 1)` only makes sense for keywords (where `(str :k)` has
+;; a leading ':'). For string/UUID/number invoke-ids (allowed by ::sc/id and
+;; possible via idlocation), this corrupts storage: "report" → "eport", 42 → "2".
+;; The worker then builds done.invoke.*/error.invoke.* from the corrupted value
+;; and the parent never receives its terminal event.
+
+(deftest invokeid->str-preserves-non-keyword-values-test
+  (testing "invokeid->str must not corrupt non-keyword invoke-ids"
+    (is (= "report" (job-store/invokeid->str "report"))
+        "string invoke-id must not have first char stripped")
+    (is (= "42" (job-store/invokeid->str 42))
+        "numeric invoke-id must not have first char stripped")
+    (let [uuid (UUID/randomUUID)]
+      (is (= (str uuid) (job-store/invokeid->str uuid))
+          "UUID invoke-id must preserve full string form"))
+    (is (= "my-invoke" (job-store/invokeid->str :my-invoke))
+        "keyword invoke-id serialization is preserved for back-compat")
+    (is (= "my-ns/my-invoke" (job-store/invokeid->str :my-ns/my-invoke))
+        "namespaced keyword invoke-id serialization is preserved for back-compat")))
+
+;; -----------------------------------------------------------------------------
+;; Finding #H (P2) — invoke-data-keys throws on UUID/number invoke-ids
+;; -----------------------------------------------------------------------------
+;;
+;; `(name invokeid)` only accepts strings/keywords/symbols. For a UUID or
+;; numeric invoke-id (valid ::sc/id shapes), start-invocation! throws AFTER
+;; create-job! has already inserted the pending row — leaving an orphaned job.
+
+(deftest invoke-data-keys-handles-any-id-shape-test
+  (testing "invoke-data-keys must accept all ::sc/id shapes without throwing"
+    (doseq [iid ["report" 42 (UUID/randomUUID) :kw :my-ns/kw]]
+      (let [{:keys [job-id-key job-kind-key]} (durable-job/invoke-data-keys iid)]
+        (is (keyword? job-id-key)
+            (str ":job-id-key must be a keyword for invokeid=" (pr-str iid)))
+        (is (keyword? job-kind-key)
+            (str ":job-kind-key must be a keyword for invokeid=" (pr-str iid)))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #I (P2) — future invocation error send omits :invoke-id
+;; -----------------------------------------------------------------------------
+;;
+;; handle-external-invocations! matches terminal events to <invoke> elements by
+;; :invokeid. The error.invoke.* send from future.clj lacks it, so finalize
+;; content and autoforward are skipped on the failure path.
+
+(deftest future-invocation-error-event-includes-invoke-id-test
+  (testing "future-backed invocation error.invoke.* send includes :invoke-id"
+    (let [sent        (atom nil)
+          event-queue (reify sp/EventQueue
+                        (send! [_ _env send-request]
+                          (reset! sent send-request)
+                          true)
+                        (cancel! [_ _env _sid _sendid] true)
+                        (receive-events! [_ _env _h] nil)
+                        (receive-events! [_ _env _h _opts] nil))
+          env         {::sc/session-id   :future-parent
+                       ::sc/event-queue  event-queue
+                       ::sc/vwmem        (volatile! {::sc/session-id :future-parent})}
+          processor   ((requiring-resolve 'com.fulcrologic.statecharts.invocation.future/new-future-processor))
+          throwing-fn (fn [_params] (throw (ex-info "boom" {})))]
+      (sp/start-invocation! processor env
+        {:invokeid :my-future-invoke
+         :src      throwing-fn
+         :params   {}})
+      ;; Give the future a moment to run & send its error event.
+      (let [deadline (+ (System/currentTimeMillis) 2000)]
+        (while (and (nil? @sent) (< (System/currentTimeMillis) deadline))
+          (Thread/sleep 10)))
+      (is (some? @sent) "future invocation should have sent an error event")
+      (is (or (:invoke-id @sent) (:invokeid @sent))
+          ":error.invoke.* send must carry :invoke-id for invocation matching"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #J (P2) — start-event-loop! hides the wake-signal from send!
+;; -----------------------------------------------------------------------------
+;;
+;; env-with-signal is only visible inside start-event-loop!'s closure. Callers
+;; keep their original env, so `pg/send! env …` sees `::wake-signal = nil` and
+;; can't wake the loop. Same-JVM events still wait up to poll-interval-ms.
+
+(deftest ^:integration start-event-loop-exposes-wake-signal-test
+  (testing "start-event-loop! returns an env that carries the wake-signal"
+    (let [env    (pg-sc/pg-env {:datasource *pool*})
+          result (pg-sc/start-event-loop! env 10000)]
+      (try
+        (let [loop-env (or (:env result) env)
+              signal   (or (::pg-sc/wake-signal loop-env)
+                           (:wake-signal result))]
+          (is (some? signal)
+              "start-event-loop! must expose the wake-signal via :env (or equivalent) so send! can wake the loop"))
+        (finally ((:stop! result)))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #K (P1) — datasource-closed? treats transient failures as permanent
+;; -----------------------------------------------------------------------------
+;;
+;; For DataSources that don't implement isClosed(), any getConnection exception
+;; is treated as a permanent shutdown. A transient outage or temporary pool
+;; exhaustion will flip running=false and stop the event loop forever instead
+;; of retrying on the next poll.
+
+(deftest datasource-closed-does-not-flag-transient-failures-test
+  (testing "datasource-closed? must not treat transient getConnection failures as permanent"
+    (let [closed?-fn @#'pg-sc/datasource-closed?
+          transient-ds (reify javax.sql.DataSource
+                         (getConnection [_]
+                           (throw (java.sql.SQLException. "connection refused — transient"))))]
+      (is (false? (closed?-fn transient-ds))
+          "bare DataSource without isClosed must NOT be reported as closed — we can't distinguish transient outages from shutdown"))))
+
 (deftest ^:integration legacy-invoke-id-decodes-as-string-test
   (testing "rows written pre-2.0.4 with bare-string invoke-id still decode as strings"
     (let [queue     (pg-eq/new-queue *pool* "legacy-invoke-id")
