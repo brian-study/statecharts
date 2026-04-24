@@ -1,3 +1,39 @@
+2.0.15
+------
+
+Review follow-ups on 2.0.14.
+
+* **[P3]** `tagged-number-re` now accepts scientific-notation
+  BigDecimals (`1E+10M`, `9.99E+50M`, `1.5E-10M`, …). Clojure's
+  `pr-str` produces `E+` / `E-` forms for BigDecimals outside a narrow
+  magnitude window, so the 2.0.14 regex silently failed to round-trip
+  any BigDecimal whose magnitude pushed it into scientific notation
+  (roughly `|x| >= 1e7` or very small unscaled values). Regex is now
+  `#"-?\d+(\.\d+)?([Ee][+-]?\d+)?[NM]|-?\d+/-?\d+"`. Regression:
+  scientific-notation cases added to `number-subtypes-round-trip-test`.
+
+* **Migration note (missing from 2.0.14)** — pre-2.0.14 BigInt session
+  ids were written via `session-id->str`'s old `:else` branch, i.e.
+  `(str 42N) = "42"` (no `N` marker). Starting at 2.0.14, those legacy
+  bare-`"42"` rows decode as `Long 42` rather than `BigInt 42N`. This
+  is the same type of silent narrowing that 2.0.13's CHANGELOG flagged
+  for digit-only string session-ids; it was just never called out for
+  the BigInt case. Users with BigInt session-ids pre-2.0.14 will see
+  their type narrow to Long on read. Re-save to restore BigInt
+  identity. Pinning test: legacy-bigint case in
+  `number-subtypes-round-trip-test`.
+
+* Defensive pinning tests added so that future refactors fail loudly:
+  `re-matches` → `re-find` regression would silently accept trailing
+  junk like `"42Nabc"` → now covered; `resolve-invocation-session-id`
+  tier-3 requiring `state-map` in an `and` refactor would break
+  callers who pass `nil` state-map → now covered; new `fulcro-api-spec`
+  behavior pins tier-3 with nil state-map.
+
+* Docstring: `resolve-invocation-session-id` tier 3 now explicitly
+  states it fires regardless of `state-map` (the previous doc implied
+  state-map presence was relevant).
+
 2.0.14
 ------
 

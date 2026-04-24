@@ -1036,7 +1036,15 @@
                -3.14M
                0.001M
                (/ 1 2)
-               (/ -3 7)]]
+               (/ -3 7)
+               ;; Scientific-notation BigDecimals — Clojure's pr-str produces
+               ;; `E+` / `E-` forms for values outside a narrow magnitude
+               ;; window, so the decoder must accept those shapes too.
+               1E+10M
+               1E+100M
+               1E-10M
+               9.99E+50M
+               1.5E-10M]]
       (let [stored    (core/session-id->str n)
             read-back (core/str->session-id stored)]
         (is (= n read-back)
@@ -1052,4 +1060,22 @@
   (testing "legacy bare non-numeric strings still decode as strings (no false-positive EDN read)"
     (doseq [s ["my-session" "legacy-bare" "foo-bar-baz"]]
       (is (= s (core/str->session-id s))
-          (str "bare string " (pr-str s) " must not be misread as a symbol by EDN")))))
+          (str "bare string " (pr-str s) " must not be misread as a symbol by EDN"))))
+
+  (testing "trailing-garbage after tagged-numeric shape does not pass the regex gate"
+    ;; If someone future-refactors re-matches → re-find, the gate's safety
+    ;; margin disappears silently. Pin that trailing junk stays string so
+    ;; that refactor fails loudly.
+    (doseq [s ["42Nabc" "1/2xyz" "3.14Mfoo" "1E+10Mbar"]]
+      (is (= s (core/str->session-id s))
+          (str "input " (pr-str s) " has trailing junk; must not decode as a number"))))
+
+  (testing "legacy pre-2.0.14 BigInt rows (stored via (str n) as bare \"42\") decode as Long"
+    ;; Pre-2.0.14, session-id->str's :else branch produced (str 42N) = "42"
+    ;; (no N marker). Post-2.0.14 those legacy rows decode as Long 42, not
+    ;; BigInt 42N — a silent type narrow. Documented in CHANGELOG 2.0.15.
+    (let [legacy-bigint-row "42"]
+      (is (= 42 (core/str->session-id legacy-bigint-row))
+          "pre-2.0.14 BigInt row decodes as Long (documented migration)")
+      (is (= Long (class (core/str->session-id legacy-bigint-row)))
+          "class is Long, not BigInt — users relying on class identity must re-save"))))

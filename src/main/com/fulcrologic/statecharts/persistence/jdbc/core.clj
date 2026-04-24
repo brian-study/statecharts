@@ -49,7 +49,14 @@
     :else                 (str session-id)))
 
 (def ^:private tagged-number-re
-  #"-?\d+(\.\d+)?[NM]|-?\d+/-?\d+")
+  ;; Matches Clojure literals produced by pr-str for BigInt / BigDecimal / Ratio:
+  ;;   42N, -42N, 99999999999N        — BigInt
+  ;;   3.14M, -0.001M, 0M             — plain BigDecimal
+  ;;   1E+10M, 9.99E+50M, 1.5E-10M    — scientific BigDecimal (Clojure produces
+  ;;                                     these for values outside a narrow
+  ;;                                     magnitude window)
+  ;;   1/2, -3/7                      — Ratio
+  #"-?\d+(\.\d+)?([Ee][+-]?\d+)?[NM]|-?\d+/-?\d+")
 
 (defn str->session-id
   "Convert a string from database back to original session ID type.

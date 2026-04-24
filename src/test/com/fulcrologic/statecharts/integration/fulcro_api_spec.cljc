@@ -441,7 +441,20 @@
   (behavior "falls back to stored-id when no parent provided"
     (assertions
       "no parent → cannot scope, keep raw stored-id"
-      (scf/resolve-invocation-session-id {} nil "some-id") => "some-id")))
+      (scf/resolve-invocation-session-id {} nil "some-id") => "some-id"))
+
+  (behavior "returns scoped-id when state-map is nil (tier 3 fires regardless of state-map)"
+    ;; Pinning: tier 3 fires whenever parent-session-id is present, including
+    ;; when state-map is nil. If someone future-refactors the cond to require
+    ;; state-map for this branch, this test breaks loudly.
+    (let [parent-id "parent-sess"
+          stored-id "invoke-key"
+          scoped-id (str parent-id "." stored-id)]
+      (assertions
+        "nil state-map with parent → returns scoped-id as best-guess"
+        (scf/resolve-invocation-session-id nil parent-id stored-id) => scoped-id
+        "nil state-map without parent → returns stored-id unchanged"
+        (scf/resolve-invocation-session-id nil nil "some-id") => "some-id"))))
 
 (specification {:covers {`scf/install-fulcro-statecharts! "PLACEHOLDER"}} "install-fulcro-statecharts!"
   (behavior "installs statechart system on app"

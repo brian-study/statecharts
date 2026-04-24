@@ -76,9 +76,10 @@
       Covers the case where the child was started with an explicit, unscoped
       session-id.
    3. `parent-session-id` is present (scoped-id is computable) → return the
-      scoped id as a best-guess, even if no matching session is in `state-map`.
-      Allows callers to address a child that will be created imminently
-      (eventual consistency / pre-mount addressing).
+      scoped id as a best-guess. Fires regardless of `state-map` — so it is
+      also the branch used when `state-map` is `nil` (no Fulcro state
+      available). Allows callers to address a child that will be created
+      imminently (eventual consistency / pre-mount addressing).
    4. Otherwise → return `stored-id` unchanged.
 
    Returns `nil` when `stored-id` is `nil`."
