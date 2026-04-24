@@ -2,12 +2,18 @@
     {:tests    [{:id           :unit
                  :ns-patterns  ["-test$" "-spec$"]
                  :test-paths   ["src/test"]
-                 :skip-meta    [:integration]
+                 :skip-meta    [:integration :known-failing]
                  :source-paths ["src/main"]}
                 {:id           :integration
                  :ns-patterns  ["-test$" "-spec$"]
                  :test-paths   ["src/test"]
                  :focus-meta   [:integration]
+                 :skip-meta    [:known-failing]
+                 :source-paths ["src/main"]}
+                {:id           :known-failing
+                 :ns-patterns  ["-test$" "-spec$"]
+                 :test-paths   ["src/test"]
+                 :focus-meta   [:known-failing]
                  :source-paths ["src/main"]}]
      ;:reporter [fulcro-spec.reporters.terminal/fulcro-report]
      :color? false
