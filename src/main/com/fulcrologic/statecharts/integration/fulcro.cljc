@@ -66,12 +66,22 @@
 (defn resolve-invocation-session-id
   "Resolve a stored SCXML invokeid to the actual child session ID.
 
-   `stored-id` is typically the raw value written to `:idlocation`. If Fulcro
-   `state-map` is available, this prefers the fork's scoped child-session
-   convention (`<parent-session-id>.<invokeid>`) whenever such a session exists,
-   so a top-level session whose id happens to collide with the invokeid never
-   shadows the real child. Falls back to `stored-id` only when no scoped child
-   is present but a top-level session with `stored-id` is."
+   `stored-id` is typically the raw value written to `:idlocation`. Resolution
+   tiers (in order):
+
+   1. Scoped child session `<parent-session-id>.<invokeid>` exists in
+      `state-map` → return it. This is the fork convention and wins over
+      stored-id so a colliding top-level session can't shadow the real child.
+   2. Top-level session with id `stored-id` exists in `state-map` → return it.
+      Covers the case where the child was started with an explicit, unscoped
+      session-id.
+   3. `parent-session-id` is present (scoped-id is computable) → return the
+      scoped id as a best-guess, even if no matching session is in `state-map`.
+      Allows callers to address a child that will be created imminently
+      (eventual consistency / pre-mount addressing).
+   4. Otherwise → return `stored-id` unchanged.
+
+   Returns `nil` when `stored-id` is `nil`."
   [state-map parent-session-id stored-id]
   (when stored-id
     (let [scoped-id (when parent-session-id

@@ -1,3 +1,35 @@
+2.0.14
+------
+
+Review follow-ups on 2.0.13.
+
+* **[P3]** `session-id->str` / `str->session-id` now preserve every
+  `number?` subtype (`Long`, `Double`, `BigInt`, `BigDecimal`, `Ratio`)
+  rather than just `Long` / `Double`. `::sc/id` is
+  `[:or uuid? number? keyword? string?]`, so all of these are
+  legitimate session-id shapes. `session-id->str` now writes numbers
+  via `pr-str`, which keeps the `N` / `M` / ratio tags; plain
+  `Long` / `Double` still serialize to the same bare form as 2.0.13.
+  `str->session-id` adds a gated `edn/read-string` branch for
+  `<digits>N` / `<digits>.<digits>M` / `<int>/<int>` shapes. The regex
+  gate keeps legacy bare strings like `"my-session"` from accidentally
+  parsing as symbols. Regression: `number-subtypes-round-trip-test`
+  plus new `core-spec` cases.
+
+* Cleanup: removed the dead `(symbol? session-id)` branch in
+  `session-id->str`. `::sc/id` does not permit symbols, and the branch
+  was semantically identical to the `:else` `(str x)` fallback (since
+  `pr-str` of a symbol does not add a marker, unlike for keywords or
+  strings). Updated `core-spec` to pin the new behavior: symbols go
+  through `:else` and do not round-trip.
+
+* Docstring fixes: `session-id->str` doc no longer claims symbols
+  keep a marker (they never did). `str->session-id` doc now mentions
+  the 2.0.13 migration note in-place (legacy pre-2.0.11 digit-only
+  strings decode as numbers). `integration.fulcro/resolve-invocation-
+  session-id` doc now describes all four resolution tiers — the
+  previous doc omitted the "scoped-id as best-guess fallback" arm.
+
 2.0.13
 ------
 

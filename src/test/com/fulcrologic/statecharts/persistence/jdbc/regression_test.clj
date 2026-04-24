@@ -1016,3 +1016,40 @@
             read-back (core/str->session-id stored)]
         (is (= s read-back)
             (str "string session-id " (pr-str s) " must not be coerced to a number"))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #Y (P3) — all `number?` subtypes must round-trip, not just Long/Double
+;; -----------------------------------------------------------------------------
+;;
+;; `::sc/id` is `[:or uuid? number? keyword? string?]`. The 2.0.13 fix covered
+;; Long/Double but let BigInt (42N), BigDecimal (3.14M), and Ratio (1/2) degrade:
+;; BigInt would narrow to Long, BigDecimal and Ratio would read back as strings.
+;; `session-id->str` now uses pr-str for numbers (which preserves N / M / ratio
+;; tags) and `str->session-id` recognises tagged numeric forms.
+
+(deftest number-subtypes-round-trip-test
+  (testing "BigInt / BigDecimal / Ratio session-ids preserve their type"
+    (doseq [n [42N
+               -42N
+               (bigint "99999999999999999999999")
+               3.14M
+               -3.14M
+               0.001M
+               (/ 1 2)
+               (/ -3 7)]]
+      (let [stored    (core/session-id->str n)
+            read-back (core/str->session-id stored)]
+        (is (= n read-back)
+            (str "numeric session-id " (pr-str n)
+                 " (" (.getSimpleName (class n)) ") must round-trip with its type;"
+                 " stored=" (pr-str stored)
+                 " read-back=" (pr-str read-back)
+                 " (" (some-> read-back class .getSimpleName) ")"))
+        (is (= (class n) (class read-back))
+            (str "type of read-back for " (pr-str n)
+                 " must equal input type; got " (pr-str (class read-back)))))))
+
+  (testing "legacy bare non-numeric strings still decode as strings (no false-positive EDN read)"
+    (doseq [s ["my-session" "legacy-bare" "foo-bar-baz"]]
+      (is (= s (core/str->session-id s))
+          (str "bare string " (pr-str s) " must not be misread as a symbol by EDN")))))

@@ -30,13 +30,6 @@
         "deeply namespaced keywords work"
         (core/session-id->str :com.example/session) => ":com.example/session"))
 
-    (behavior "handles symbol session IDs"
-      (assertions
-        "simple symbols"
-        (core/session-id->str 'my-session) => "my-session"
-        "namespaced symbols"
-        (core/session-id->str 'ns/my-session) => "ns/my-session"))
-
     (behavior "handles UUID session IDs"
       (let [uuid (java.util.UUID/fromString "550e8400-e29b-41d4-a716-446655440000")]
         (assertions
@@ -50,7 +43,24 @@
         "longs"
         (core/session-id->str 9999999999999) => "9999999999999"
         "negative numbers"
-        (core/session-id->str -1) => "-1")))
+        (core/session-id->str -1) => "-1"
+        "BigInt is tagged (so type can be recovered on read)"
+        (core/session-id->str 42N) => "42N"
+        "BigDecimal is tagged"
+        (core/session-id->str 3.14M) => "3.14M"
+        "Ratio is written with a slash"
+        (core/session-id->str (/ 1 2)) => "1/2"))
+
+    (behavior "handles symbols via the :else fallback (symbols are not in ::sc/id)"
+      ;; ::sc/id is [:or uuid? number? keyword? string?] — symbols aren't in
+      ;; the spec. The :else branch uses (str x), so symbols go through but
+      ;; do NOT round-trip (they come back as strings or numbers depending
+      ;; on content). Pinned here so the degradation is explicit.
+      (assertions
+        "simple symbols degrade to bare name"
+        (core/session-id->str 'my-session) => "my-session"
+        "namespaced symbols degrade to bare name"
+        (core/session-id->str 'ns/my-session) => "ns/my-session")))
 
   (component "str->session-id"
     (behavior "handles nil input"
@@ -94,7 +104,22 @@
         "bare double → double"
         (core/str->session-id "3.14") => 3.14
         "strings that need to stay as strings must be written via pr-str (quoted)"
-        (core/str->session-id "\"42\"") => "42")))
+        (core/str->session-id "\"42\"") => "42"))
+
+    (behavior "handles tagged numeric subtypes (BigInt / BigDecimal / Ratio)"
+      (assertions
+        "BigInt (42N)"
+        (core/str->session-id "42N") => 42N
+        "negative BigInt"
+        (core/str->session-id "-42N") => -42N
+        "BigDecimal (3.14M)"
+        (core/str->session-id "3.14M") => 3.14M
+        "negative BigDecimal"
+        (core/str->session-id "-3.14M") => -3.14M
+        "Ratio"
+        (core/str->session-id "1/2") => (/ 1 2)
+        "negative-numerator Ratio"
+        (core/str->session-id "-3/7") => (/ -3 7)))))
 
   (component "session-id roundtrip"
     (behavior "preserves keyword identity"
@@ -124,7 +149,13 @@
         "double"
         (-> 3.14 core/session-id->str core/str->session-id) => 3.14
         "negative number"
-        (-> -1 core/session-id->str core/str->session-id) => -1))))
+        (-> -1 core/session-id->str core/str->session-id) => -1
+        "BigInt keeps its type"
+        (-> 42N core/session-id->str core/str->session-id) => 42N
+        "BigDecimal keeps its type"
+        (-> 3.14M core/session-id->str core/str->session-id) => 3.14M
+        "Ratio keeps its type"
+        (-> (/ 1 2) core/session-id->str core/str->session-id) => (/ 1 2))))
 
 (specification "Nippy Serialization (freeze/thaw)"
   (component "freeze"

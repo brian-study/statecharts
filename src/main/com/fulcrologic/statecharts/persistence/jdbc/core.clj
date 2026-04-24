@@ -30,19 +30,26 @@
 (defn session-id->str
   "Convert a session ID to a string for database storage.
 
-   Keywords (`:kw` / `:ns/kw`) and symbols are stored via `pr-str` so
-   they keep their leading `:` / namespace / symbol markers. UUIDs are
-   stored in their bare string form (no tag) — back-compat with pre-
-   2.0.11 deployments. Strings are stored via `pr-str` (quoted) so the
-   decoder can distinguish a user-supplied string that happens to look
-   like a UUID or keyword from a genuine UUID / keyword session id."
+   `::sc/id` allows `[:or uuid? number? keyword? string?]`. Each type is written
+   so the inverse `str->session-id` can recover it:
+   - **Strings** via `pr-str` (quoted) so `\"42\"`, `\":kw\"`, or a UUID-shaped
+     string can't be mis-decoded as another type.
+   - **Keywords** via `pr-str` (keeps leading `:` / namespace).
+   - **UUIDs** bare (`(str uuid)`) — back-compat with pre-2.0.11 deployments.
+   - **Numbers** via `pr-str` — preserves `N` / `M` / ratio tags for BigInt,
+     BigDecimal, and Ratio. Plain Long and Double pr-str to the same bare
+     form as `(str n)`, so on-disk shape for Long/Double is unchanged from
+     2.0.12."
   [session-id]
   (cond
     (string? session-id)  (pr-str session-id)
     (keyword? session-id) (pr-str session-id)
-    (symbol? session-id)  (pr-str session-id)
     (uuid? session-id)    (str session-id)
+    (number? session-id)  (pr-str session-id)
     :else                 (str session-id)))
+
+(def ^:private tagged-number-re
+  #"-?\d+(\.\d+)?[NM]|-?\d+/-?\d+")
 
 (defn str->session-id
   "Convert a string from database back to original session ID type.
@@ -50,16 +57,33 @@
    Shape-inspecting inverse of `session-id->str`:
    - leading `\"` → EDN read (quoted string form)
    - leading `:` → EDN read (keyword)
-   - parses as long/double → number (SCXML `::sc/id` allows numbers)
+   - parses as long/double → number (most numeric session-ids)
+   - matches `<digits>N` / `<digits>.<digits>M` / `<int>/<int>` → EDN read
+     (BigInt / BigDecimal / Ratio — other `number?` subtypes allowed by
+     `::sc/id`)
    - looks like a UUID → UUID
    - otherwise → bare string (legacy rows pre-2.0.11 that stored strings
-     unquoted)."
+     unquoted)
+
+   Migration note (2.0.13): legacy pre-2.0.11 rows that stored a *string*
+   session-id whose contents were digit-only (e.g. `\"12345\"`) will now
+   decode as the number `12345`. Post-2.0.11 rows are unaffected because
+   strings carry the pr-str quote marker."
   [s]
   (when s
     (cond
       (.startsWith ^String s "\"") (try (edn/read-string s) (catch Exception _ s))
       (.startsWith ^String s ":")  (try (edn/read-string s) (catch Exception _ s))
-      :else                        (or (parse-long s) (parse-double s) (parse-uuid s) s))))
+      :else                        (or (parse-long s)
+                                       (parse-double s)
+                                       (parse-uuid s)
+                                       ;; Tagged numeric forms (42N, 3.14M, 1/2).
+                                       ;; Gated on the regex so legacy bare
+                                       ;; string ids like "my-session" don't
+                                       ;; accidentally read as a symbol.
+                                       (when (re-matches tagged-number-re s)
+                                         (try (edn/read-string s) (catch Exception _ nil)))
+                                       s))))
 
 ;; -----------------------------------------------------------------------------
 ;; Binary Serialization (nippy)
