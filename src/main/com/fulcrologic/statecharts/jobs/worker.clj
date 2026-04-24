@@ -240,9 +240,12 @@
 
 (defn- execute-claimed-job!
   [pool event-queue env handlers owner-id exec-opts job]
+  ;; As of 2.0.22 `hydrate-job-row` decodes `:job-type` back to its original
+  ;; typed value (keyword, symbol, UUID, string, number) via `str->job-type`,
+  ;; so handler lookup is a direct `get` on the typed key — no keyword-of-a-
+  ;; string coercion, and namespaced keywords round-trip correctly.
   (let [job-type (:job-type job)
-        handler-fn (or (get handlers (keyword job-type))
-                       (get handlers job-type))]
+        handler-fn (get handlers job-type)]
     (if handler-fn
       (execute-job! pool event-queue env job handler-fn owner-id exec-opts)
       (do

@@ -1,3 +1,23 @@
+2.0.22
+------
+
+* **[P2]** `statechart_jobs.job_type` is now stored as a self-describing
+  tagged literal (`pr-str`) and decoded via `edn/read-string` in
+  `hydrate-job-row`. Consolidates encoding into the lib — prior to
+  2.0.22, callers hand-rolled `(name src)` / `(subs (str src) 1)`
+  to produce a bare-name string, which silently dropped namespaces on
+  keys like `:my.app/x` (handler lookup then missed the registered
+  handler). The new `job-type->str` / `str->job-type` mirror the
+  existing `invokeid->str` / `str->invokeid` scheme: bare-unless-
+  numeric keywords stay bare for back-compat, and anything else
+  (strings, UUIDs, numbers, numeric-named keywords) carries a type
+  marker so the decoder can reconstruct the original value. Legacy
+  pre-2.0.22 rows decode via `:legacy-fallback :keyword`, preserving
+  the existing `(keyword job-type)` semantics for rolling upgrades.
+  The worker's handler lookup drops the `(keyword job-type)`
+  coercion because `job-type` in a hydrated row is already the
+  decoded keyword/symbol/UUID/number/string.
+
 2.0.21
 ------
 

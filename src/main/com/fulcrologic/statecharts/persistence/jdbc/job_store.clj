@@ -56,6 +56,37 @@
   [s]
   (core/decode-id s {:legacy-fallback :keyword}))
 
+(defn job-type->str
+  "Serialize a job-type to a string for DB storage.
+
+   Mirrors `invokeid->str`'s scheme so the on-disk form is
+   self-describing: keywords with non-numeric names are stored bare
+   (`:video-url-validation` → `\"video-url-validation\"`), namespaced
+   keywords preserve their namespace (`:my.app/x` → `\"my.app/x\"`),
+   and anything else (numeric-named keyword, UUID, string, number)
+   is stored via `pr-str` with a type marker the decoder can read
+   back.
+
+   Before 2.0.22, callers hand-rolled this encoding — typically
+   `(name src)`, which silently dropped namespaces. Consolidating
+   here makes the lib the sole owner of the job-type shape and
+   fixes the namespace bug by construction."
+  [job-type]
+  (core/encode-id job-type {:uuid-shape    :tagged
+                            :keyword-shape :bare-unless-numeric
+                            :symbol-shape  :bare-unless-numeric}))
+
+(defn str->job-type
+  "Deserialize a stored job_type back into its original type.
+
+   Shape-aware inverse of `job-type->str`. Legacy-fallback is
+   `:keyword` so pre-2.0.22 rows (bare name without a type marker,
+   e.g. `\"video-url-validation\"`) continue to decode to the matching
+   keyword for handler lookup. Rolling upgrades are safe: old rows
+   keep working, new rows carry the marker."
+  [s]
+  (core/decode-id s {:legacy-fallback :keyword}))
+
 ;; -----------------------------------------------------------------------------
 ;; Internal Helpers
 ;; -----------------------------------------------------------------------------
@@ -78,11 +109,13 @@
      :extra-params []}))
 
 (defn- hydrate-job-row
-  "Decode persisted fields and restore session-id shape for runtime use."
+  "Decode persisted fields and restore session-id / job-type shape for
+   runtime use."
   [row]
   (-> row
       (update :session-id core/str->session-id)
       (update :invokeid str->invokeid)
+      (update :job-type str->job-type)
       (update :payload core/thaw)
       (cond->
         (:result row) (update :result core/thaw)
@@ -115,12 +148,13 @@
        :or {max-attempts 3}}]
   (let [sid-str (core/session-id->str session-id)
         iid-str (invokeid->str invokeid)
+        jt-str (job-type->str job-type)
         insert-sql (str "INSERT INTO statechart_jobs (id, session_id, invokeid, job_type, payload, max_attempts)"
                         " VALUES (?, ?, ?, ?, ?, ?)"
                         " ON CONFLICT (session_id, invokeid) WHERE status IN ('pending', 'running')"
                         " DO NOTHING"
                         " RETURNING id")
-        insert-params [id sid-str iid-str job-type (core/freeze payload) max-attempts]
+        insert-params [id sid-str iid-str jt-str (core/freeze payload) max-attempts]
         try-insert! (fn []
                       (let [result (core/execute-sql! ds insert-sql insert-params)]
                         (or (some-> (when (sequential? result) (first result)) :id)
