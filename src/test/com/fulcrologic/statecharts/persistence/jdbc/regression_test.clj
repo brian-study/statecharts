@@ -771,4 +771,79 @@
           env (pg-sc/pg-env {:datasource :fake-pool
                              :processor  custom-processor})]
       (is (identical? custom-processor (::sc/processor env))
-          "pg-env must honour :processor so async execution models can be paired with the async algorithm"))))
+          "pg-env must honour :processor so async execution models can be paired with the async algorithm")))
+  (testing "pg-env rejects a :processor that doesn't implement sp/Processor"
+    (is (thrown? AssertionError
+                 (pg-sc/pg-env {:datasource :fake-pool :processor "not-a-processor"}))
+        "type-check should fire at construction time, not later when the chart tries to run")))
+
+;; -----------------------------------------------------------------------------
+;; Finding #Q (P2) — orphaned statechart_definitions table/DDL
+;; -----------------------------------------------------------------------------
+;;
+;; JdbcStatechartRegistry was deleted in 2.0.10 but schema.clj still creates
+;; the `statechart_definitions` table and the README still documents it.
+;; Dead DDL + misleading docs: a fresh install creates an unused table.
+
+(deftest ^:integration create-tables-does-not-create-definitions-table-test
+  (testing "the statechart_definitions table is not created by create-tables! after registry removal"
+    (schema/drop-tables! *pool*)
+    (schema/create-tables! *pool*)
+    (let [tables (into #{}
+                       (map :tablename)
+                       (core/execute-sql! *pool*
+                         "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"))]
+      (is (not (contains? tables "statechart_definitions"))
+          (str "statechart_definitions should not be created — JdbcStatechartRegistry was deleted in 2.0.10. "
+               "Tables present: " tables))
+      (is (contains? tables "statechart_jobs")
+          "sanity check: other tables still created")
+      (is (contains? tables "statechart_events")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #R (P3) — future cancellation detection misses wrapped interrupts
+;; -----------------------------------------------------------------------------
+;;
+;; If the future body catches InterruptedException internally and rethrows
+;; a wrapping exception (e.g. ExecutionException, CompletionException, or a
+;; domain-specific wrapper), the 2.0.10 catch only checks the top-level
+;; exception type and misclassifies cancellation as a real failure.
+
+(deftest future-cancellation-with-wrapped-interrupt-is-suppressed-test
+  (testing "cancellation is suppressed even when the body wraps InterruptedException"
+    (let [sent        (atom [])
+          event-queue (reify sp/EventQueue
+                        (send! [_ _env req] (swap! sent conj req) true)
+                        (cancel! [_ _env _sid _sendid] true)
+                        (receive-events! [_ _env _h] nil)
+                        (receive-events! [_ _env _h _opts] nil))
+          env         {::sc/session-id  :wrap-parent
+                       ::sc/event-queue event-queue
+                       ::sc/vwmem       (volatile! {::sc/session-id :wrap-parent})}
+          processor   ((requiring-resolve 'com.fulcrologic.statecharts.invocation.future/new-future-processor))
+          started     (promise)
+          wrapping-fn (fn [_params]
+                        (deliver started true)
+                        (try
+                          (Thread/sleep 5000)
+                          {:unreachable true}
+                          (catch InterruptedException e
+                            ;; Wrap like many real codebases do — the raw
+                            ;; InterruptedException is no longer visible at
+                            ;; the top level.
+                            (throw (java.util.concurrent.ExecutionException.
+                                     "wrapping interrupt"
+                                     e)))))]
+      (sp/start-invocation! processor env
+        {:invokeid :wrapped-cancel :src wrapping-fn :params {}})
+      (deref started 2000 :timeout)
+      (sp/stop-invocation! processor env {:invokeid :wrapped-cancel})
+      (Thread/sleep 300)
+      (let [errors (filter (fn [req]
+                             (let [evt (:event req)]
+                               (and (keyword? evt)
+                                    (clojure.string/starts-with? (name evt) "error.invoke"))))
+                           @sent)]
+        (is (empty? errors)
+            (str "cancellation wrapped in ExecutionException must not emit error.invoke.*; got "
+                 (pr-str errors)))))))

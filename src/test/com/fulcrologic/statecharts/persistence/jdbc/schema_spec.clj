@@ -141,30 +141,10 @@
         (assertions
           (some #(clojure.string/includes? % "WHERE") indexes) => true)))))
 
-(specification "Definitions Table DDL"
-  (component "table structure"
-    (let [ddl @#'schema/definitions-ddl]
-      (behavior "contains CREATE TABLE"
-        (assertions
-          (clojure.string/includes? ddl "CREATE TABLE") => true))
-
-      (behavior "creates statechart_definitions table"
-        (assertions
-          (clojure.string/includes? ddl "statechart_definitions") => true))
-
-      (behavior "has src primary key"
-        (assertions
-          (clojure.string/includes? ddl "src") => true
-          (clojure.string/includes? ddl "PRIMARY KEY") => true))
-
-      (behavior "has definition BYTEA column"
-        (assertions
-          (clojure.string/includes? ddl "definition") => true
-          (clojure.string/includes? ddl "BYTEA") => true))
-
-      (behavior "has version column"
-        (assertions
-          (clojure.string/includes? ddl "version") => true)))))
+;; (Definitions Table DDL specification removed — JdbcStatechartRegistry
+;; was deleted in 2.0.10 and the statechart_definitions table is no
+;; longer created by schema/create-tables!. See regression_test.clj
+;; create-tables-does-not-create-definitions-table-test.)
 
 (specification "Jobs Table DDL"
   (component "table structure"
@@ -273,8 +253,8 @@
           (clojure.string/includes? ddl "CASCADE") => true
           (clojure.string/includes? ddl "statechart_events") => true)))
 
-    (behavior "drop definitions uses CASCADE"
-      (let [ddl @#'schema/drop-definitions-ddl]
+    (behavior "legacy definitions drop (still present for migration cleanup) uses CASCADE"
+      (let [ddl @#'schema/drop-legacy-definitions-ddl]
         (assertions
           (clojure.string/includes? ddl "DROP TABLE") => true
           (clojure.string/includes? ddl "CASCADE") => true

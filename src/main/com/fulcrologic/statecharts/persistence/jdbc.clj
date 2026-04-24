@@ -101,6 +101,9 @@
   [{:keys [datasource node-id data-model execution-model invocation-processors processor]
     :or {node-id (str (random-uuid))}}]
   (assert datasource "A javax.sql.DataSource is required under :datasource")
+  (when processor
+    (assert (satisfies? sp/Processor processor)
+            ":processor must implement com.fulcrologic.statecharts.protocols/Processor"))
   (let [dm (or data-model (wmdm/new-flat-model))
         q (pg-eq/new-queue datasource node-id)
         ex (or execution-model (lambda/new-execution-model dm q))

@@ -5,7 +5,8 @@ implementing all three core storage protocols on top of `next.jdbc`:
 
 - **WorkingMemoryStore** - Persist session state across restarts
 - **EventQueue** - Durable event queue with exactly-once delivery
-- **StatechartRegistry** - Store chart definitions in the database
+- Chart definitions are held in an in-memory registry (they contain
+  guards/actions as closures, which can't be serialised)
 
 Consumers pass a `javax.sql.DataSource`. HikariCP is the standard choice but
 any DataSource `next.jdbc` accepts will work.
@@ -276,20 +277,6 @@ CREATE TABLE statechart_events (
     claimed_at          TIMESTAMPTZ,   -- exactly-once delivery
     claimed_by          TEXT,          -- worker node tracking
     processed_at        TIMESTAMPTZ
-);
-```
-
-### statechart_definitions
-
-Stores registered chart definitions:
-
-```sql
-CREATE TABLE statechart_definitions (
-    src              TEXT PRIMARY KEY,
-    definition       BYTEA NOT NULL,
-    version          BIGINT NOT NULL DEFAULT 1,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 

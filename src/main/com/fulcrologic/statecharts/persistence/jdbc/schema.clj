@@ -45,15 +45,6 @@
    "CREATE INDEX IF NOT EXISTS idx_events_cancel ON statechart_events(source_session_id, send_id, deliver_at) WHERE processed_at IS NULL"
    "CREATE INDEX IF NOT EXISTS idx_events_claimed ON statechart_events(claimed_at) WHERE claimed_at IS NOT NULL AND processed_at IS NULL"])
 
-(def ^:private definitions-ddl
-  "CREATE TABLE IF NOT EXISTS statechart_definitions (
-    src              TEXT PRIMARY KEY,
-    definition       BYTEA NOT NULL,
-    version          BIGINT NOT NULL DEFAULT 1,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-  )")
-
 (def ^:private jobs-ddl
   "CREATE TABLE IF NOT EXISTS statechart_jobs (
     id                          UUID PRIMARY KEY,
@@ -95,8 +86,11 @@
 
 (def ^:private drop-sessions-ddl "DROP TABLE IF EXISTS statechart_sessions CASCADE")
 (def ^:private drop-events-ddl "DROP TABLE IF EXISTS statechart_events CASCADE")
-(def ^:private drop-definitions-ddl "DROP TABLE IF EXISTS statechart_definitions CASCADE")
 (def ^:private drop-jobs-ddl "DROP TABLE IF EXISTS statechart_jobs CASCADE")
+;; Legacy table kept out of create-tables! — JdbcStatechartRegistry was
+;; deleted in 2.0.10. drop/truncate still name it so existing deployments
+;; can clean up without a manual migration.
+(def ^:private drop-legacy-definitions-ddl "DROP TABLE IF EXISTS statechart_definitions CASCADE")
 
 ;; -----------------------------------------------------------------------------
 ;; Public API
@@ -112,7 +106,6 @@
   (core/execute-sql! ds-or-conn events-ddl)
   (doseq [idx events-indexes-ddl]
     (core/execute-sql! ds-or-conn idx))
-  (core/execute-sql! ds-or-conn definitions-ddl)
   (core/execute-sql! ds-or-conn jobs-ddl)
   (doseq [idx jobs-indexes-ddl]
     (core/execute-sql! ds-or-conn idx))
@@ -120,12 +113,13 @@
 
 (defn drop-tables!
   "Drop all statechart persistence tables.
-   WARNING: This will delete all data!"
+   WARNING: This will delete all data! Also drops the legacy
+   `statechart_definitions` table from pre-2.0.10 deployments for cleanup."
   [ds-or-conn]
   (core/execute-sql! ds-or-conn drop-jobs-ddl)
   (core/execute-sql! ds-or-conn drop-events-ddl)
   (core/execute-sql! ds-or-conn drop-sessions-ddl)
-  (core/execute-sql! ds-or-conn drop-definitions-ddl)
+  (core/execute-sql! ds-or-conn drop-legacy-definitions-ddl)
   true)
 
 (defn truncate-tables!
@@ -133,5 +127,5 @@
    Removes all data but keeps table structure."
   [ds-or-conn]
   (core/execute-sql! ds-or-conn
-    "TRUNCATE statechart_events, statechart_sessions, statechart_definitions, statechart_jobs RESTART IDENTITY CASCADE")
+    "TRUNCATE statechart_events, statechart_sessions, statechart_jobs RESTART IDENTITY CASCADE")
   true)

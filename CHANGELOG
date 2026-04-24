@@ -1,3 +1,31 @@
+2.0.11
+------
+
+Cleanup follow-ups from the post-2.0.10 review.
+
+* **[P2]** `statechart_definitions` DDL is no longer created. The 2.0.10
+  deletion of `JdbcStatechartRegistry` left the schema, drop, and
+  truncate paths still touching the table. `create-tables!` no longer
+  produces it; `drop-tables!` still drops it (kept as a migration aid
+  for pre-2.0.10 deployments); `truncate-tables!` no longer names it.
+  README chart-definitions section removed. Regression test:
+  `create-tables-does-not-create-definitions-table-test`.
+
+* **[P3]** `invocation/future` cancellation detection now walks the
+  cause chain. A body that catches `InterruptedException` internally
+  and rethrows a wrapping exception (common pattern with
+  `ExecutionException` / `CompletionException` / domain wrappers) used
+  to misclassify cancellation as a real invocation failure. Also
+  restores the thread interrupt flag via
+  `(.interrupt (Thread/currentThread))` when we swallow the interrupt —
+  standard Java convention. Regression test:
+  `future-cancellation-with-wrapped-interrupt-is-suppressed-test`.
+
+* Nit: `pg-env` now asserts `(satisfies? sp/Processor processor)` at
+  construction so misconfiguration fails fast rather than blowing up
+  the first time a chart tries to run. Regression covered by extending
+  `pg-env-accepts-custom-processor-test`.
+
 2.0.10
 ------
 

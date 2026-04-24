@@ -16,6 +16,23 @@
    [com.fulcrologic.statecharts.protocols :as sp]
    [taoensso.timbre :as log]))
 
+(defn- cancellation-exception?
+  "True if the Throwable (or anything in its cause chain) is an
+   Interrupted/Cancellation exception, or the current thread is
+   interrupted.
+
+   Walks `.getCause` because many libraries wrap InterruptedException in
+   ExecutionException / CompletionException / domain wrappers before it
+   reaches our catch. An `instance?` check on the top-level alone would
+   misclassify those as real failures."
+  [^Throwable t]
+  (boolean
+    (or (instance? InterruptedException t)
+        (instance? java.util.concurrent.CancellationException t)
+        (.isInterrupted (Thread/currentThread))
+        (when-let [cause (.getCause t)]
+          (cancellation-exception? cause)))))
+
 (defrecord FutureInvocationProcessor [active-futures]
   sp/InvocationProcessor
   (supports-invocation-type? [_this typ] (= :future typ))
@@ -52,15 +69,20 @@
                             ;; `stop-invocation!` cancels the future, which
                             ;; interrupts its thread — blocking operations
                             ;; inside the body surface as Interrupted /
-                            ;; Cancellation exceptions. That's a normal exit,
-                            ;; not an invocation failure; emitting error.invoke.*
+                            ;; Cancellation exceptions (sometimes wrapped in
+                            ;; ExecutionException / CompletionException / a
+                            ;; domain exception). That's a normal exit, not
+                            ;; an invocation failure; emitting error.invoke.*
                             ;; would drive transitions that should never fire
                             ;; after the state was left.
-                            (if (or (instance? InterruptedException t)
-                                    (instance? java.util.concurrent.CancellationException t)
-                                    (.isInterrupted (Thread/currentThread)))
-                              (log/debug "Future invocation cancelled, suppressing error.invoke.*"
-                                         {:invokeid invokeid})
+                            (if (cancellation-exception? t)
+                              (do
+                                ;; Re-assert the interrupt flag per Java
+                                ;; convention — we're swallowing the
+                                ;; InterruptedException at the boundary.
+                                (.interrupt (Thread/currentThread))
+                                (log/debug "Future invocation cancelled, suppressing error.invoke.*"
+                                           {:invokeid invokeid}))
                               (do
                                 (log/error t "Future invocation failed" {:invokeid invokeid})
                                 (sp/send! event-queue env {:target            source-session-id
