@@ -1,3 +1,66 @@
+2.0.18
+------
+
+Close the five review recommendations on 2.0.17. Shipped together
+since each addresses a gap in the same consolidation refactor.
+
+* **Decoder gating closes two behaviour changes introduced by 2.0.17.**
+  The unified `decode-id` ran its `#`-tagged-literal branch and
+  `parse-uuid` step for every call site regardless of the legacy data
+  each site needed to remain compatible with. Both are now gated on
+  `:legacy-fallback`:
+  - `:string` (session-id) enables `parse-uuid` (pre-2.0.11 wrote
+    UUIDs bare) but disables `#`-read (pre-2.0.11 session-id writers
+    never produced `#` forms; a bare string starting with `#` is raw
+    user content, not a tagged literal). So a pre-2.0.11 session-id
+    row `\"#{1 2 3}\"` stays a string instead of decoding as a set,
+    and `\"#uuid \\\"…\\\"\"` stays a string instead of decoding as a
+    UUID.
+  - `:keyword` (invoke-id) enables `#`-read (post-2.0.4 / post-2.0.8
+    invoke-id writers use `pr-str` for UUIDs and produce `#uuid \"…\"`
+    on disk) but disables `parse-uuid` (pre-2.0.4 / pre-2.0.8 bare
+    invoke-id rows were written via `(name x)` which only accepts
+    keywords/strings, so a UUID-shaped bare row represents a keyword
+    whose name happened to be UUID-shaped — not a UUID).
+  Regressions: `decode-id-preserves-session-id-legacy-behavior-test`,
+  `decode-id-preserves-invoke-id-legacy-behavior-test`,
+  `decode-id-option-matrix-test`.
+
+* **`encode-id` nil handling is explicit.** 2.0.17 dropped the old
+  `session-id->str`'s `:else (str session-id)` branch, so passing `nil`
+  stopped matching any `cond` arm and silently returned `nil` (cond
+  default) for session-ids but `(pr-str nil)` = `\"nil\"` for invoke-ids
+  once the invoke-id encoder was also routed through `encode-id`. Both
+  are wrong in different ways. `encode-id` now wraps its body in
+  `(when x ...)` and documents the behaviour: `nil` in, `nil` out.
+  This surfaces the caller bug at the `NOT NULL` session-id column
+  rather than silently writing `\"\"` (pre-2.0.17 session-id) or `\"nil\"`
+  (2.0.17 transitional). Regression: `encode-id-option-matrix-test`
+  nil case.
+
+* **`encode-id` has an explicit `:else` fallback** to `pr-str`. This is
+  only reachable for invalid (non-`::sc/id`) input and matches the
+  pre-2.0.17 invoke-id encoder's behaviour. Previously the lack of an
+  `:else` in the cond meant non-`::sc/id` input silently returned `nil`,
+  which propagates to an unexpected SQL NULL downstream.
+
+* **Public API stability notes** on `encode-id`, `decode-id`, and
+  `tagged-number-re`. All three remain public and documented as stable
+  since 2.0.17 — option sets may grow (with backwards-compatible
+  defaults) but will not shrink.
+
+* **Direct unit tests** for the `encode-id` / `decode-id` option
+  matrix. The three subsystem wrappers cover the three in-use
+  configurations indirectly; the new tests exercise each option flag
+  in isolation so a future caller using an unusual combination has
+  documentation of the intended behaviour.
+
+* **In-code comment** in `decode-id`'s `:else` explaining that the
+  parser order (`parse-long` → `parse-double` → gated `parse-uuid` →
+  `tagged-number-re` + EDN → legacy-fallback) is load-bearing — none
+  of the earlier parsers would correctly classify inputs the later
+  ones handle, and reordering would silently change type choices.
+
 2.0.17
 ------
 

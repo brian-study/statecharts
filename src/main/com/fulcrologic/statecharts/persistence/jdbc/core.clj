@@ -47,7 +47,11 @@
        1E+10M, 9.99E+50M, 1.5E-10M    — scientific BigDecimal (Clojure
                                          produces these outside a narrow
                                          magnitude window)
-       1/2, -3/7                      — Ratio"
+       1/2, -3/7                      — Ratio
+
+   **Public API since 2.0.17.** Safe to reference from out-of-library
+   callers; regex contents may grow (to cover more `number?` subtypes)
+   but will not shrink."
   #"-?\d+(\.\d+)?([Ee][+-]?\d+)?[NM]|-?\d+/-?\d+")
 
 (defn- numeric-bare-name?
@@ -76,67 +80,110 @@
    - `:symbol-shape`  — same split as `:keyword-shape` (symbols aren't in
                         `::sc/id` but some callers pass them through).
 
-   Strings, numbers, and anything else always go through `pr-str`.
+   Strings, numbers, and anything else valid go through `pr-str`.
    BigInt/BigDecimal/Ratio round-trip because `pr-str` preserves their
    `N` / `M` / ratio markers; plain Long/Double pr-str to the same text
-   as `(str n)` so on-disk shape is unchanged for them."
+   as `(str n)` so on-disk shape is unchanged for them.
+
+   `nil` returns `nil` (pre-2.0.17 `session-id->str` returned `\"\"` via
+   `(str nil)`; the new behaviour surfaces the bug at the caller instead
+   of silently writing an empty-string row — all session-id columns are
+   `NOT NULL`).
+
+   **Public API since 2.0.17.** The option set is stable; new options
+   may be added (with defaults that preserve current behaviour) but
+   existing ones will not be removed."
   [x {:keys [uuid-shape keyword-shape symbol-shape]
       :or {uuid-shape    :bare
            keyword-shape :marked
            symbol-shape  :marked}}]
-  (cond
-    (string? x)  (pr-str x)
-    (keyword? x) (case keyword-shape
-                   :marked              (pr-str x)
-                   :bare-unless-numeric (let [bare (subs (str x) 1)]
-                                          (if (numeric-bare-name? bare)
-                                            (pr-str x)
-                                            bare)))
-    (symbol? x)  (case symbol-shape
-                   :marked              (pr-str x)
-                   :bare-unless-numeric (let [bare (str x)]
-                                          (if (numeric-bare-name? bare)
-                                            (pr-str x)
-                                            bare)))
-    (uuid? x)    (case uuid-shape
-                   :bare   (str x)
-                   :tagged (pr-str x))
-    (number? x)  (pr-str x)
-    :else        (pr-str x)))
+  (when x
+    (cond
+      (string? x)  (pr-str x)
+      (keyword? x) (case keyword-shape
+                     :marked              (pr-str x)
+                     :bare-unless-numeric (let [bare (subs (str x) 1)]
+                                            (if (numeric-bare-name? bare)
+                                              (pr-str x)
+                                              bare)))
+      (symbol? x)  (case symbol-shape
+                     :marked              (pr-str x)
+                     :bare-unless-numeric (let [bare (str x)]
+                                            (if (numeric-bare-name? bare)
+                                              (pr-str x)
+                                              bare)))
+      (uuid? x)    (case uuid-shape
+                     :bare   (str x)
+                     :tagged (pr-str x))
+      (number? x)  (pr-str x)
+      ;; `::sc/id` is closed over string/number/keyword/uuid, so :else is
+      ;; only reached by invalid input. pr-str is the most recoverable
+      ;; fallback — matches the pre-2.0.17 invoke-id encoder.
+      :else        (pr-str x))))
 
 (defn decode-id
   "Deserialize a DB string back to the original `::sc/id` value.
 
-   Shape-inspecting inverse of `encode-id`. All callers share the same
-   decoder — the only difference is the legacy fallback for a bare row
-   that isn't a number / UUID / marked literal:
+   Shape-inspecting inverse of `encode-id`. The one option,
+   `:legacy-fallback`, covers two per-site asymmetries that exist
+   because each subsystem's writer has a different history:
 
-   - `:legacy-fallback :string`  — return the bare string. Sessions use
-                                   this because pre-2.0.11 session-ids
-                                   stored strings bare.
-   - `:legacy-fallback :keyword` — coerce to keyword. Invoke-ids (both
-                                   queued and durable) use this because
-                                   pre-2.0.4 / pre-2.0.8 wrote keyword
-                                   invoke-ids via `(name x)`.
+   - `:legacy-fallback :string`  — **session-id mode.**
+     Enables bare-UUID recognition (`parse-uuid`) because `session-id->str`
+     has always written UUIDs bare for pre-2.0.11 compatibility.
+     Disables `#`-tagged-literal read because session-id writers have
+     never produced `#` forms; a pre-2.0.11 bare string whose content
+     starts with `#` (e.g. `\"#foo\"` or `\"#{1 2 3}\"`) stays a string.
+     A bare row that isn't a number or UUID falls back to the string
+     itself.
 
-   Note: a bare row whose content is digit-only (e.g. `\"42\"`) decodes
-   as a Long regardless of fallback choice — that migration note is in
-   CHANGELOG 2.0.13 for sessions and applies equally to invoke-ids."
+   - `:legacy-fallback :keyword` — **invoke-id mode.**
+     Enables `#`-tagged-literal read (needed so `#uuid \"…\"` produced
+     by `invokeid->str` / `event->row` decodes back to a UUID).
+     Disables `parse-uuid` because pre-2.0.4 / pre-2.0.8 invoke-id
+     writers used `(name x)` which only accepts keywords/strings, and a
+     UUID-shaped *bare* row therefore represents a keyword whose name
+     was UUID-shaped (e.g. `(keyword \"550e8400-…\")`). A bare
+     non-numeric row falls back to `(keyword s)`.
+
+   Migration note: a bare row whose content is digit-only (e.g. `\"42\"`)
+   decodes as a Long regardless of fallback choice — that migration note
+   is in CHANGELOG 2.0.13 for sessions and applies equally to
+   invoke-ids.
+
+   **Public API since 2.0.17.** See `encode-id` for the stability
+   contract."
   [s {:keys [legacy-fallback]
       :or {legacy-fallback :string}}]
   (when s
     (cond
       (.startsWith ^String s "\"") (try (edn/read-string s) (catch Exception _ s))
       (.startsWith ^String s ":")  (try (edn/read-string s) (catch Exception _ s))
-      (.startsWith ^String s "#")  (try (edn/read-string s) (catch Exception _ s))
-      :else (or (parse-long s)
-                (parse-double s)
-                (parse-uuid s)
-                (when (re-matches tagged-number-re s)
-                  (try (edn/read-string s) (catch Exception _ nil)))
-                (case legacy-fallback
-                  :keyword (keyword s)
-                  :string  s)))))
+      ;; `#`-tagged literal — only enabled for invoke-id-style callers,
+      ;; because session-id writers never produced `#` forms and a
+      ;; pre-2.0.11 bare legacy row starting with `#` (e.g. `"#foo"`,
+      ;; `"#{1 2 3}"`) must continue to decode as the raw string.
+      (and (.startsWith ^String s "#") (= :keyword legacy-fallback))
+      (try (edn/read-string s) (catch Exception _ s))
+      :else
+      ;; Parser order is load-bearing: `parse-long` first (cheapest and
+      ;; most common); `parse-double` catches scientific/decimal; the
+      ;; `:string`-mode `parse-uuid` must come after the number parsers
+      ;; because bare UUIDs could not otherwise tell themselves apart
+      ;; from "arbitrary alphanumeric string" cheaply; `tagged-number-re`
+      ;; catches `42N` / `3.14M` / `1/2`; finally the fallback.
+      (or (parse-long s)
+          (parse-double s)
+          ;; `:string` mode: session-id wrote bare UUIDs pre-2.0.11.
+          ;; `:keyword` mode: invoke-id never wrote bare UUIDs (all
+          ;; UUIDs go through `#uuid`); a UUID-shaped bare row here is
+          ;; a legacy keyword whose name happened to be UUID-shaped.
+          (when (= :string legacy-fallback) (parse-uuid s))
+          (when (re-matches tagged-number-re s)
+            (try (edn/read-string s) (catch Exception _ nil)))
+          (case legacy-fallback
+            :keyword (keyword s)
+            :string  s)))))
 
 (defn session-id->str
   "Serialize a session-id for DB storage. See `encode-id` for the scheme."

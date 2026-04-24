@@ -1291,3 +1291,131 @@
          :explicit-id? true})
       (is (not (contains? @saved-wms "admin"))
           "stop-invocation! must delete the explicit-id child by its bare id"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #Z5 — 2.0.17 consolidation must preserve prior per-site decoder behavior
+;; -----------------------------------------------------------------------------
+;;
+;; The 2.0.17 refactor introduced a shared `decode-id` with a uniform `#`-branch
+;; and a uniform `parse-uuid` step. That was a behavior change for two edge
+;; cases in legacy data:
+;;   (1) pre-2.0.11 bare session-id rows starting with `#` (e.g. a string
+;;       session-id literally called `"#foo"` or `"#{1 2 3}"`) would previously
+;;       return as String — now they'd EDN-read and potentially decode as a
+;;       set / other tagged literal / UUID.
+;;   (2) pre-2.0.8 bare invoke-id rows that happened to be UUID-shaped (from a
+;;       keyword whose name was UUID-shaped, passed through `(name x)`) would
+;;       previously decode as a keyword — now they'd decode as a UUID.
+;; Both are preserved by gating the `#`-branch and `parse-uuid` on
+;; `:legacy-fallback`: `:string` (session-id) enables parse-uuid but not
+;; `#`-read; `:keyword` (invoke-id) enables `#`-read but not parse-uuid.
+
+(deftest decode-id-preserves-session-id-legacy-behavior-test
+  (testing "pre-2.0.11 bare session-id rows starting with `#` do NOT EDN-read"
+    ;; Rare but legal per ::sc/id: a string session-id whose content happens
+    ;; to start with `#`. Pre-2.0.17 the session-id decoder had no `#` branch
+    ;; so these fell through to the string-fallback. Post-2.0.17 they must
+    ;; continue to decode as strings.
+    (is (= "#foo" (core/str->session-id "#foo"))
+        "bare `#foo` must stay a string (legacy pre-2.0.11 row)")
+    (is (= "#{1 2 3}" (core/str->session-id "#{1 2 3}"))
+        "bare `#{...}` must stay a string, not decode as a Clojure set")
+    (is (= "#uuid \"550e8400-e29b-41d4-a716-446655440000\""
+           (core/str->session-id "#uuid \"550e8400-e29b-41d4-a716-446655440000\""))
+        "even UUID-tagged-literal-looking bare content stays as string — session-id writer never produced `#` forms"))
+
+  (testing "nil session-id input returns nil (was \"\" via (str nil) before 2.0.17 — pinned)"
+    (is (nil? (core/session-id->str nil))
+        "nil in → nil out. Pre-2.0.17 (str nil) produced \"\", which silently wrote an empty-string session-id row. nil now propagates instead so the bug surfaces at the NOT NULL constraint.")))
+
+(deftest decode-id-preserves-invoke-id-legacy-behavior-test
+  (testing "pre-2.0.8 bare UUID-shaped invoke-id rows decode as keyword, not UUID"
+    ;; Pre-2.0.8 `invokeid->str` used `(name x)` which only supported
+    ;; keywords/strings/symbols. A keyword with a UUID-shaped name, e.g.
+    ;; `(keyword "550e8400-e29b-41d4-a716-446655440000")`, would be stored as
+    ;; the bare UUID-shaped string. On readback the decoder must honour the
+    ;; original keyword shape so `handle-external-invocations!` matches the
+    ;; running invocation by `=` against the keyword idlocation.
+    (let [uuid-shaped-bare "550e8400-e29b-41d4-a716-446655440000"]
+      (is (= (keyword uuid-shaped-bare) (job-store/str->invokeid uuid-shaped-bare))
+          "UUID-shaped bare row must decode as keyword (pre-2.0.8 `(name :kw)` legacy)")))
+
+  (testing "post-2.0.8 #uuid-tagged invoke-id rows still decode as UUIDs"
+    ;; Normal path: writer uses pr-str → `#uuid "..."`. Decoder must read it.
+    (let [u (random-uuid)
+          stored (pr-str u)]
+      (is (= u (job-store/str->invokeid stored))
+          "`#uuid \"...\"` tagged literal decodes back to the UUID"))))
+
+;; -----------------------------------------------------------------------------
+;; Direct tests for the shared encode-id / decode-id option matrix
+;; -----------------------------------------------------------------------------
+
+(deftest encode-id-option-matrix-test
+  (testing ":uuid-shape :bare vs :tagged"
+    (let [u (random-uuid)]
+      (is (= (str u) (core/encode-id u {:uuid-shape :bare}))
+          ":bare produces just the UUID string")
+      (is (= (pr-str u) (core/encode-id u {:uuid-shape :tagged}))
+          ":tagged produces #uuid \"...\" form")))
+
+  (testing ":keyword-shape :marked vs :bare-unless-numeric"
+    (is (= ":kw" (core/encode-id :kw {:keyword-shape :marked}))
+        ":marked → leading colon via pr-str")
+    (is (= "kw" (core/encode-id :kw {:keyword-shape :bare-unless-numeric}))
+        ":bare-unless-numeric → bare name for non-numeric keyword")
+    (is (= ":42" (core/encode-id :42 {:keyword-shape :bare-unless-numeric}))
+        ":bare-unless-numeric → marked form for numeric-name keyword (disambiguates from number)")
+    (is (= "ns/kw" (core/encode-id :ns/kw {:keyword-shape :bare-unless-numeric}))
+        "namespaced keywords keep their namespace in bare form (leading `:` stripped)"))
+
+  (testing ":symbol-shape :marked vs :bare-unless-numeric"
+    (is (= "sym" (core/encode-id 'sym {:symbol-shape :marked}))
+        "pr-str of a symbol has no marker — same as bare")
+    (is (= "sym" (core/encode-id 'sym {:symbol-shape :bare-unless-numeric}))
+        "bare name for non-numeric symbol"))
+
+  (testing "nil input returns nil"
+    (is (nil? (core/encode-id nil {})))
+    (is (nil? (core/encode-id nil {:uuid-shape :tagged})))))
+
+(deftest decode-id-option-matrix-test
+  (testing ":legacy-fallback :string enables parse-uuid, not #-read"
+    (let [opts {:legacy-fallback :string}]
+      (is (= "foo" (core/decode-id "foo" opts))
+          "bare non-numeric → string")
+      (is (= (java.util.UUID/fromString "550e8400-e29b-41d4-a716-446655440000")
+             (core/decode-id "550e8400-e29b-41d4-a716-446655440000" opts))
+          ":string mode parses bare UUIDs")
+      (is (= "#foo" (core/decode-id "#foo" opts))
+          ":string mode does NOT try EDN-read on `#` — legacy bare content stays a string")
+      (is (= "#{1 2}" (core/decode-id "#{1 2}" opts))
+          ":string mode rejects set literals — would otherwise silently decode as a Clojure set")))
+
+  (testing ":legacy-fallback :keyword enables #-read, not parse-uuid"
+    (let [opts {:legacy-fallback :keyword}]
+      (is (= :foo (core/decode-id "foo" opts))
+          "bare non-numeric → keyword")
+      (is (= (keyword "550e8400-e29b-41d4-a716-446655440000")
+             (core/decode-id "550e8400-e29b-41d4-a716-446655440000" opts))
+          ":keyword mode does NOT parse-uuid — pre-2.0.8 bare UUID-shaped row stays a keyword")
+      (let [u (random-uuid)]
+        (is (= u (core/decode-id (pr-str u) opts))
+            ":keyword mode DOES decode #uuid-tagged literal"))))
+
+  (testing "numeric parsers run in both modes"
+    (doseq [opts [{:legacy-fallback :string} {:legacy-fallback :keyword}]]
+      (is (= 42 (core/decode-id "42" opts)))
+      (is (= 3.14 (core/decode-id "3.14" opts)))
+      (is (= 42N (core/decode-id "42N" opts)))
+      (is (= 3.14M (core/decode-id "3.14M" opts)))
+      (is (= (/ 1 2) (core/decode-id "1/2" opts)))))
+
+  (testing "marked literals (leading `:` / `\"`) decode in both modes"
+    (doseq [opts [{:legacy-fallback :string} {:legacy-fallback :keyword}]]
+      (is (= :ns/kw (core/decode-id ":ns/kw" opts)))
+      (is (= "hello" (core/decode-id "\"hello\"" opts)))))
+
+  (testing "nil input returns nil"
+    (is (nil? (core/decode-id nil {:legacy-fallback :string})))
+    (is (nil? (core/decode-id nil {:legacy-fallback :keyword})))))
