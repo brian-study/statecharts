@@ -439,17 +439,36 @@
 ;; The worker then builds done.invoke.*/error.invoke.* from the corrupted value
 ;; and the parent never receives its terminal event.
 
+(deftest invokeid-roundtrip-preserves-all-supported-types-test
+  (testing "invokeid->str / str->invokeid round-trip preserves value and type"
+    ;; handle-external-invocations! matches terminal events to <invoke>
+    ;; elements by `=` against the original idlocation value, so a string
+    ;; invoke-id that's silently coerced to a keyword on readback will miss
+    ;; finalize! / autoforward bookkeeping.
+    (let [uuid   (UUID/randomUUID)
+          inputs [:kw
+                  :my-ns/kw
+                  "report"
+                  "looks-like-a/ns"
+                  42
+                  3.14
+                  uuid]]
+      (doseq [original inputs]
+        (let [stored    (job-store/invokeid->str original)
+              read-back (job-store/str->invokeid stored)]
+          (is (= original read-back)
+              (str "round-trip for " (pr-str original)
+                   " must preserve value+type; stored as " (pr-str stored)
+                   ", read back as " (pr-str read-back))))))))
+
 (deftest invokeid->str-preserves-non-keyword-values-test
-  (testing "invokeid->str must not corrupt non-keyword invoke-ids"
-    (is (= "report" (job-store/invokeid->str "report"))
+  (testing "invokeid->str must not corrupt non-keyword invoke-ids (no leading-char stripping)"
+    (is (not (= "eport" (job-store/invokeid->str "report")))
         "string invoke-id must not have first char stripped")
-    (is (= "42" (job-store/invokeid->str 42))
+    (is (not (= "2" (job-store/invokeid->str 42)))
         "numeric invoke-id must not have first char stripped")
-    (let [uuid (UUID/randomUUID)]
-      (is (= (str uuid) (job-store/invokeid->str uuid))
-          "UUID invoke-id must preserve full string form"))
     (is (= "my-invoke" (job-store/invokeid->str :my-invoke))
-        "keyword invoke-id serialization is preserved for back-compat")
+        "keyword invoke-id serialization is preserved for back-compat (bare form)")
     (is (= "my-ns/my-invoke" (job-store/invokeid->str :my-ns/my-invoke))
         "namespaced keyword invoke-id serialization is preserved for back-compat")))
 

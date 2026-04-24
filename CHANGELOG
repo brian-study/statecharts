@@ -1,3 +1,39 @@
+2.0.8
+-----
+
+Closes the remaining durable-job invoke-id correctness gap:
+`str->invokeid` used to always coerce to a keyword, so a durable job
+started with a string / UUID / number invoke-id round-tripped back as
+`:report` / `:abc-…` / `:42` (keywords). The worker then emitted
+`done.invoke.*` / `error.invoke.*` with the keyword in `:invoke-id`,
+and `handle-external-invocations!` (which matches by `=` against the
+original idlocation value) missed finalize/autoforward bookkeeping.
+
+Fix pair:
+
+* **`invokeid->str`** now uses `pr-str` for non-keyword/non-symbol
+  values — `\"report\"` → `\"\\\"report\\\"\"`, UUIDs → `\"#uuid \\\"…\\\"\"`,
+  numbers → `\"42\"`. The leading marker lets the decoder distinguish
+  them from bare-keyword legacy rows. Keywords/symbols still serialize
+  bare, so existing keyword rows stay readable.
+* **`str->invokeid`** now shape-inspects:
+  - strings starting with `\"` or `#` → `edn/read-string`,
+  - all-digits-with-optional-decimal → `parse-long` / `parse-double`,
+  - everything else → `(keyword s)` (legacy/bare keyword form).
+
+* **`cancel!`** now builds the terminal event name via
+  `(pr-str (evts/invoke-error-event invokeid))` instead of
+  string-concatenating the bare invokeid string (which only worked for
+  keyword invokeids).
+* **`cancel-by-session!`** switched from one SQL-concat UPDATE to a
+  SELECT + per-row UPDATE loop so the terminal event name can be
+  constructed in Clojure for each typed invokeid.
+
+Regression test:
+`invokeid-roundtrip-preserves-all-supported-types-test` — covers
+`:kw`, `:my-ns/kw`, `\"report\"`, `\"looks-like-a/ns\"`, `42`, `3.14`,
+and a UUID.
+
 2.0.7
 -----
 

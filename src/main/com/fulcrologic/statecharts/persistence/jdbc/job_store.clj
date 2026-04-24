@@ -5,6 +5,9 @@
    and claimed by the worker for execution. Designed for restart safety with
    lease-based ownership and idempotent operations."
   (:require
+   [clojure.edn :as edn]
+   [clojure.string :as str]
+   [com.fulcrologic.statecharts.events :as evts]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [taoensso.timbre :as log])
   (:import
@@ -15,31 +18,52 @@
 ;; -----------------------------------------------------------------------------
 
 (defn invokeid->str
-  "Serialize an invokeid to a string for DB storage.
+  "Serialize an invokeid to a string for DB storage, preserving type
+   information so `str->invokeid` can reconstruct the original value.
 
-   Keywords (including namespaced) strip the leading `:` so legacy rows
-   stay compatible: `:content-generation` → `\"content-generation\"`,
-   `:my-ns/gen` → `\"my-ns/gen\"`.
+   - Keywords (including namespaced) are stored bare (`:kw` → `\"kw\"`,
+     `:my-ns/k` → `\"my-ns/k\"`). Back-compat with rows written pre-2.0.8.
+   - Symbols are stored bare (`'my-sym` → `\"my-sym\"`). Round-trip is
+     lossy — symbols reconstruct as keywords (rare use case).
+   - Everything else (string, UUID, Long, Double, etc.) is stored via
+     `pr-str` so the leading marker distinguishes it from a bare keyword
+     on readback. `\"report\"` → `\"\\\"report\\\"\"`, `42` → `\"42\"`,
+     `#uuid \"…\"` → `\"#uuid \\\"…\\\"\"`.
 
-   Strings/UUIDs/numbers (all valid `::sc/id` shapes, reachable via
-   idlocation) use their plain string form unchanged. Previously the
-   blanket `(subs (str x) 1)` stripped the first character from every
-   non-keyword value — corrupting storage.
-
-   Readback via `str->invokeid` is lossy for non-keyword originals: they
-   reconstruct as keywords (the dominant case)."
+   Why it matters: `handle-external-invocations!` matches terminal
+   events to `<invoke>` elements by `=` against the original
+   `idlocation` value. A string invokeid silently coerced to a keyword
+   on readback misses finalize/autoforward even though the terminal
+   event name looks right."
   [invokeid]
   (cond
     (keyword? invokeid) (subs (str invokeid) 1)
     (symbol? invokeid)  (str invokeid)
-    :else               (str invokeid)))
+    :else               (pr-str invokeid)))
 
 (defn str->invokeid
-  "Deserialize a string back to an invokeid keyword.
-   \"content-generation\" → :content-generation
-   \"my-ns/gen\" → :my-ns/gen"
+  "Deserialize an invokeid from the DB back to its original type.
+
+   Shape-aware inverse of `invokeid->str`:
+   - quoted string form (`\"…\"`) or tagged literal (`#uuid …`) → EDN read.
+   - integer/decimal string → `parse-long` / `parse-double`.
+   - anything else → `(keyword s)` (bare keyword form, legacy rows).
+
+   Symbols round-trip as keywords — the bare form can't be distinguished
+   from a keyword's bare form without a type marker."
   [s]
-  (keyword s))
+  (when s
+    (cond
+      (str/starts-with? s "\"")
+      (try (edn/read-string s) (catch Exception _ s))
+
+      (str/starts-with? s "#")
+      (try (edn/read-string s) (catch Exception _ s))
+
+      :else
+      (or (parse-long s)
+          (parse-double s)
+          (keyword s)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Internal Helpers
@@ -274,6 +298,12 @@
 (def ^:private cancelled-event-data
   (delay (core/freeze {:reason :cancelled})))
 
+(defn- terminal-event-name-for
+  "Build the `error.invoke.<invokeid>` terminal event name in the same EDN
+   form the worker's reconciliation path expects (`pr-str`'d keyword)."
+  [invokeid]
+  (pr-str (evts/invoke-error-event invokeid)))
+
 (defn cancel!
   "Cancel a job for a specific session+invokeid.
    Status-conditional (I7): only cancels pending/running jobs.
@@ -286,7 +316,7 @@
    Returns the number of rows affected."
   [ds session-id invokeid]
   (let [iid-str (invokeid->str invokeid)
-        terminal-event-name (str \: "error.invoke." iid-str)
+        terminal-event-name (terminal-event-name-for invokeid)
         result (core/execute-sql! ds
                  (str "UPDATE statechart_jobs"
                       " SET status = 'cancelled',"
@@ -309,24 +339,38 @@
    Used when session is being deleted or reset.
 
    Writes a terminal event per job so the reconciler dispatches
-   `error.invoke.<invokeid>` to the parent. `invokeid` is concatenated
-   server-side (safe: `invokeid` is library-serialised via `invokeid->str`,
-   never user input)."
+   `error.invoke.<invokeid>` to the parent. Since invokeid storage is
+   typed (keyword/UUID/number/string via `invokeid->str`/`str->invokeid`),
+   we can't reconstruct the terminal event name server-side via SQL
+   concat — we fetch each row, reconstruct the original invokeid in
+   Clojure, and issue a guarded UPDATE per row."
   [ds session-id]
-  (let [result (core/execute-sql! ds
-                 (str "UPDATE statechart_jobs"
-                      " SET status = 'cancelled',"
-                      "     lease_owner = NULL,"
-                      "     lease_expires_at = NULL,"
-                      "     terminal_event_name = ':error.invoke.' || invokeid,"
-                      "     terminal_event_data = ?,"
-                      "     updated_at = now()"
-                      " WHERE session_id = ?"
-                      " AND status IN ('pending', 'running')"
-                      " RETURNING id")
-                 [@cancelled-event-data
-                  (core/session-id->str session-id)])]
-    (core/affected-row-count result)))
+  (let [sid-str (core/session-id->str session-id)
+        rows (core/execute-sql! ds
+               (str "SELECT id, invokeid FROM statechart_jobs"
+                    " WHERE session_id = ?"
+                    " AND status IN ('pending', 'running')")
+               [sid-str])
+        cancelled-data @cancelled-event-data]
+    (reduce
+      (fn [n {:keys [id invokeid]}]
+        (let [orig-invokeid (str->invokeid invokeid)
+              terminal-event-name (terminal-event-name-for orig-invokeid)
+              result (core/execute-sql! ds
+                       (str "UPDATE statechart_jobs"
+                            " SET status = 'cancelled',"
+                            "     lease_owner = NULL,"
+                            "     lease_expires_at = NULL,"
+                            "     terminal_event_name = ?,"
+                            "     terminal_event_data = ?,"
+                            "     updated_at = now()"
+                            " WHERE id = ?"
+                            " AND status IN ('pending', 'running')"
+                            " RETURNING id")
+                       [terminal-event-name cancelled-data id])]
+          (+ n (core/affected-row-count result))))
+      0
+      rows)))
 
 (defn get-active-job
   "Get the active (pending/running) job for a session+invokeid, or nil."
