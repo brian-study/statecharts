@@ -1,3 +1,31 @@
+2.0.7
+-----
+
+Follow-up from the post-2.0.6 review.
+
+* **Revert a silent breaking change introduced in 2.0.6**: the qualified-
+  keyword branch of `durable-job/invoke-data-keys` remapped the
+  data-model key shape (e.g. `:my-ns/my-invoke` → `:my-ns.my-invoke/job-id`
+  instead of the pre-2.0.6 `:my-invoke/job-id`). Charts that read their
+  durable-job data-model keys via guards/actions/RAD integration would
+  have silently stopped finding the stored job-id. Restored to
+  `(name invokeid)` for both simple and qualified keywords. The
+  UUID/number crash fix (the original #H) is preserved — strings/UUIDs/
+  numbers still fall through to `(str invokeid)`.
+
+* **Perf polish**: `datasource-closed?` now memoizes its per-class
+  `getMethod("isClosed")` lookup instead of reflecting on every event
+  loop iteration.
+
+* **Docs**: `README.md` updated to show the 2.0.6 idiom of adopting
+  `(:env loop-handle)` for `send!` so events auto-wake the loop.
+
+Regression coverage:
+* `invoke-data-keys-qualified-keyword-shape-unchanged-test` — pins the
+  pre-2.0.6 key shape.
+* `future-invocation-done-event-includes-invoke-id-test` — pins the done
+  path that 2.0.6 also fixed (error was the only one flagged in review).
+
 2.0.6
 -----
 

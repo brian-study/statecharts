@@ -30,17 +30,21 @@
   "Returns the data model keys for tracking a durable job invoke.
    Keys are namespaced by invokeid to support multiple concurrent invokes.
 
-   Accepts any `::sc/id` shape (keyword, namespaced keyword, symbol,
-   string, UUID, number). `(name x)` only works for keyword/string/symbol
-   and would throw on UUID/number — leaving an orphaned row in
-   `statechart_jobs` because `create-job!` has already inserted by the
-   time this runs."
+   Uses `(name invokeid)` for keywords/symbols (matching the pre-2.0.6
+   shape — charts that read these keys keep working). Qualified-keyword
+   invokeids produce the same key as their simple-keyword counterpart
+   (`:my-ns/foo` → `:foo/job-id`); this matches the prior behaviour and
+   is safe in practice because SCXML invokeids are unique per session.
+
+   Falls back to `(str invokeid)` for UUID/number/string invokeids (all
+   valid `::sc/id` shapes reachable via `idlocation`). `(name x)` would
+   throw on UUID/number — that crash would leave an orphaned row in
+   `statechart_jobs` because `create-job!` inserts before this runs."
   [invokeid]
   (let [ns-str (cond
-                 (qualified-keyword? invokeid) (str (namespace invokeid) "." (name invokeid))
-                 (keyword? invokeid)           (name invokeid)
-                 (symbol? invokeid)            (name invokeid)
-                 :else                         (str invokeid))]
+                 (keyword? invokeid) (name invokeid)
+                 (symbol? invokeid)  (name invokeid)
+                 :else               (str invokeid))]
     {:job-id-key   (keyword ns-str "job-id")
      :job-kind-key (keyword ns-str "job-kind")}))
 

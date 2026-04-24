@@ -471,6 +471,65 @@
             (str ":job-kind-key must be a keyword for invokeid=" (pr-str iid)))))))
 
 ;; -----------------------------------------------------------------------------
+;; Finding #H follow-up — invoke-data-keys must preserve the pre-2.0.6 key shape
+;; for qualified-keyword invokeids
+;; -----------------------------------------------------------------------------
+;;
+;; The 2.0.6 fix also re-shaped the qualified-keyword path from
+;;   (name :my-ns/my-invoke)            = "my-invoke"            → :my-invoke/job-id
+;; to
+;;   (str (namespace x) "." (name x))   = "my-ns.my-invoke"       → :my-ns.my-invoke/job-id
+;; This is a silent breaking change — any chart that reads its durable-job
+;; data-model keys (guard/action code, RAD integration) would fail to find
+;; the stored job-id after upgrade.
+;;
+;; Pin the pre-2.0.6 shape. The UUID/number crash fix is independent of this.
+
+(deftest invoke-data-keys-qualified-keyword-shape-unchanged-test
+  (testing "qualified-keyword invokeids produce the same data-model keys as pre-2.0.6"
+    (let [{:keys [job-id-key job-kind-key]} (durable-job/invoke-data-keys :my-ns/my-invoke)]
+      (is (= :my-invoke/job-id job-id-key)
+          "qualified-keyword :job-id-key uses (name invokeid) as namespace — must not change")
+      (is (= :my-invoke/job-kind job-kind-key)
+          "qualified-keyword :job-kind-key uses (name invokeid) as namespace — must not change"))
+    (let [{:keys [job-id-key]} (durable-job/invoke-data-keys :simple-invoke)]
+      (is (= :simple-invoke/job-id job-id-key)
+          "simple-keyword shape is stable"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #I follow-up — future invocation done send also carries :invoke-id
+;; -----------------------------------------------------------------------------
+;;
+;; Preventive: #I fixed the error path; the done path was fixed in the same
+;; change for consistency. Pin both.
+
+(deftest future-invocation-done-event-includes-invoke-id-test
+  (testing "future-backed invocation done.invoke.* send includes :invoke-id"
+    (let [sent        (atom nil)
+          event-queue (reify sp/EventQueue
+                        (send! [_ _env send-request]
+                          (reset! sent send-request)
+                          true)
+                        (cancel! [_ _env _sid _sendid] true)
+                        (receive-events! [_ _env _h] nil)
+                        (receive-events! [_ _env _h _opts] nil))
+          env         {::sc/session-id  :future-parent
+                       ::sc/event-queue event-queue
+                       ::sc/vwmem       (volatile! {::sc/session-id :future-parent})}
+          processor   ((requiring-resolve 'com.fulcrologic.statecharts.invocation.future/new-future-processor))
+          ok-fn       (fn [_params] {:result :done})]
+      (sp/start-invocation! processor env
+        {:invokeid :my-future-invoke
+         :src      ok-fn
+         :params   {}})
+      (let [deadline (+ (System/currentTimeMillis) 2000)]
+        (while (and (nil? @sent) (< (System/currentTimeMillis) deadline))
+          (Thread/sleep 10)))
+      (is (some? @sent) "future invocation should have sent a done event")
+      (is (= :my-future-invoke (or (:invoke-id @sent) (:invokeid @sent)))
+          ":done.invoke.* send must carry :invoke-id for invocation matching"))))
+
+;; -----------------------------------------------------------------------------
 ;; Finding #I (P2) — future invocation error send omits :invoke-id
 ;; -----------------------------------------------------------------------------
 ;;

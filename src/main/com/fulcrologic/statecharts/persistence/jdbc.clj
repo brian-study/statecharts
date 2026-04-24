@@ -191,6 +191,16 @@
 ;; Event Loop
 ;; -----------------------------------------------------------------------------
 
+(def ^:private ^java.lang.reflect.Method isClosed-method-for-class
+  "Memoized per-class reflection lookup — the event loop calls
+   datasource-closed? once per poll, no need to re-reflect every time."
+  (memoize
+    (fn [cls]
+      (try
+        (.getMethod ^Class cls "isClosed" (into-array Class []))
+        (catch NoSuchMethodException _ nil)
+        (catch Exception _ nil)))))
+
 (defn- datasource-closed?
   "Return true if the datasource exposes `isClosed()` and it reports true.
 
@@ -205,12 +215,9 @@
   [ds]
   (boolean
     (when ds
-      (when-let [isClosed-m (try
-                              (.getMethod (class ds) "isClosed" (into-array Class []))
-                              (catch NoSuchMethodException _ nil)
-                              (catch Exception _ nil))]
+      (when-let [m (isClosed-method-for-class (class ds))]
         (try
-          (.invoke isClosed-m ds (object-array 0))
+          (.invoke ^java.lang.reflect.Method m ds (object-array 0))
           (catch Exception _ false))))))
 
 (defn start-event-loop!

@@ -53,14 +53,19 @@ any DataSource `next.jdbc` accepts will work.
 ;; 5. Start a session
 (pg-sc/start! env :order/process :order-123)
 
-;; 6. Send events
+;; 7. Process events (or use start-event-loop!)
+;;    start-event-loop! returns {:env :stop! :wake!}. Use the returned :env
+;;    for subsequent send! calls so they wake the loop immediately; the
+;;    original env has no wake-signal attached and events would wait up to
+;;    poll-interval-ms before being picked up.
+(def loop-handle (pg-sc/start-event-loop! env 100))
+(def env (:env loop-handle))
+
+;; 8. Send events (on the loop-attached env so send! wakes the loop)
 (pg-sc/send! env {:event :pay :target :order-123})
 
-;; 7. Process events (or use start-event-loop!)
-(def stop! (pg-sc/start-event-loop! env 100))
-
 ;; Later: stop the loop
-(stop!)
+((:stop! loop-handle))
 ```
 
 ## Working with Session Data
@@ -331,11 +336,13 @@ The event queue uses PostgreSQL's `SELECT FOR UPDATE SKIP LOCKED` to ensure each
 
 ## Immediate Event Processing
 
-When using `start-event-loop!`, events sent via `send!` on the same env instance are processed immediately without waiting for the poll interval. This eliminates latency for locally-sent events:
+When using `start-event-loop!`, events sent via `send!` on the env it **returns** are processed immediately without waiting for the poll interval. This eliminates latency for locally-sent events:
 
 ```clojure
 ;; Start event loop with 100ms poll interval
-(def stop! (pg-sc/start-event-loop! env 100))
+(def loop-handle (pg-sc/start-event-loop! env 100))
+;; Adopt the returned env — it carries the wake-signal the loop is listening on.
+(def env (:env loop-handle))
 
 ;; This event is processed immediately (not in 100ms)
 (pg-sc/send! env {:event :process :target :session-1})
