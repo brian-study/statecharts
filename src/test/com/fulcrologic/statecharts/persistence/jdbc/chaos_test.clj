@@ -225,31 +225,34 @@
       (chaos/assert-invariants! *pool* "after handler failure retry"))))
 
 (deftest ^:integration poison-event-does-not-block-queue-test
-  (testing "a poison event that always fails doesn't block other events"
-    (let [session-id :poison-session
-          queue (pg-eq/new-queue *pool* "test-worker")
+  (testing "a poison event on session A doesn't block events on sessions B/C"
+    ;; Per-session FIFO: a failing event blocks its OWN session until it's
+    ;; retried successfully. But events for other sessions are independent and
+    ;; must keep flowing. This test pins that invariant.
+    (let [poison-session :poison-session
+          other-session-1 :other-session-1
+          other-session-2 :other-session-2
+          queue   (pg-eq/new-queue *pool* "test-worker")
           tracker (atom [])]
 
-      ;; Send: good, poison, good, good
-      (sp/send! queue {} (chaos/make-event session-id :good-1))
-      (sp/send! queue {} (chaos/make-event session-id :poison {:poison? true}))
-      (sp/send! queue {} (chaos/make-event session-id :good-2))
-      (sp/send! queue {} (chaos/make-event session-id :good-3))
+      ;; Poison blocks its own session; other sessions' events must still run.
+      (sp/send! queue {} (chaos/make-event poison-session :poison {:poison? true}))
+      (sp/send! queue {} (chaos/make-event other-session-1 :good-1))
+      (sp/send! queue {} (chaos/make-event other-session-2 :good-2))
 
       ;; Process multiple rounds
       (let [handler (chaos/poison-aware-handler tracker)]
         (dotimes [_ 10]
-          (sp/receive-events! queue {} handler {:batch-size 2})
+          (sp/receive-events! queue {} handler {:batch-size 10})
           (Thread/sleep 10)))
 
-      ;; Good events should all be processed
+      ;; Events on the non-poisoned sessions must be processed.
       (let [processed-names (->> @tracker
                                  (remove :poison?)
                                  (map :event-name)
                                  set)]
-        (is (contains? processed-names :good-1) "good-1 should be processed")
-        (is (contains? processed-names :good-2) "good-2 should be processed")
-        (is (contains? processed-names :good-3) "good-3 should be processed"))
+        (is (contains? processed-names :good-1) "good-1 on other session should be processed")
+        (is (contains? processed-names :good-2) "good-2 on other session should be processed"))
 
       ;; Poison event should still be in queue (released for retry each time)
       (is (pos? (chaos/count-events *pool* :processed? false))
@@ -369,7 +372,7 @@
                             0 (sp/get-working-memory store {} sid)
                             ;; Write (with retry)
                             1 (pg-wms/with-optimistic-retry
-                                {:max-retries 5 :backoff-ms 5}
+                                {:max-retries 25 :backoff-ms 2}
                                 (fn []
                                   (let [wm (sp/get-working-memory store {} sid)
                                         updated (update-in wm [::sc/data-model :counter]

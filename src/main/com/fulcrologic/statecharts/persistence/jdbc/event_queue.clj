@@ -58,7 +58,10 @@
     {:target-session-id (core/session-id->str (or target source-session-id))
      :source-session-id (when source-session-id (core/session-id->str source-session-id))
      :send-id send-id
-     :invoke-id (when invoke-id (name invoke-id))
+     ;; invoke-id may be a keyword (including namespaced), UUID, number, string,
+     ;; etc. `(name x)` only works for keywords/strings and loses namespaces.
+     ;; Round-trip via EDN so row->event can restore the original type.
+     :invoke-id (when invoke-id (pr-str invoke-id))
      :event-name (pr-str event)
      :event-type (pr-str (or type :external))
      :event-data (core/freeze (or data {}))
@@ -79,7 +82,13 @@
        (:send-id row)
        (assoc :sendid (:send-id row) ::sc/send-id (:send-id row))
        (:invoke-id row)
-       (assoc :invokeid (:invoke-id row))))))
+       (assoc :invokeid (let [s (:invoke-id row)]
+                          ;; EDN round-trip for types written via pr-str
+                          ;; (keyword/UUID/number). Legacy rows stored via
+                          ;; `name` lack the leading tag and are read as
+                          ;; bare strings.
+                          (try (edn/read-string s)
+                               (catch Exception _ s))))))))
 
 (defn- insert-event!
   "Insert an event into the queue."
@@ -189,9 +198,12 @@
     (sp/receive-events! this env handler {}))
 
   (receive-events! [_ env handler options]
-    ;; Claim events in their own transaction
-    (let [claimed-events (core/with-tx [tx datasource]
-                           (claim-events! tx node-id options))
+    ;; Claim events in their own transaction.
+    ;; UPDATE … RETURNING does NOT preserve the subquery's ORDER BY, so
+    ;; re-sort in memory before handing to the handler to keep FIFO delivery.
+    (let [claimed-events (->> (core/with-tx [tx datasource]
+                                (claim-events! tx node-id options))
+                              (sort-by (juxt :deliver-at :id)))
           claimed-count (count claimed-events)]
       (when (pos? claimed-count)
         (log/debug "Claimed events for processing"
@@ -200,56 +212,74 @@
                     :session-filter (:session-id options)}))
       ;; Process each event in its own transaction so that a failure in event N
       ;; doesn't roll back the mark-processed of events 1..N-1.
-      (doseq [row claimed-events]
-        (let [event-id (:id row)
-              event-name (:event-name row)
-              target (:target-session-id row)
-              start-time (System/nanoTime)]
-          (try
-            (let [event (row->event row)]
-              (handler env event)
-              (core/with-tx [tx datasource]
-                (mark-processed! tx event-id))
-              (let [duration-ms (/ (- (System/nanoTime) start-time) 1e6)]
-                (log/debug "Event processed"
-                           {:event-id event-id
-                            :event event-name
-                            :target target
-                            :duration-ms duration-ms
-                            :node-id node-id})))
-            (catch Exception e
-              (log/error e "Event handler threw an exception"
-                         {:event-id event-id
-                          :event-name event-name
-                          :target target
-                          :node-id node-id})
-              ;; Release claim so event can be retried
-              (core/with-tx [tx datasource]
-                (release-claim! tx event-id))
-              (log/info "Event released for retry"
-                        {:event-id event-id
-                         :event-name event-name
-                         :target target}))
-            (catch Error e
-              (log/error e "Event handler threw a fatal error"
-                         {:event-id event-id
-                          :event-name event-name
-                          :target target
-                          :node-id node-id})
-              ;; Release this event's claim so it can be retried. Remaining
-              ;; claimed events in this batch will be recovered by stale claim
-              ;; timeout.
-              (try
-                (core/with-tx [tx datasource]
-                  (release-claim! tx event-id))
-                (log/info "Event released for retry after fatal error"
-                          {:event-id event-id
-                           :event-name event-name
-                           :target target})
-                (catch Throwable t
-                  (log/error t "Failed to release claim after fatal error"
-                             {:event-id event-id})))
-              (throw e))))))))
+      ;;
+      ;; Per-session FIFO invariant: if the handler throws on event N, any
+      ;; subsequent events for the SAME session in this batch must wait for
+      ;; N's retry to succeed first — their claims are released so the next
+      ;; poll picks them up AFTER the retried event. Events for OTHER sessions
+      ;; keep processing so a poison event in one session doesn't block
+      ;; liveness in others.
+      (loop [[row & more] claimed-events
+             blocked-sessions #{}]
+        (when row
+          (let [event-id (:id row)
+                event-name (:event-name row)
+                target (:target-session-id row)
+                start-time (System/nanoTime)
+                blocked? (contains? blocked-sessions target)
+                next-blocked
+                (cond
+                  blocked?
+                  (do
+                    (core/with-tx [tx datasource]
+                      (release-claim! tx event-id))
+                    blocked-sessions)
+
+                  :else
+                  (try
+                    (let [event (row->event row)]
+                      (handler env event)
+                      (core/with-tx [tx datasource]
+                        (mark-processed! tx event-id))
+                      (let [duration-ms (/ (- (System/nanoTime) start-time) 1e6)]
+                        (log/debug "Event processed"
+                                   {:event-id event-id
+                                    :event event-name
+                                    :target target
+                                    :duration-ms duration-ms
+                                    :node-id node-id}))
+                      blocked-sessions)
+                    (catch Exception e
+                      (log/error e "Event handler threw an exception"
+                                 {:event-id event-id
+                                  :event-name event-name
+                                  :target target
+                                  :node-id node-id})
+                      (core/with-tx [tx datasource]
+                        (release-claim! tx event-id))
+                      (log/info "Event released for retry"
+                                {:event-id event-id
+                                 :event-name event-name
+                                 :target target})
+                      (conj blocked-sessions target))
+                    (catch Error e
+                      (log/error e "Event handler threw a fatal error"
+                                 {:event-id event-id
+                                  :event-name event-name
+                                  :target target
+                                  :node-id node-id})
+                      (try
+                        (core/with-tx [tx datasource]
+                          (release-claim! tx event-id))
+                        (log/info "Event released for retry after fatal error"
+                                  {:event-id event-id
+                                   :event-name event-name
+                                   :target target})
+                        (catch Throwable t
+                          (log/error t "Failed to release claim after fatal error"
+                                     {:event-id event-id})))
+                      (throw e))))]
+            (recur more next-blocked)))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Public API
@@ -321,9 +351,17 @@
    - :session-id - Filter by session ID"
   ([ds] (queue-depth ds {}))
   ([ds {:keys [session-id]}]
-   (let [sql (cond-> {:select [[[:count :*] :count]]
-                      :from [:statechart-events]
-                      :where [:is :processed-at nil]}
-               session-id
-               (update :where conj [:= :target-session-id (core/session-id->str session-id)]))]
+   (let [;; `(update :where conj …)` on `[:is :processed-at nil]` produces
+         ;; `[:is :processed-at nil […]]`, which HoneySQL formats as the
+         ;; illegal `processed_at IS NULL IS (…)`. Build the predicate list
+         ;; first, then wrap in :and if we ended up with more than one.
+         predicates (cond-> [[:is :processed-at nil]]
+                      session-id
+                      (conj [:= :target-session-id (core/session-id->str session-id)]))
+         where-clause (if (= 1 (count predicates))
+                        (first predicates)
+                        (into [:and] predicates))
+         sql {:select [[[:count :*] :count]]
+              :from [:statechart-events]
+              :where where-clause}]
      (:count (core/execute-one! ds sql)))))

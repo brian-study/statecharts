@@ -1,3 +1,47 @@
+2.0.4
+-----
+
+Six findings from the second deep review. Each has a regression test in
+`persistence/jdbc/regression_test.clj` (findings #A–#F).
+
+* **[P1]** `receive-events!` now re-sorts the claimed rows by
+  `(deliver-at, id)` in memory before dispatching. PostgreSQL does not
+  preserve the subquery's `ORDER BY` through `UPDATE … RETURNING *`, so a
+  single poll that claimed multiple ready events for the same session
+  could deliver them out of order. FIFO-per-session is restored.
+* **[P1]** `receive-events!` is now session-aware when a handler fails:
+  the failed event's claim is released AND any remaining events in that
+  batch that target the SAME session are also released. Events for other
+  sessions continue to process. This preserves per-session FIFO (the
+  retried event must run before subsequent events for the same session)
+  while keeping liveness for independent sessions (a poison event in one
+  session can't block the queue).
+* **[P2]** `queue-depth` with the `:session-id` filter now formats valid
+  SQL. The previous `(update :where conj ...)` on `[:is :processed-at
+  nil]` produced `[:is :processed-at nil [:= ...]]`, which HoneySQL
+  formatted as `processed_at IS NULL IS (...)` — parse error at runtime.
+* **[P2]** The durable-job worker's `dispatch-terminal-event!` now
+  includes `:invoke-id` on the emitted event. Without it, the
+  `InvocationProcessor` machinery (finalize, autoforward) couldn't match
+  the event back to the originating `<invoke>` element.
+* **[P2]** `DurableJobInvocationProcessor.start-invocation!` preserves
+  namespaces on the stored `job_type`. Previously `(name src)` turned
+  `:my.app/send-email` into `"send-email"`; the worker's handler lookup
+  by `(keyword stored-job-type)` therefore missed the namespaced handler
+  registration. Now stores the full keyword string via `(subs (str src) 1)`.
+* **[P2]** The JDBC event queue now round-trips `:invoke-id` losslessly.
+  `(name invoke-id)` threw on UUID/numeric invoke IDs and stripped
+  namespaces from keyword IDs; both shapes are allowed by `::sc/id`.
+  Storage now uses `(pr-str invoke-id)` and decode tries
+  `edn/read-string` first, falling back to the raw DB string for legacy
+  rows.
+
+Housekeeping: the poison-event chaos test was rewritten to assert the
+post-fix invariant correctly — a poison event on session A doesn't block
+events on sessions B, C. The concurrent-session contention test bumped
+retry limits to absorb contention now that optimistic locking actually
+fires (follow-up from 2.0.2).
+
 2.0.3
 -----
 

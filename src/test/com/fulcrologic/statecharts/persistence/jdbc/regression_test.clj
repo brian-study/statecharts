@@ -252,3 +252,178 @@
                           (fn [_env event] (reset! received event)))
       (is (= ::sc/chart (:type @received))
           ":type should preserve namespace through queue round-trip; currently reduced to :chart"))))
+
+;; -----------------------------------------------------------------------------
+;; Batch 2 — 6 findings surfaced by the follow-up review (targeted at v2.0.4)
+;; -----------------------------------------------------------------------------
+
+;; -----------------------------------------------------------------------------
+;; Finding #A (P1) — claim-events! loses FIFO order after UPDATE … RETURNING
+;; -----------------------------------------------------------------------------
+;;
+;; `claim-events!` wraps the ORDER BY in a subquery, but PostgreSQL does NOT
+;; preserve that order through UPDATE … RETURNING. Two ready events for the
+;; same session can therefore be returned in arbitrary order, breaking the
+;; queue's advertised FIFO semantics.
+
+(deftest ^:integration claim-events-preserves-deliver-at-order-test
+  (testing "events for the same session are returned in (deliver_at, id) order after UPDATE … RETURNING"
+    (let [queue (pg-eq/new-queue *pool* "claim-fifo")
+          session-id :fifo-session
+          received (atom [])]
+      ;; Insert 5 events in reverse delivery order so any planner-level
+      ;; reordering inside UPDATE … RETURNING is observable.
+      (doseq [i [5 4 3 2 1]]
+        (sp/send! queue {}
+                  {:event  (keyword (str "event-" i))
+                   :target session-id
+                   :data   {:ix i}}))
+      (sp/receive-events! queue {}
+                          (fn [_env event]
+                            (swap! received conj (:name event))))
+      ;; With a single claim of all 5 events, we should observe them in
+      ;; insertion (== deliver_at) order regardless of UPDATE … RETURNING's
+      ;; physical order.
+      (is (= [:event-5 :event-4 :event-3 :event-2 :event-1] @received)
+          "claim-events! must hand events to the handler in FIFO order"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #B (P1) — receive-events! keeps processing after a handler throws
+;; -----------------------------------------------------------------------------
+;;
+;; After the catch block releases the failed event, the doseq continues and
+;; later events in the same batch run BEFORE the released event is retried.
+;; For a single session, that permanently reorders the event stream after any
+;; transient handler error.
+
+(deftest ^:integration receive-events-stops-processing-after-handler-failure-test
+  (testing "later events in the same batch are not processed after an earlier event's handler throws"
+    (let [queue (pg-eq/new-queue *pool* "fail-stops-batch")
+          session-id :failure-order-session
+          processed (atom [])
+          attempts (atom 0)]
+      (sp/send! queue {} {:event :first  :target session-id :data {}})
+      (sp/send! queue {} {:event :second :target session-id :data {}})
+      ;; First call: first-event handler throws. Second event MUST NOT run in
+      ;; the same batch. receive-events! should stop and leave the remaining
+      ;; events for the next claim cycle.
+      (sp/receive-events! queue {}
+                          (fn [_env event]
+                            (swap! attempts inc)
+                            (when (= :first (:name event))
+                              (throw (ex-info "transient" {})))
+                            (swap! processed conj (:name event))))
+      (is (= [] @processed)
+          ":second must not be processed while :first's released claim is pending retry")
+      (is (= 1 @attempts)
+          "handler is only called once per batch once a failure stops the loop"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #C (P2) — queue-depth throws on the :session-id filter
+;; -----------------------------------------------------------------------------
+;;
+;; `(update :where conj [:= :target-session-id …])` turns `[:is :processed-at
+;; nil]` into `[:is :processed-at nil [:= :target-session-id …]]`, which
+;; HoneySQL formats as the illegal SQL `processed_at IS NULL IS (…)`.
+
+(deftest ^:integration queue-depth-session-filter-is-valid-sql-test
+  (testing "queue-depth with :session-id must format to valid SQL and return the correct count"
+    (let [queue (pg-eq/new-queue *pool* "queue-depth-filter")
+          s1 :qd-filter-s1
+          s2 :qd-filter-s2]
+      (doseq [i (range 3)]
+        (sp/send! queue {} {:event :a :target s1 :data {:ix i}}))
+      (doseq [i (range 2)]
+        (sp/send! queue {} {:event :b :target s2 :data {:ix i}}))
+      (is (= 3 (pg-eq/queue-depth *pool* {:session-id s1})))
+      (is (= 2 (pg-eq/queue-depth *pool* {:session-id s2})))
+      (is (= 5 (pg-eq/queue-depth *pool*))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #D (P2) — dispatch-terminal-event! drops :invoke-id
+;; -----------------------------------------------------------------------------
+;;
+;; The InvocationProcessor contract depends on completion/error events
+;; carrying the originating `:invoke-id` so `handle-external-invocations!` can
+;; run finalize and autoforward. The worker's terminal dispatch omits it.
+
+(deftest dispatch-terminal-event-includes-invoke-id-test
+  (testing "terminal events emitted by the job worker carry the originating :invoke-id"
+    (let [dispatch-fn @#'com.fulcrologic.statecharts.jobs.worker/dispatch-terminal-event!
+          sent        (atom nil)
+          event-queue (reify sp/EventQueue
+                        (send! [_ _env send-request]
+                          (reset! sent send-request)
+                          true)
+                        (cancel! [_ _env _sid _sendid] true)
+                        (receive-events! [_ _env _h] nil)
+                        (receive-events! [_ _env _h _opts] nil))
+          job {:id (UUID/randomUUID)
+               :session-id :job-parent
+               :invokeid :durable-job-invocation
+               :terminal-event-name ":done.invoke.durable-job-invocation"
+               :terminal-event-data {:result 42}}]
+      (dispatch-fn event-queue {} job {})
+      (is (= :durable-job-invocation
+             (or (:invoke-id @sent) (:invokeid @sent)))
+          "terminal send! must include the invoke-id for finalize/autoforward handling"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #E (P2) — durable-job job-type loses keyword namespace
+;; -----------------------------------------------------------------------------
+;;
+;; `start-invocation!` stores `job-type` via `(name src)`, so
+;; `:my.app/send-email` becomes `"send-email"`. The worker resolves handlers
+;; from `(keyword job-type)` / raw string — namespaced handler keys miss, and
+;; two namespaces sharing the same local name would collide in storage.
+
+(deftest durable-job-preserves-namespaced-src-test
+  (testing "start-invocation! stores :src such that (keyword stored) round-trips namespaced keywords"
+    (let [sent-type  (atom nil)
+          event-queue (reify sp/EventQueue
+                        (send! [_ _env _sr] true)
+                        (cancel! [_ _env _sid _sendid] true)
+                        (receive-events! [_ _env _h] nil)
+                        (receive-events! [_ _env _h _opts] nil))
+          data-model (wmdm/new-flat-model)
+          env        {::sc/session-id :parent-ns
+                      ::sc/event-queue event-queue
+                      ::sc/data-model data-model
+                      ::sc/vwmem (volatile! {::sc/session-id :parent-ns
+                                             ::sc/data-model {}})}
+          processor  (durable-job/->DurableJobInvocationProcessor :fake-pool nil)]
+      (with-redefs [job-store/create-job!
+                    (fn [_pool params]
+                      (reset! sent-type (:job-type params))
+                      (UUID/randomUUID))]
+        (sp/start-invocation! processor env
+                              {:invokeid :ns-invoke
+                               :src      :my.app/send-email
+                               :params   {}})
+        (is (string? @sent-type))
+        (is (= :my.app/send-email (keyword @sent-type))
+            "(keyword stored-job-type) must round-trip to the original namespaced keyword")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #F (P2) — event_queue.event->row strips / crashes on non-string invoke-id
+;; -----------------------------------------------------------------------------
+;;
+;; `(name invoke-id)` throws for UUID/numeric invoke IDs and strips namespaces
+;; from keyword IDs. row->event hands back the raw string, so typed round-trip
+;; is lost.
+
+(deftest ^:integration event-invoke-id-roundtrip-preserves-type-test
+  (testing ":invoke-id round-trips through the queue for keyword (namespaced), UUID, and numeric IDs"
+    (let [queue    (pg-eq/new-queue *pool* "invoke-id-roundtrip")
+          target   :invoke-id-session
+          kw-id    :my.invoke/finalize-me
+          uuid-id  (UUID/randomUUID)
+          number-id 42
+          received (atom [])]
+      (doseq [iid [kw-id uuid-id number-id]]
+        (sp/send! queue {} {:event :e :target target :invoke-id iid :data {}}))
+      (sp/receive-events! queue {}
+                          (fn [_env event]
+                            (swap! received conj (:invokeid event))))
+      (is (= [kw-id uuid-id number-id] @received)
+          ":invoke-id must come back with its original type after the queue round-trip"))))

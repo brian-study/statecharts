@@ -88,6 +88,11 @@
                    (sp/send! event-queue env
                      {:event event-name
                       :target session-id
+                      ;; The InvocationProcessor contract requires terminal
+                      ;; events to carry the originating invoke-id so
+                      ;; handle-external-invocations! can run finalize and
+                      ;; autoforward against the right <invoke> element.
+                      :invoke-id invokeid
                       :data (or terminal-event-data {})})
                    (when wake-event-loop-fn (wake-event-loop-fn)))]
     (if-let [check-result (when get-session-state-fn

@@ -41,7 +41,15 @@
   (start-invocation! [_ {::sc/keys [event-queue] :as env} {:keys [invokeid src params]}]
     (let [session-id (env/session-id env)
           new-id     (random-uuid)
-          job-type   (if (keyword? src) (name src) (str src))
+          ;; Preserve keyword namespaces in the stored job-type. `(name src)`
+          ;; on a keyword like :my.app/send-email returns "send-email" — the
+          ;; worker then resolves handlers via (keyword job-type) = :send-email
+          ;; and misses a handler registered under the original namespaced
+          ;; key. Stripping just the leading ':' preserves both namespace and
+          ;; name so round-trip is lossless.
+          job-type   (cond
+                       (keyword? src) (subs (str src) 1)
+                       :else          (str src))
           ;; Per the InvocationProcessor protocol: return `false` and emit an
           ;; :error.platform event to the parent session if start fails.
           ;; create-job! can throw when it exhausts race retries (see v2.0.2

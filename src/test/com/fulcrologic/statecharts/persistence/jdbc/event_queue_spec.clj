@@ -356,8 +356,11 @@
           (:source-session-id row) => ":source-session"
           "has send-id"
           (:send-id row) => "my-send"
-          "has invoke-id"
-          (:invoke-id row) => "my-invoke"))))
+          ;; invoke-id is stored via pr-str so the type survives the round-trip;
+          ;; for a string input that means the stored form is the quoted EDN
+          ;; form. row->event reads it back with edn/read-string.
+          "invoke-id is stored in EDN form"
+          (:invoke-id row) => "\"my-invoke\""))))
 
   (component "event->row falls back to source as target"
     (let [send-request {:event :test
@@ -392,7 +395,8 @@
                :target-session-id ":target"
                :source-session-id ":source"
                :send-id "send-123"
-               :invoke-id "invoke-456"
+               ;; Stored form (pr-str'd) for a string invoke-id
+               :invoke-id "\"invoke-456\""
                :event-data (core/freeze {})}
           event (#'eq/row->event row)]
       (behavior "includes source session ID"
@@ -404,7 +408,7 @@
           (:sendid event) => "send-123"
           (::sc/send-id event) => "send-123"))
 
-      (behavior "includes invoke-id"
+      (behavior "round-trips invoke-id back to its original type"
         (assertions
           (:invokeid event) => "invoke-456"))))
 
