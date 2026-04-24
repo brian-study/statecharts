@@ -51,47 +51,22 @@
       (str/starts-with? s "\"") (try (edn/read-string s) (catch Exception _ s))
       :else                     (keyword s))))
 
-(def ^:private tagged-number-re
-  ;; Matches Clojure literals produced by pr-str for BigInt / BigDecimal / Ratio:
-  ;; 42N, -42N, 3.14M, -0.001M, 1E+10M, 1.5E-10M, 1/2, -3/7.
-  ;; Mirrors `core/tagged-number-re`; kept private here rather than requiring
-  ;; the var so this ns stays independent.
-  #"-?\d+(\.\d+)?([Ee][+-]?\d+)?[NM]|-?\d+/-?\d+")
-
 (defn- parse-invoke-id
   "Read an invoke-id from the DB back to its original type.
 
    New rows (2.0.4+) store `(pr-str invoke-id)` — keywords, UUIDs, numbers,
    and strings all round-trip through EDN. Legacy rows (pre-2.0.4) stored
-   `(name invoke-id)` as a bare string — but the original was always a
-   keyword (pre-2.0.4 write path used `(name x)` which only accepts
-   keyword/string/symbol, and the dominant case was keyword), so we
-   restore the keyword shape on readback.
+   `(name invoke-id)` as a bare string — originally always a keyword, so
+   we restore the keyword shape on readback. Matches
+   `job_store/str->invokeid`'s legacy fallback so both decoders agree on
+   the type of a legacy bare row; `handle-external-invocations!` matches
+   by `=` against the original idlocation value and a string vs keyword
+   mismatch would silently skip finalize/autoforward.
 
-   Matches `job_store/str->invokeid`'s legacy fallback so both decoders
-   agree on the type of a legacy bare row; `handle-external-invocations!`
-   matches by `=` against the original idlocation value and a string vs
-   keyword mismatch would silently skip finalize/autoforward."
+   Since 2.0.17 this is a thin wrapper around `core/decode-id` so all
+   invoke-id/session-id decoding shares one tagged-number-aware path."
   [s]
-  (when s
-    (cond
-      (str/starts-with? s ":")                ; keyword (incl. namespaced)
-      (try (edn/read-string s) (catch Exception _ s))
-
-      (str/starts-with? s "\"")               ; quoted string
-      (try (edn/read-string s) (catch Exception _ s))
-
-      (str/starts-with? s "#")                ; tagged literal, e.g. #uuid "..."
-      (try (edn/read-string s) (catch Exception _ s))
-
-      (re-matches #"-?\d+(?:\.\d+)?" s)       ; plain Long / Double
-      (try (edn/read-string s) (catch Exception _ s))
-
-      (re-matches tagged-number-re s)         ; BigInt 42N / BigDecimal 3.14M / Ratio 1/2
-      (try (edn/read-string s) (catch Exception _ s))
-
-      :else                                   ; legacy bare row — always keyword
-      (keyword s))))
+  (core/decode-id s {:legacy-fallback :keyword}))
 
 (defn- event->row
   "Convert a send-request to a database row."

@@ -5,8 +5,6 @@
    and claimed by the worker for execution. Designed for restart safety with
    lease-based ownership and idempotent operations."
   (:require
-   [clojure.edn :as edn]
-   [clojure.string :as str]
    [com.fulcrologic.statecharts.events :as evts]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [taoensso.timbre :as log])
@@ -16,15 +14,13 @@
 ;; -----------------------------------------------------------------------------
 ;; Invokeid Serialization
 ;; -----------------------------------------------------------------------------
-
-(defn- numeric-bare-name?
-  "Does the bare keyword/symbol name look like a number? If so its bare
-   serialisation would be indistinguishable from a Long/Double on
-   readback — we must disambiguate by storing the leading `:`."
-  [bare]
-  (boolean
-    (or (parse-long bare)
-        (parse-double bare))))
+;;
+;; Thin wrappers over `core/encode-id` / `core/decode-id` since 2.0.17.
+;; Durable-job rows use `:uuid-shape :tagged` (UUIDs stored via pr-str as
+;; `#uuid \"…\"`) and `:keyword-shape / :symbol-shape :bare-unless-numeric`
+;; for back-compat with pre-2.0.8 rows that wrote keyword invoke-ids via
+;; `(name x)`. Decoder uses `:legacy-fallback :keyword` so a bare legacy
+;; row decodes as a keyword rather than a string.
 
 (defn invokeid->str
   "Serialize an invokeid to a string for DB storage, preserving type
@@ -36,8 +32,9 @@
    - Keywords whose name would parse as a number (`:42`, `:3.14`,
      `:-dashy`) are stored with the leading `:` via `pr-str` so the
      decoder can tell them apart from real numbers.
-   - Everything else (string, UUID, Long, Double, etc.) is stored via
-     `pr-str` so the leading marker distinguishes it from a bare keyword.
+   - Everything else (string, UUID, Long, Double, BigInt, BigDecimal,
+     Ratio, …) is stored via `pr-str` so the leading marker
+     distinguishes it from a bare keyword.
 
    Why it matters: `handle-external-invocations!` matches terminal
    events to `<invoke>` elements by `=` against the original
@@ -46,64 +43,18 @@
    misses finalize/autoforward even though the terminal event name
    looks right."
   [invokeid]
-  (cond
-    (keyword? invokeid)
-    (let [bare (subs (str invokeid) 1)]
-      (if (numeric-bare-name? bare)
-        (pr-str invokeid)              ; ":42" — leading marker disambiguates
-        bare))
-
-    (symbol? invokeid)
-    (let [bare (str invokeid)]
-      (if (numeric-bare-name? bare)
-        (pr-str invokeid)              ; same as for keywords
-        bare))
-
-    :else
-    (pr-str invokeid)))
-
-(def ^:private tagged-number-re
-  ;; Matches Clojure literals produced by pr-str for BigInt / BigDecimal / Ratio:
-  ;; 42N, -42N, 3.14M, -0.001M, 1E+10M, 1.5E-10M, 1/2, -3/7.
-  ;; Mirrors `core/tagged-number-re` and `event_queue/tagged-number-re`.
-  #"-?\d+(\.\d+)?([Ee][+-]?\d+)?[NM]|-?\d+/-?\d+")
+  (core/encode-id invokeid {:uuid-shape    :tagged
+                            :keyword-shape :bare-unless-numeric
+                            :symbol-shape  :bare-unless-numeric}))
 
 (defn str->invokeid
   "Deserialize an invokeid from the DB back to its original type.
 
-   Shape-aware inverse of `invokeid->str`:
-   - leading `:` (keyword literal) → EDN read,
-   - leading `\"` (quoted string) or `#` (tagged literal, e.g. `#uuid`) →
-     EDN read,
-   - integer/decimal string → `parse-long` / `parse-double`,
-   - BigInt/BigDecimal/Ratio shape (`42N`, `3.14M`, `1/2`) → EDN read so
-     the original numeric subtype is preserved. Required so worker-emitted
-     `done.invoke.*` / `error.invoke.*` events carry the right `:invoke-id`
-     for `handle-external-invocations!` to match by `=`,
-   - anything else → `(keyword s)` (bare keyword form, legacy rows).
-
-   Symbols round-trip as keywords — the bare form can't be distinguished
-   from a keyword's bare form without a type marker."
+   Shape-aware inverse of `invokeid->str`. Symbols round-trip as
+   keywords — the bare form can't be distinguished from a keyword's
+   bare form without a type marker."
   [s]
-  (when s
-    (cond
-      (str/starts-with? s ":")
-      (try (edn/read-string s) (catch Exception _ s))
-
-      (str/starts-with? s "\"")
-      (try (edn/read-string s) (catch Exception _ s))
-
-      (str/starts-with? s "#")
-      (try (edn/read-string s) (catch Exception _ s))
-
-      :else
-      (or (parse-long s)
-          (parse-double s)
-          ;; Gated on the regex so legacy bare keyword rows like "my-invoke"
-          ;; don't accidentally read as symbols via edn/read-string.
-          (when (re-matches tagged-number-re s)
-            (try (edn/read-string s) (catch Exception _ nil)))
-          (keyword s)))))
+  (core/decode-id s {:legacy-fallback :keyword}))
 
 ;; -----------------------------------------------------------------------------
 ;; Internal Helpers

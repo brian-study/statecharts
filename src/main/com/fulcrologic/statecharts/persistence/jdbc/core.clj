@@ -24,73 +24,134 @@
 ;; through without manual conversion.
 
 ;; -----------------------------------------------------------------------------
-;; Session ID Serialization
+;; ::sc/id Serialization (shared by session-id, invoke-id, and durable jobs)
 ;; -----------------------------------------------------------------------------
+;;
+;; `::sc/id` is `[:or uuid? number? keyword? string?]`. Each JDBC subsystem
+;; (session-id, queued events, durable jobs) stores these identifiers as a
+;; shape-inspecting text form. Before 2.0.17 each subsystem had its own
+;; encoder and decoder with slightly different rules, and edge cases
+;; (ratios, bigints, big decimals, tagged-numeric keywords) kept slipping
+;; through whichever site had been patched least recently. `encode-id` and
+;; `decode-id` below are the single source of truth; the public wrappers
+;; `session-id->str` / `str->session-id` and the private helpers in
+;; `event_queue.clj` / `job_store.clj` configure them via options for the
+;; legacy on-disk shapes they must remain compatible with.
 
-(defn session-id->str
-  "Convert a session ID to a string for database storage.
+(def tagged-number-re
+  "Matches Clojure literals produced by pr-str for numeric subtypes whose
+   type would otherwise be lost by `parse-long` / `parse-double`:
 
-   `::sc/id` allows `[:or uuid? number? keyword? string?]`. Each type is written
-   so the inverse `str->session-id` can recover it:
-   - **Strings** via `pr-str` (quoted) so `\"42\"`, `\":kw\"`, or a UUID-shaped
-     string can't be mis-decoded as another type.
-   - **Keywords** via `pr-str` (keeps leading `:` / namespace).
-   - **UUIDs** bare (`(str uuid)`) — back-compat with pre-2.0.11 deployments.
-   - **Numbers** via `pr-str` — preserves `N` / `M` / ratio tags for BigInt,
-     BigDecimal, and Ratio. Plain Long and Double pr-str to the same bare
-     form as `(str n)`, so on-disk shape for Long/Double is unchanged from
-     2.0.12."
-  [session-id]
-  (cond
-    (string? session-id)  (pr-str session-id)
-    (keyword? session-id) (pr-str session-id)
-    (uuid? session-id)    (str session-id)
-    (number? session-id)  (pr-str session-id)
-    :else                 (str session-id)))
-
-(def ^:private tagged-number-re
-  ;; Matches Clojure literals produced by pr-str for BigInt / BigDecimal / Ratio:
-  ;;   42N, -42N, 99999999999N        — BigInt
-  ;;   3.14M, -0.001M, 0M             — plain BigDecimal
-  ;;   1E+10M, 9.99E+50M, 1.5E-10M    — scientific BigDecimal (Clojure produces
-  ;;                                     these for values outside a narrow
-  ;;                                     magnitude window)
-  ;;   1/2, -3/7                      — Ratio
+       42N, -42N, 99999999999N        — BigInt
+       3.14M, -0.001M, 0M             — plain BigDecimal
+       1E+10M, 9.99E+50M, 1.5E-10M    — scientific BigDecimal (Clojure
+                                         produces these outside a narrow
+                                         magnitude window)
+       1/2, -3/7                      — Ratio"
   #"-?\d+(\.\d+)?([Ee][+-]?\d+)?[NM]|-?\d+/-?\d+")
 
-(defn str->session-id
-  "Convert a string from database back to original session ID type.
+(defn- numeric-bare-name?
+  "Would the bare name parse as a Long or Double? If so, a keyword/symbol
+   whose name is `bare` needs the leading `:` via pr-str so the decoder
+   can tell it apart from a real number. Referenced by
+   `:keyword-shape :bare-unless-numeric`."
+  [^String bare]
+  (boolean (or (parse-long bare) (parse-double bare))))
 
-   Shape-inspecting inverse of `session-id->str`:
-   - leading `\"` → EDN read (quoted string form)
-   - leading `:` → EDN read (keyword)
-   - parses as long/double → number (most numeric session-ids)
-   - matches `<digits>N` / `<digits>.<digits>M` / `<int>/<int>` → EDN read
-     (BigInt / BigDecimal / Ratio — other `number?` subtypes allowed by
-     `::sc/id`)
-   - looks like a UUID → UUID
-   - otherwise → bare string (legacy rows pre-2.0.11 that stored strings
-     unquoted)
+(defn encode-id
+  "Serialize an `::sc/id` value to a string for DB storage.
+
+   Options:
+   - `:uuid-shape`    — `:bare` (just `(str uuid)`) or `:tagged`
+                        (`\"#uuid \\\"…\\\"\"`). Sessions use `:bare` for
+                        back-compat with pre-2.0.11 rows; invoke-ids
+                        use `:tagged`.
+   - `:keyword-shape` — `:marked` (always `pr-str`, yields `\":kw\"`) or
+                        `:bare-unless-numeric` (bare name unless it would
+                        parse as a number, in which case `pr-str`).
+                        Sessions use `:marked`; durable jobs use
+                        `:bare-unless-numeric` for back-compat with
+                        pre-2.0.8 rows that stored keyword invoke-ids
+                        via `(name x)`.
+   - `:symbol-shape`  — same split as `:keyword-shape` (symbols aren't in
+                        `::sc/id` but some callers pass them through).
+
+   Strings, numbers, and anything else always go through `pr-str`.
+   BigInt/BigDecimal/Ratio round-trip because `pr-str` preserves their
+   `N` / `M` / ratio markers; plain Long/Double pr-str to the same text
+   as `(str n)` so on-disk shape is unchanged for them."
+  [x {:keys [uuid-shape keyword-shape symbol-shape]
+      :or {uuid-shape    :bare
+           keyword-shape :marked
+           symbol-shape  :marked}}]
+  (cond
+    (string? x)  (pr-str x)
+    (keyword? x) (case keyword-shape
+                   :marked              (pr-str x)
+                   :bare-unless-numeric (let [bare (subs (str x) 1)]
+                                          (if (numeric-bare-name? bare)
+                                            (pr-str x)
+                                            bare)))
+    (symbol? x)  (case symbol-shape
+                   :marked              (pr-str x)
+                   :bare-unless-numeric (let [bare (str x)]
+                                          (if (numeric-bare-name? bare)
+                                            (pr-str x)
+                                            bare)))
+    (uuid? x)    (case uuid-shape
+                   :bare   (str x)
+                   :tagged (pr-str x))
+    (number? x)  (pr-str x)
+    :else        (pr-str x)))
+
+(defn decode-id
+  "Deserialize a DB string back to the original `::sc/id` value.
+
+   Shape-inspecting inverse of `encode-id`. All callers share the same
+   decoder — the only difference is the legacy fallback for a bare row
+   that isn't a number / UUID / marked literal:
+
+   - `:legacy-fallback :string`  — return the bare string. Sessions use
+                                   this because pre-2.0.11 session-ids
+                                   stored strings bare.
+   - `:legacy-fallback :keyword` — coerce to keyword. Invoke-ids (both
+                                   queued and durable) use this because
+                                   pre-2.0.4 / pre-2.0.8 wrote keyword
+                                   invoke-ids via `(name x)`.
+
+   Note: a bare row whose content is digit-only (e.g. `\"42\"`) decodes
+   as a Long regardless of fallback choice — that migration note is in
+   CHANGELOG 2.0.13 for sessions and applies equally to invoke-ids."
+  [s {:keys [legacy-fallback]
+      :or {legacy-fallback :string}}]
+  (when s
+    (cond
+      (.startsWith ^String s "\"") (try (edn/read-string s) (catch Exception _ s))
+      (.startsWith ^String s ":")  (try (edn/read-string s) (catch Exception _ s))
+      (.startsWith ^String s "#")  (try (edn/read-string s) (catch Exception _ s))
+      :else (or (parse-long s)
+                (parse-double s)
+                (parse-uuid s)
+                (when (re-matches tagged-number-re s)
+                  (try (edn/read-string s) (catch Exception _ nil)))
+                (case legacy-fallback
+                  :keyword (keyword s)
+                  :string  s)))))
+
+(defn session-id->str
+  "Serialize a session-id for DB storage. See `encode-id` for the scheme."
+  [session-id]
+  (encode-id session-id {:uuid-shape :bare :keyword-shape :marked :symbol-shape :marked}))
+
+(defn str->session-id
+  "Deserialize a DB session-id string. See `decode-id` for the scheme.
 
    Migration note (2.0.13): legacy pre-2.0.11 rows that stored a *string*
    session-id whose contents were digit-only (e.g. `\"12345\"`) will now
    decode as the number `12345`. Post-2.0.11 rows are unaffected because
    strings carry the pr-str quote marker."
   [s]
-  (when s
-    (cond
-      (.startsWith ^String s "\"") (try (edn/read-string s) (catch Exception _ s))
-      (.startsWith ^String s ":")  (try (edn/read-string s) (catch Exception _ s))
-      :else                        (or (parse-long s)
-                                       (parse-double s)
-                                       (parse-uuid s)
-                                       ;; Tagged numeric forms (42N, 3.14M, 1/2).
-                                       ;; Gated on the regex so legacy bare
-                                       ;; string ids like "my-session" don't
-                                       ;; accidentally read as a symbol.
-                                       (when (re-matches tagged-number-re s)
-                                         (try (edn/read-string s) (catch Exception _ nil)))
-                                       s))))
+  (decode-id s {:legacy-fallback :string}))
 
 ;; -----------------------------------------------------------------------------
 ;; Binary Serialization (nippy)

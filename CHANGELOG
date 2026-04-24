@@ -1,3 +1,56 @@
+2.0.17
+------
+
+Consolidate the three parallel `::sc/id` encode/decode sites into a
+single implementation. Pure refactor — no behavioural change, no new
+coverage, nothing on disk moves.
+
+`core.clj` now owns `encode-id` and `decode-id` (plus the shared
+`tagged-number-re` and `numeric-bare-name?` helpers). Each call site
+is a thin options-carrying wrapper:
+
+- `core/session-id->str` / `str->session-id` — sessions. Options pin
+  `:uuid-shape :bare` (pre-2.0.11 compat), `:keyword-shape :marked`,
+  `:legacy-fallback :string` on decode.
+- `event_queue/parse-invoke-id` — queued events. `:legacy-fallback
+  :keyword` on decode; writer is already `pr-str` in `event->row` so
+  it maps to `:uuid-shape :tagged, :keyword-shape :marked` on encode.
+- `job_store/invokeid->str` / `str->invokeid` — durable jobs.
+  `:uuid-shape :tagged, :keyword-shape :bare-unless-numeric,
+  :symbol-shape :bare-unless-numeric` (pre-2.0.8 compat);
+  `:legacy-fallback :keyword` on decode.
+
+Incidental, not a behaviour change for any real deployment: the
+unified decoder now includes the `#`-tagged-literal branch and
+`parse-uuid` on every call site. Previously `job_store/str->invokeid`
+lacked `parse-uuid`, and `str->session-id` lacked `#`. Neither was
+reachable in practice (`job_store` always wrote UUIDs with `#uuid`
+so bare UUIDs never appeared; `session-id->str` never wrote `#`
+forms) but the asymmetry was confusing.
+
+Motivation: the five patch releases between 2.0.12 and 2.0.16 each
+fixed one of these encoders in isolation and left the others behind.
+New `::sc/id` edge cases (ratios, bigints, scientific bigdecimals,
+tagged-numeric keywords, collision-adjacent shapes) kept slipping
+through whichever site had been patched least recently. With a single
+implementation, a future fix in one place covers all three subsystems.
+
+Also fixes framing in the 2.0.16 entry:
+
+- The atomic-ACK [P1] was framed as a regression; in fact the split
+  transaction has existed since the JDBC backend landed in cb8f2f2
+  (v2.0.0). 2.0.12 only added the promise-await step; it did not
+  create the crash window. The 2.0.16 fix closes a pre-existing gap,
+  not a recent regression.
+- The tagged-numeric invoke-id [P2] items were framed as regressions
+  too. They are better read as incomplete fixes: v2.0.4 and v2.0.8
+  rewrote the invoke-id encoders to handle broader types but the
+  accompanying decoders never caught up to BigInt / BigDecimal /
+  Ratio. 2.0.16 finished what those releases started.
+- The explicit `:child-session-id` [P1] item was correctly framed
+  as a regression — 7d018d7 (2026-02-02) introduced unconditional
+  scoping that overrode user-specified session ids.
+
 2.0.16
 ------
 
