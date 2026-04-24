@@ -62,6 +62,12 @@
     :else
     (pr-str invokeid)))
 
+(def ^:private tagged-number-re
+  ;; Matches Clojure literals produced by pr-str for BigInt / BigDecimal / Ratio:
+  ;; 42N, -42N, 3.14M, -0.001M, 1E+10M, 1.5E-10M, 1/2, -3/7.
+  ;; Mirrors `core/tagged-number-re` and `event_queue/tagged-number-re`.
+  #"-?\d+(\.\d+)?([Ee][+-]?\d+)?[NM]|-?\d+/-?\d+")
+
 (defn str->invokeid
   "Deserialize an invokeid from the DB back to its original type.
 
@@ -70,6 +76,10 @@
    - leading `\"` (quoted string) or `#` (tagged literal, e.g. `#uuid`) →
      EDN read,
    - integer/decimal string → `parse-long` / `parse-double`,
+   - BigInt/BigDecimal/Ratio shape (`42N`, `3.14M`, `1/2`) → EDN read so
+     the original numeric subtype is preserved. Required so worker-emitted
+     `done.invoke.*` / `error.invoke.*` events carry the right `:invoke-id`
+     for `handle-external-invocations!` to match by `=`,
    - anything else → `(keyword s)` (bare keyword form, legacy rows).
 
    Symbols round-trip as keywords — the bare form can't be distinguished
@@ -89,6 +99,10 @@
       :else
       (or (parse-long s)
           (parse-double s)
+          ;; Gated on the regex so legacy bare keyword rows like "my-invoke"
+          ;; don't accidentally read as symbols via edn/read-string.
+          (when (re-matches tagged-number-re s)
+            (try (edn/read-string s) (catch Exception _ nil)))
           (keyword s)))))
 
 ;; -----------------------------------------------------------------------------

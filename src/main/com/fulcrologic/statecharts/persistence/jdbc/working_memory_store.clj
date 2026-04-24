@@ -75,24 +75,37 @@
    - Without version metadata (initial save from `start!`): INSERT with
      `ON CONFLICT DO UPDATE` so concurrent starts of the same session-id
      deterministically end in the last writer's state rather than one of
-     them surfacing a duplicate-key error."
-  [ds session-id wmem]
-  (let [expected-version (core/get-version wmem)]
-    (if expected-version
-      (update-session! ds session-id wmem expected-version)
-      (let [src (get wmem ::sc/statechart-src)]
-        (core/execute! ds
-                       {:insert-into :statechart-sessions
-                        :values [{:session-id (core/session-id->str session-id)
-                                  :statechart-src (pr-str src)
-                                  :working-memory (core/freeze wmem)
-                                  :version 1}]
-                        :on-conflict [:session-id]
-                        :do-update-set {:working-memory :excluded.working-memory
-                                        :statechart-src :excluded.statechart-src
-                                        :version [:+ :statechart-sessions.version 1]
-                                        :updated-at [:now]}})
-        true))))
+     them surfacing a duplicate-key error.
+
+   When `on-save-hooks` is non-empty, the save runs inside a transaction
+   and each hook is invoked with the tx connection before commit. If any
+   hook throws, the WM write rolls back with it — this is how callers
+   (e.g. the JDBC event queue) piggy-back atomic ACK-on-save semantics."
+  [ds session-id wmem on-save-hooks]
+  (let [expected-version (core/get-version wmem)
+        write!           (fn [conn]
+                           (if expected-version
+                             (update-session! conn session-id wmem expected-version)
+                             (let [src (get wmem ::sc/statechart-src)]
+                               (core/execute! conn
+                                              {:insert-into :statechart-sessions
+                                               :values [{:session-id (core/session-id->str session-id)
+                                                         :statechart-src (pr-str src)
+                                                         :working-memory (core/freeze wmem)
+                                                         :version 1}]
+                                               :on-conflict [:session-id]
+                                               :do-update-set {:working-memory :excluded.working-memory
+                                                               :statechart-src :excluded.statechart-src
+                                                               :version [:+ :statechart-sessions.version 1]
+                                                               :updated-at [:now]}})
+                               true)))]
+    (if (seq on-save-hooks)
+      (core/with-tx [tx ds]
+        (write! tx)
+        (doseq [hook on-save-hooks]
+          (hook tx))
+        true)
+      (write! ds))))
 
 (defn- delete-session!
   "Delete a session by ID."
@@ -114,8 +127,10 @@
   (get-working-memory [_ _env session-id]
     (fetch-session datasource session-id))
 
-  (save-working-memory! [_ _env session-id wmem]
-    (upsert-session! datasource session-id wmem))
+  (save-working-memory! [_ env session-id wmem]
+    ;; `::sc/on-save-hooks` in env lets callers (e.g. the JDBC event queue)
+    ;; participate in the save's transaction so ACK-on-save is atomic.
+    (upsert-session! datasource session-id wmem (::sc/on-save-hooks env)))
 
   (delete-working-memory! [_ _env session-id]
     (delete-session! datasource session-id)))

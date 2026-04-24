@@ -1,3 +1,70 @@
+2.0.16
+------
+
+Four correctness findings from the post-2.0.15 review.
+
+* **[P1]** Event ACK is atomic with working-memory persistence.
+  Previously `receive-events!` marked a row processed in a separate
+  transaction after the handler returned, and the handler's
+  `save-working-memory!` had already committed in its own transaction.
+  A crash, DB error, or connection loss between the WM save and the ACK
+  left WM advanced but the event unacked — stale-claim recovery then
+  re-delivered it against already-advanced state, running
+  non-idempotent actions twice (direct "exactly-once" violation).
+  `JdbcWorkingMemoryStore/save-working-memory!` now reads
+  `::sc/on-save-hooks` from env and runs them inside its own
+  transaction. The JDBC event queue injects a `mark-processed!` hook so
+  the ACK commits atomically with the save. A separate post-handler
+  `mark-processed!` is kept as an idempotent fallback for handlers that
+  succeed without calling `save-working-memory!` (e.g. terminated /
+  missing session). Regression:
+  `save-working-memory-runs-on-save-hooks-test`.
+
+* **[P1]** `StatechartInvocationProcessor` preserves explicit
+  `:child-session-id`. 7d018d7 unconditionally rewrote every child
+  session to `<parent>.<invokeid>`. That was correct for
+  auto-generated invokeids (collision avoidance) but regressed the
+  documented `:child-session-id` routing option — a route configured
+  with `:child-session-id "admin"` no longer created a child session
+  at `"admin"`, so `scf/send!`, URL sync, and child restoration all
+  stopped finding the child. The algorithm now threads
+  `:explicit-id?` through `start-invocation!`, `stop-invocation!`, and
+  `forward-event!`; when true, the processor uses the invokeid as the
+  session-id directly (matching the pre-7d018d7 documented behavior
+  and the `elements.cljc` docstring on `invoke`). Auto-generated
+  invokeids remain scoped. `stop-invocation!` and `forward-event!`
+  also probe the WM store for both scoped and bare forms to cover
+  legacy callers that don't yet thread `:explicit-id?` through.
+  Regression:
+  `statechart-invocation-preserves-explicit-session-id-test`.
+  `invocation/statechart-spec.cljc` updated to assert the new
+  (correct) explicit-id behavior — the old scoped assertion was
+  codifying the bug.
+
+* **[P2]** Tagged numeric invoke-ids in queued events now decode back
+  as numbers, not keywords. `event->row` persists `:invoke-id` via
+  `pr-str`, so `42N`, `3.14M`, `1/2` were stored as tagged numeric
+  literals. The old `parse-invoke-id` only EDN-read plain integers and
+  decimals; tagged forms fell through to `(keyword s)`, surfacing as
+  `:42N` / `:1/2` in the handler. `handle-external-invocations!`
+  matches by `=` against the original idlocation value, so queued
+  terminal events silently skipped finalize/autoforward for those
+  ids. `parse-invoke-id` now has the same tagged-number regex gate as
+  `core/str->session-id`. Regression:
+  `parse-invoke-id-accepts-tagged-numeric-literals-test`.
+
+* **[P2]** Tagged numeric invoke-ids in durable-job hydration now
+  decode back as numbers, not keywords. Same class of bug as above,
+  on a different code path: `invokeid->str` wrote non-keyword
+  invoke-ids via `pr-str`, but `str->invokeid` only reconstructed
+  UUIDs, quoted strings, and plain longs/doubles. A durable job
+  started with invokeid `42N` / `3.14M` / `1/2` hydrated back as
+  `:42N` / …, so the worker dispatched `done.invoke.*` /
+  `error.invoke.*` with the wrong id and the parent never saw the
+  completion event. `str->invokeid` now has the same regex-gated
+  EDN-read branch. Regression:
+  `str-invokeid-accepts-tagged-numeric-literals-test`.
+
 2.0.15
 ------
 

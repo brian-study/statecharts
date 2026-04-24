@@ -780,10 +780,11 @@
               (sp/update! data-model env {:ops [(ops/assign idlocation invokeid)]}))
             (log/debugf "Starting invocation id = %s, type = %s, src = %s, params = %s"
               (str invokeid) (str type) (str src) (str params))
-            (sp/start-invocation! processor env {:invokeid invokeid
-                                                  :src      src
-                                                  :type     type
-                                                  :params   params})))
+            (sp/start-invocation! processor env {:invokeid     invokeid
+                                                  :src          src
+                                                  :type         type
+                                                  :params       params
+                                                  :explicit-id? (boolean explicit-id?)})))
         (do
           (log/error "Cannot start invocation. No processor for " invocation)
           (sp/send! event-queue env {:event             :error.execution
@@ -829,14 +830,15 @@
           [{::sc/keys [data-model] :as env} invocation]
           (let [details (invocation-details env invocation)]
             (maybe-then details
-              (fn [{:keys [type processor id idlocation]}]
+              (fn [{:keys [type processor id idlocation explicit-id?]}]
                 (when processor
                   (let [invokeid (if idlocation
                                    (sp/get-at data-model env idlocation)
                                    id)]
                     (log/debug "Stopping invocation" invokeid)
-                    (sp/stop-invocation! processor env {:invokeid invokeid
-                                                        :type     type})))))))]
+                    (sp/stop-invocation! processor env {:invokeid     invokeid
+                                                        :type         type
+                                                        :explicit-id? (boolean explicit-id?)})))))))]
   (defn cancel-active-invocations!
     [{::sc/keys [statechart] :as env} state]
     (log/spy :debug "Stopping invocations for " state)
@@ -973,12 +975,13 @@
           [{::sc/keys [data-model] :as env} invocation event]
           (let [details (invocation-details env invocation)]
             (maybe-then details
-              (fn [{:keys [type processor id idlocation]}]
+              (fn [{:keys [type processor id idlocation explicit-id?]}]
                 (when processor
                   (let [invokeid (if idlocation (sp/get-at data-model env idlocation) id)]
-                    (sp/forward-event! processor env {:invokeid invokeid
-                                                      :type     type
-                                                      :event    event})))))))]
+                    (sp/forward-event! processor env {:invokeid     invokeid
+                                                      :type         type
+                                                      :event        event
+                                                      :explicit-id? (boolean explicit-id?)})))))))]
 
   (defn handle-external-invocations!
     [{::sc/keys [statechart vwmem data-model] :as env}

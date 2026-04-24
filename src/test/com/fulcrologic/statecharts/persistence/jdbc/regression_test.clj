@@ -12,12 +12,14 @@
    [com.fulcrologic.statecharts.data-model.working-memory-data-model :as wmdm]
    [com.fulcrologic.statecharts.elements :refer [state]]
    [com.fulcrologic.statecharts.invocation.durable-job :as durable-job]
+   [com.fulcrologic.statecharts.invocation.statechart :as i.statechart]
    [com.fulcrologic.statecharts.jobs.worker :as worker]
    [com.fulcrologic.statecharts.persistence.jdbc :as pg-sc]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
    [com.fulcrologic.statecharts.persistence.jdbc.event-queue :as pg-eq]
    [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
    [com.fulcrologic.statecharts.persistence.jdbc.schema :as schema]
+   [com.fulcrologic.statecharts.persistence.jdbc.working-memory-store :as pg-wms]
    [com.fulcrologic.statecharts.protocols :as sp]
    [com.fulcrologic.statecharts.registry.local-memory-registry :as mem-reg]
    [next.jdbc.connection :as jdbc.connection]
@@ -1079,3 +1081,213 @@
           "pre-2.0.14 BigInt row decodes as Long (documented migration)")
       (is (= Long (class (core/str->session-id legacy-bigint-row)))
           "class is Long, not BigInt — users relying on class identity must re-save"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #Z1 (P2) — tagged numeric invoke-ids mis-decoded in event_queue
+;; -----------------------------------------------------------------------------
+;;
+;; event->row persists :invoke-id via pr-str, so 42N, 3.14M, 1/2 are stored
+;; as tagged numeric literals. parse-invoke-id only reads plain integers and
+;; decimals; tagged forms fall through to (keyword s), and the handler sees
+;; :42N / :3.14M / :1/2 instead of the original number. finalize/autoforward
+;; matching in handle-external-invocations! uses = against the original
+;; idlocation value, so those queued terminal events silently skip bookkeeping.
+;; Same fallback regex should match core's tagged-number-re.
+
+(deftest parse-invoke-id-accepts-tagged-numeric-literals-test
+  (let [parse @#'pg-eq/parse-invoke-id]
+    (testing "BigInt invokeids round-trip via pr-str → parse-invoke-id"
+      (doseq [n [42N -42N 0N (bigint "99999999999999999999999")]]
+        (let [stored    (pr-str n)
+              read-back (parse stored)]
+          (is (= n read-back)
+              (str "BigInt invokeid " (pr-str n) " must decode as BigInt;"
+                   " stored=" (pr-str stored) " read-back=" (pr-str read-back)))
+          (is (= (class n) (class read-back))
+              (str "class must be preserved; got " (pr-str (class read-back)))))))
+
+    (testing "BigDecimal invokeids round-trip"
+      (doseq [n [3.14M -3.14M 0.001M 1E+10M]]
+        (let [stored    (pr-str n)
+              read-back (parse stored)]
+          (is (= n read-back)
+              (str "BigDecimal invokeid " (pr-str n) " must decode as BigDecimal;"
+                   " read-back=" (pr-str read-back))))))
+
+    (testing "Ratio invokeids round-trip"
+      (doseq [n [(/ 1 2) (/ -3 7)]]
+        (let [stored    (pr-str n)
+              read-back (parse stored)]
+          (is (= n read-back)
+              (str "Ratio invokeid " (pr-str n) " must decode as Ratio;"
+                   " read-back=" (pr-str read-back))))))
+
+    (testing "legacy bare-keyword rows still decode as keywords"
+      (is (= :legacy (parse "legacy"))
+          "bare non-numeric strings still decode as keywords (legacy invariant)"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #Z2 (P2) — tagged numeric invoke-ids mis-decoded in job_store
+;; -----------------------------------------------------------------------------
+;;
+;; invokeid->str writes non-keyword invoke-ids with pr-str, but str->invokeid
+;; only reconstructs UUIDs, quoted strings, and plain longs/doubles. Numeric
+;; invoke-ids such as 42N, 3.14M, 1/2 therefore hydrate as keywords and the
+;; worker dispatches done.invoke.* / error.invoke.* against the wrong id.
+;; handle-external-invocations! compares the decoded id by = and the parent
+;; chart never sees the completion event.
+
+(deftest str->invokeid-accepts-tagged-numeric-literals-test
+  (testing "BigInt / BigDecimal / Ratio invokeids round-trip through invokeid->str / str->invokeid"
+    (doseq [n [42N -42N 0N 3.14M -3.14M 0.001M 1E+10M (/ 1 2) (/ -3 7)]]
+      (let [stored    (job-store/invokeid->str n)
+            read-back (job-store/str->invokeid stored)]
+        (is (= n read-back)
+            (str "invokeid " (pr-str n) " must round-trip as its original type;"
+                 " stored=" (pr-str stored) " read-back=" (pr-str read-back)))
+        (is (= (class n) (class read-back))
+            (str "class must be preserved; got " (pr-str (class read-back)))))))
+
+  (testing "plain Long/Double still round-trip (no regression)"
+    (doseq [n [42 -1 0 3.14 -2.5]]
+      (is (= n (job-store/str->invokeid (job-store/invokeid->str n)))
+          (str "plain numeric invokeid " (pr-str n) " still round-trips"))))
+
+  (testing "keyword invokeids still round-trip"
+    (doseq [k [:kw :my-ns/kw :42]]
+      (is (= k (job-store/str->invokeid (job-store/invokeid->str k)))
+          (str "keyword invokeid " (pr-str k) " still round-trips")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #Z3 (P1) — event ACK is not atomic with working-memory persistence
+;; -----------------------------------------------------------------------------
+;;
+;; receive-events! marks the row processed AFTER handler returns, in a
+;; separate transaction. Between save-working-memory! (inside handler) and
+;; mark-processed! there is a window: a crash / DB error / connection loss
+;; leaves the WM advanced but the event not acked. Stale-claim recovery
+;; re-delivers the event → handler runs a second time against advanced
+;; state → non-idempotent actions run twice → "exactly-once" is violated.
+;;
+;; Fix: save-working-memory! runs pre-commit hooks from env inside its own
+;; transaction, so the queue can hand it a `mark-processed!` hook that
+;; commits atomically with the WM update.
+
+(deftest ^:integration save-working-memory-runs-on-save-hooks-test
+  (let [chart    (chart/statechart {:initial :s1} (state {:id :s1}))
+        registry (mem-reg/new-registry)
+        _        (sp/register-statechart! registry :test-chart chart)
+        store    (pg-wms/new-store *pool*)
+        env      {::sc/statechart-registry registry}
+        wmem     (core/attach-version {::sc/session-id :ack-atomic-session
+                                       ::sc/statechart-src :test-chart
+                                       ::sc/configuration #{:s1}
+                                       ::sc/running? true} nil)]
+
+    (testing "save-working-memory! accepts and runs ::sc/on-save-hooks inside its tx"
+      (let [hook-called? (atom false)
+            hook-tx      (atom nil)
+            hook         (fn [tx]
+                           (reset! hook-called? true)
+                           (reset! hook-tx tx))
+            env+hooks    (assoc env ::sc/on-save-hooks [hook])]
+        (sp/save-working-memory! store env+hooks :ack-atomic-session wmem)
+        (is @hook-called?
+            "on-save hook must fire during save-working-memory!")
+        (is (some? @hook-tx)
+            "hook must receive a JDBC transaction/connection so it can participate in the save's tx")))
+
+    (testing "a throwing hook rolls back the WM write (atomicity)"
+      ;; Read current version first so we can assert it DOESN'T change.
+      (let [wmem-before  (sp/get-working-memory store env :ack-atomic-session)
+            throwing-hook (fn [_tx] (throw (ex-info "simulated mid-commit failure" {})))
+            env+bad-hook  (assoc env ::sc/on-save-hooks [throwing-hook])
+            next-wmem     (assoc wmem-before ::sc/configuration #{:s2})]
+        (is (thrown? Exception
+              (sp/save-working-memory! store env+bad-hook :ack-atomic-session next-wmem))
+            "hook throw must propagate")
+        (let [wmem-after (sp/get-working-memory store env :ack-atomic-session)]
+          (is (= (::sc/configuration wmem-before) (::sc/configuration wmem-after))
+              "WM must not have advanced — hook throw inside the tx must roll back the save"))))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #Z4 (P1) — StatechartInvocationProcessor regresses explicit child-session-id
+;; -----------------------------------------------------------------------------
+;;
+;; 7d018d7 unconditionally scopes every child session to <parent>.<invokeid>.
+;; That breaks the documented :child-session-id option in routing.cljc: a
+;; route configured with :child-session-id "admin" no longer creates a child
+;; at "admin" (the invoke element's :id becomes the invokeid, which is then
+;; scoped). Code that addresses the child directly by its explicit session-id
+;; (scf/send!, URL sync, restoring an existing child) stops finding it.
+;;
+;; Fix: when the algorithm marks the invocation as `:explicit-id? true`
+;; (user provided :id on the invoke element), the processor uses invokeid
+;; directly as the session-id. Auto-generated invokeids remain scoped.
+
+(deftest statechart-invocation-preserves-explicit-session-id-test
+  (let [sent-events (atom [])
+        saved-wms   (atom {})
+        event-queue (reify sp/EventQueue
+                      (send! [_ _env req] (swap! sent-events conj req) true)
+                      (cancel! [_ _env _sid _sendid] true)
+                      (receive-events! [_ _env _h] nil)
+                      (receive-events! [_ _env _h _opts] nil))
+        registry    (mem-reg/new-registry)
+        _           (sp/register-statechart! registry :child-chart
+                      (chart/statechart {:initial :c1} (state {:id :c1})))
+        wm-store    (reify sp/WorkingMemoryStore
+                      (get-working-memory [_ _env sid] (get @saved-wms sid))
+                      (save-working-memory! [_ _env sid wmem]
+                        (swap! saved-wms assoc sid wmem)
+                        true)
+                      (delete-working-memory! [_ _env sid]
+                        (swap! saved-wms dissoc sid)
+                        true))
+        processor   (reify sp/Processor
+                      (start! [_ _env _src {::sc/keys [session-id] :as _data}]
+                        {::sc/session-id session-id
+                         ::sc/configuration #{:c1}})
+                      (process-event! [_ _env wmem _event] wmem)
+                      (exit! [_ _env _wmem _terminal?] nil))
+        inv-proc    (i.statechart/new-invocation-processor)
+        parent-sid  :parent-sess
+        env         {::sc/session-id            parent-sid
+                     ::sc/vwmem                 (volatile! {::sc/session-id parent-sid})
+                     ::sc/event-queue           event-queue
+                     ::sc/working-memory-store  wm-store
+                     ::sc/processor             processor
+                     ::sc/statechart-registry   registry}]
+
+    (testing "explicit-id? → child session stored at invokeid, not at scoped form"
+      (sp/start-invocation! inv-proc env
+        {:invokeid     "admin"
+         :src          :child-chart
+         :params       {}
+         :explicit-id? true})
+      (is (contains? @saved-wms "admin")
+          "child session must be stored under the user-supplied id \"admin\"")
+      (is (not (contains? @saved-wms (str parent-sid ".admin")))
+          "must NOT create the scoped form when id is explicit"))
+
+    (testing "no explicit-id? → child session stored at scoped form (default behaviour preserved)"
+      (reset! saved-wms {})
+      (sp/start-invocation! inv-proc env
+        {:invokeid "auto-gen.abc-123"
+         :src      :child-chart
+         :params   {}})
+      (is (contains? @saved-wms (str parent-sid "." "auto-gen.abc-123"))
+          "without explicit-id? the child is scoped to parent to avoid collisions")
+      (is (not (contains? @saved-wms "auto-gen.abc-123"))
+          "must NOT store at the bare invokeid"))
+
+    (testing "stop-invocation! finds the explicit-id child"
+      ;; set up an explicit-id child
+      (reset! saved-wms {"admin" {::sc/session-id "admin"
+                                  ::sc/configuration #{:c1}
+                                  ::sc/running? true}})
+      (sp/stop-invocation! inv-proc env
+        {:invokeid     "admin"
+         :explicit-id? true})
+      (is (not (contains? @saved-wms "admin"))
+          "stop-invocation! must delete the explicit-id child by its bare id"))))

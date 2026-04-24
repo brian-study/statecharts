@@ -223,11 +223,17 @@
             (contains? (::sc/configuration parent-wmem) :parent/active) => true)))
 
       (behavior "child session exists"
+        ;; The invoke element above supplies `:id :my-child`, which per
+        ;; elements.cljc's docstring IS the session id of the invoked chart
+        ;; when explicitly provided. Auto-generated invokeids get scoped to
+        ;; parent, but user-supplied ones are used verbatim — required so the
+        ;; documented `:child-session-id` routing option in the Fulcro
+        ;; integration still addresses the child at the expected id.
         (let [wmstore    (::sc/working-memory-store env)
-              scoped-id  (str :parent-session "." :my-child)
-              child-wmem (sp/get-working-memory wmstore env scoped-id)]
+              explicit-id (str :my-child)
+              child-wmem (sp/get-working-memory wmstore env explicit-id)]
           (assertions
-            "child created at parent-scoped session-id"
+            "child created at the user-supplied invoke id (not parent-scoped)"
             (some? child-wmem) => true
             "child knows parent"
             (::sc/parent-session-id child-wmem) => :parent-session))))))

@@ -51,6 +51,13 @@
       (str/starts-with? s "\"") (try (edn/read-string s) (catch Exception _ s))
       :else                     (keyword s))))
 
+(def ^:private tagged-number-re
+  ;; Matches Clojure literals produced by pr-str for BigInt / BigDecimal / Ratio:
+  ;; 42N, -42N, 3.14M, -0.001M, 1E+10M, 1.5E-10M, 1/2, -3/7.
+  ;; Mirrors `core/tagged-number-re`; kept private here rather than requiring
+  ;; the var so this ns stays independent.
+  #"-?\d+(\.\d+)?([Ee][+-]?\d+)?[NM]|-?\d+/-?\d+")
+
 (defn- parse-invoke-id
   "Read an invoke-id from the DB back to its original type.
 
@@ -77,7 +84,10 @@
       (str/starts-with? s "#")                ; tagged literal, e.g. #uuid "..."
       (try (edn/read-string s) (catch Exception _ s))
 
-      (re-matches #"-?\d+(?:\.\d+)?" s)       ; number
+      (re-matches #"-?\d+(?:\.\d+)?" s)       ; plain Long / Double
+      (try (edn/read-string s) (catch Exception _ s))
+
+      (re-matches tagged-number-re s)         ; BigInt 42N / BigDecimal 3.14M / Ratio 1/2
       (try (edn/read-string s) (catch Exception _ s))
 
       :else                                   ; legacy bare row — always keyword
@@ -266,8 +276,19 @@
 
                   :else
                   (try
-                    (let [event (row->event row)
-                          handler-result (handler env event)]
+                    (let [event           (row->event row)
+                          ;; Inject an on-save hook so that the handler's
+                          ;; working-memory save and the event ACK commit
+                          ;; in the same transaction. Without this the
+                          ;; handler's save tx and the separate
+                          ;; mark-processed! tx have a crash window: a
+                          ;; crash between them leaves WM advanced but the
+                          ;; event unacked, and stale-claim recovery then
+                          ;; re-delivers it against already-advanced state
+                          ;; — non-idempotent actions run twice.
+                          env-with-ack    (update env ::sc/on-save-hooks
+                                                  (fnil conj []) #(mark-processed! % event-id))
+                          handler-result  (handler env-with-ack event)]
                       ;; If the handler returns a Promesa promise (async
                       ;; processor, or any promise-returning handler), wait
                       ;; for it to resolve BEFORE marking the row processed.
@@ -277,6 +298,11 @@
                       ;; return non-promise values — the deref is a no-op.
                       (when (p/promise? handler-result)
                         @handler-result)
+                      ;; Fallback ACK for handlers that succeed without
+                      ;; ever calling `save-working-memory!` (e.g. session
+                      ;; already terminated / session gone). `mark-processed!`
+                      ;; is idempotent (UPDATE by event-id), so a hook-path
+                      ;; ACK already committed makes this a no-op.
                       (core/with-tx [tx datasource]
                         (mark-processed! tx event-id))
                       (let [duration-ms (/ (- (System/nanoTime) start-time) 1e6)]
