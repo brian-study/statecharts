@@ -76,13 +76,21 @@
                                      :data              {:message "Could not invoke child chart. Not registered."
                                                          :target  src}})
           false)
-        (let [result (sp/start! processor env src {::sc/invocation-data         (or params {})
-                                                    ::sc/session-id              child-session-id
-                                                    ::sc/parent-session-id       source-session-id
-                                                    :org.w3.scxml.event/invokeid invokeid})
-              save!  (fn [wmem]
-                       (sp/save-working-memory! working-memory-store env child-session-id wmem)
-                       true)]
+        ;; Strip any parent-event ACK hooks from env before starting the
+        ;; child. The JDBC event queue installs `::sc/on-save-hooks` so the
+        ;; parent event is ACKed atomically with the parent WM save — but
+        ;; the child's first save uses this same env, which would fire the
+        ;; parent's hook prematurely and mark the parent event processed
+        ;; before the parent itself has saved. A later parent save failure
+        ;; (e.g. optimistic-lock conflict) then silently loses the event.
+        (let [child-env (dissoc env ::sc/on-save-hooks)
+              result    (sp/start! processor child-env src {::sc/invocation-data         (or params {})
+                                                             ::sc/session-id              child-session-id
+                                                             ::sc/parent-session-id       source-session-id
+                                                             :org.w3.scxml.event/invokeid invokeid})
+              save!     (fn [wmem]
+                          (sp/save-working-memory! working-memory-store child-env child-session-id wmem)
+                          true)]
           (if (p/promise? result)
             (p/then result save!)
             (save! result))))))

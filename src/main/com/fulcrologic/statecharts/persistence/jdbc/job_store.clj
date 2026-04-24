@@ -405,12 +405,44 @@
     (mapv hydrate-job-row rows)))
 
 (defn mark-terminal-event-dispatched!
-  "Mark a job's terminal event as dispatched (reconciliation complete)."
+  "Mark a job's terminal event as dispatched (reconciliation complete).
+
+   Prefer `claim-terminal-dispatch!` which is atomic — this helper is
+   kept for callers that have other reasons to set the timestamp
+   (e.g. backfill scripts)."
   [ds job-id]
   (core/execute! ds
     {:update :statechart-jobs
      :set {:terminal-event-dispatched-at [:now]}
      :where [:= :id job-id]}))
+
+(defn claim-terminal-dispatch!
+  "Atomically claim a terminal job for dispatch. Returns `true` if this
+   caller won the claim and should `send!` the terminal event; `false`
+   if another worker or reconciler has already claimed the slot.
+
+   The claim commits `terminal_event_dispatched_at = now()` conditionally
+   on `terminal_event_dispatched_at IS NULL`, so simultaneous callers
+   serialize at the row and only the first wins. This eliminates
+   duplicate `done.invoke.*` / `error.invoke.*` events across concurrent
+   reconcilers and the gap between a worker's `succeed!` / `fail!` and
+   its own `mark-terminal-event-dispatched!`.
+
+   Trade-off: a crash between the claim committing and the subsequent
+   `send!` commit now loses the terminal event (previously that same
+   crash produced a duplicate). The loss is auditable — query for rows
+   with `terminal_event_dispatched_at IS NOT NULL` but no matching
+   entry in `statechart_events`. Duplicate dispatch drove divergent
+   parent transitions and was the greater harm."
+  [ds job-id]
+  (pos? (core/affected-row-count
+          (core/execute! ds
+            {:update :statechart-jobs
+             :set {:terminal-event-dispatched-at [:now]
+                   :updated-at                   [:now]}
+             :where [:and
+                     [:= :id job-id]
+                     [:= :terminal-event-dispatched-at nil]]}))))
 
 (defn store-partial-result!
   "Store intermediate result for idempotent retry (I9).

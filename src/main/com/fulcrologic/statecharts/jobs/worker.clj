@@ -155,12 +155,17 @@
                                   {:job-id (str id)})]
             ;; Store terminal state + event in one write
             (if (job-store/complete! pool id owner-id result done-event-name event-data)
-              ;; Try immediate dispatch
-              (when (dispatch-terminal-event! event-queue env
-                      (assoc job :terminal-event-name done-event-name
-                                 :terminal-event-data event-data)
-                      exec-opts)
-                (job-store/mark-terminal-event-dispatched! pool id))
+              ;; Atomically claim the dispatch slot before send!ing — the
+              ;; reconciler can also see this row, and without the claim
+              ;; a race would double-fire done.invoke.*. The claim +
+              ;; dispatch ordering means a crash between them loses the
+              ;; terminal event (auditable via dispatched_at set with no
+              ;; event row) — the lesser evil vs duplicate transitions.
+              (when (job-store/claim-terminal-dispatch! pool id)
+                (dispatch-terminal-event! event-queue env
+                  (assoc job :terminal-event-name done-event-name
+                             :terminal-event-data event-data)
+                  exec-opts))
               (log/info "Skipping completion write; job no longer active/owned"
                         {:job-id id :session-id session-id :owner-id owner-id})))
           (log/info "Job lease lost after execution, abandoning"
@@ -175,12 +180,12 @@
           (case (job-store/fail! pool id owner-id attempt max-attempts error
                                  error-event-name event-data)
             :failed
-            ;; If permanently failed, try immediate dispatch
-            (when (dispatch-terminal-event! event-queue env
-                    (assoc job :terminal-event-name error-event-name
-                               :terminal-event-data event-data)
-                    exec-opts)
-              (job-store/mark-terminal-event-dispatched! pool id))
+            ;; Same atomic-claim pattern as the success branch.
+            (when (job-store/claim-terminal-dispatch! pool id)
+              (dispatch-terminal-event! event-queue env
+                (assoc job :terminal-event-name error-event-name
+                           :terminal-event-data event-data)
+                exec-opts))
             :retry-scheduled nil
             :ignored
             (log/info "Skipping fail update; job no longer active/owned"
@@ -192,14 +197,22 @@
 
 (defn- reconcile-undispatched!
   "Find jobs that completed/failed but whose terminal event wasn't dispatched,
-   and dispatch them. Handles the complete-then-crash gap."
+   and dispatch them. Handles the complete-then-crash gap.
+
+   The claim-before-send ordering is load-bearing: multiple reconciler
+   passes (across workers or after a crash mid-dispatch) would otherwise
+   see the same row and double-fire the terminal event. Since
+   `get-session-state-fn` is optional and the parent may not have
+   consumed the first event yet, duplicates can drive double transitions.
+   `claim-terminal-dispatch!` is a conditional UPDATE that the first
+   caller wins; subsequent callers see `false` and skip."
   [pool event-queue env {:keys [limit] :or {limit 10} :as exec-opts}]
   (try
     (let [jobs (job-store/get-undispatched-terminal-jobs pool limit)]
       (doseq [job jobs]
         (try
-          (when (dispatch-terminal-event! event-queue env job exec-opts)
-            (job-store/mark-terminal-event-dispatched! pool (:id job)))
+          (when (job-store/claim-terminal-dispatch! pool (:id job))
+            (dispatch-terminal-event! event-queue env job exec-opts))
           (catch Exception e
             (log/warn e "Failed to reconcile terminal event"
                       {:job-id (:id job)})))))
@@ -225,11 +238,14 @@
                                     (:max-attempts job)
                                     (:max-attempts job)
                                     error error-event-name event-data))
-            (when (dispatch-terminal-event! event-queue env
-                    (assoc job :terminal-event-name error-event-name
-                               :terminal-event-data event-data)
-                    exec-opts)
-              (job-store/mark-terminal-event-dispatched! pool (:id job)))))))))
+            ;; Same atomic-claim pattern as execute-job!'s terminal paths —
+            ;; the reconciler can race this dispatch and the claim keeps
+            ;; it single-delivery.
+            (when (job-store/claim-terminal-dispatch! pool (:id job))
+              (dispatch-terminal-event! event-queue env
+                (assoc job :terminal-event-name error-event-name
+                           :terminal-event-data event-data)
+                exec-opts))))))))
 
 (defn- shutdown-executor!
   [^ExecutorService executor owner-id shutdown-timeout-ms]

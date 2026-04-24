@@ -1,3 +1,72 @@
+2.0.19
+------
+
+Four runtime-correctness findings from the post-2.0.18 review.
+
+* **[P1]** `StatechartInvocationProcessor` strips the parent's
+  `::sc/on-save-hooks` from env before starting a child chart. The
+  JDBC event queue injects a hook so the parent event is ACKed
+  atomically with the parent's WM save. 2.0.16 routed `start-invocation!`
+  through that same env — so entering a `:statechart` invoke marked
+  the parent event processed as soon as the CHILD session saved, BEFORE
+  the parent actually saved. A later parent save failure (optimistic
+  lock conflict, DB error) released the claim but the row already had
+  `processed_at` set, silently losing the parent event while the child
+  chart had been started. Fix: `(dissoc env ::sc/on-save-hooks)` in
+  the path that saves the child's WM. Regression:
+  `statechart-invocation-strips-parent-ack-hooks-from-child-save-test`.
+
+* **[P1]** `JdbcWorkingMemoryStore/delete-working-memory!` now cancels
+  any durable jobs the session owns, in the same transaction that
+  drops the `statechart_sessions` row. Previously only the session
+  row was deleted. When
+  `StatechartInvocationProcessor/stop-invocation!` triggers session
+  deletion on invoke exit, active `:durable-job` rows stayed pending
+  / running: workers kept executing side effects for a session that
+  no longer existed, and later emitted `done.invoke.*` /
+  `error.invoke.*` events that had nowhere valid to go. The tx
+  wraps `job-store/cancel-by-session!` + the session row delete so
+  either both commit or neither does. Cancellation writes
+  `terminal_event_name` on each row so the reconciler can still
+  dispatch `error.invoke.<invokeid>` to any chart that was observing.
+  Regression: `delete-working-memory-cancels-durable-jobs-test`.
+
+* **[P1]** `FlatWorkingMemoryDataModel` reads the pre-9330ee6 legacy
+  data-model key for restart-recovery and rolling-upgrade compat.
+  Commit 9330ee6 (2026-01-11) moved the flat model's storage key from
+  the namespace-local `::wmdm/data-model` to `::sc/data-model`. Working
+  memory persisted before that commit holds its map under the old key;
+  after upgrade, `current-data` returned `nil` and `update!` started a
+  fresh map, so any JDBC-persisted session looked blank until recreated.
+  Since `pg-env` uses the flat model by default, this broke rolling
+  upgrades and restart recovery for existing deployments. `current-data`
+  now returns the merge of legacy-key and new-key data (new wins on
+  collision); `update!` reads from that same merged view and, on the
+  first write, dissocs the legacy key so repeated reads/updates don't
+  resurrect data that was subsequently deleted. Regression:
+  `flat-data-model-reads-legacy-data-model-key-test`.
+
+* **[P2]** Terminal job dispatch is now atomically claimed so
+  concurrent reconcilers cannot duplicate-dispatch. The previous flow
+  was plain SELECT → `send!` → `mark-terminal-event-dispatched!`;
+  two reconciler passes (across workers, or after a crash between
+  `send!` and the mark) could observe the same row and enqueue the
+  same `done.invoke.*` / `error.invoke.*` twice. Because
+  `get-session-state-fn` is optional and the parent may not have
+  consumed the first event yet, duplicates drove double transitions.
+  New `job-store/claim-terminal-dispatch!` is a conditional
+  `UPDATE ... WHERE terminal_event_dispatched_at IS NULL` that returns
+  `true` for the first caller and `false` for everyone else. The
+  reconciler and all three `execute-job!` terminal paths (success,
+  handler failure, no-handler failure) now claim before `send!`.
+  Trade-off: a crash between the claim commit and the event-queue
+  `send!` commit now loses the terminal event (previously that same
+  crash produced a duplicate). Single-event loss is auditable —
+  rows with `terminal_event_dispatched_at` set but no corresponding
+  row in `statechart_events`. Duplicate dispatch drove divergent
+  parent state and was the greater harm. Regression:
+  `claim-terminal-dispatch-is-atomic-test`.
+
 2.0.18
 ------
 

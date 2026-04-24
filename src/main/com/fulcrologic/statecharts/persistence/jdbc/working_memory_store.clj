@@ -7,6 +7,7 @@
    [clojure.edn :as edn]
    [com.fulcrologic.statecharts :as sc]
    [com.fulcrologic.statecharts.persistence.jdbc.core :as core]
+   [com.fulcrologic.statecharts.persistence.jdbc.job-store :as job-store]
    [com.fulcrologic.statecharts.protocols :as sp]
    [taoensso.timbre :as log]))
 
@@ -108,15 +109,24 @@
       (write! ds))))
 
 (defn- delete-session!
-  "Delete a session by ID."
+  "Delete a session by ID and cancel any durable jobs it owns.
+
+   Cancellation writes a terminal event per job so the reconciler can
+   dispatch `error.invoke.<invokeid>` for observers. Both happen inside
+   one transaction so either both commit or neither does — if a
+   mid-delete failure leaves active jobs running for a deleted session,
+   workers would keep executing side effects for a session that no
+   longer exists and later emit terminal events pointed at nothing."
   [ds session-id]
-  (let [result (core/execute! ds
-                              {:delete-from :statechart-sessions
-                               :where [:= :session-id (core/session-id->str session-id)]})]
-    (when (pos? (core/affected-row-count result))
-      (log/debug "Session deleted"
-                 {:session-id session-id}))
-    true))
+  (core/with-tx [tx ds]
+    (job-store/cancel-by-session! tx session-id)
+    (let [result (core/execute! tx
+                                {:delete-from :statechart-sessions
+                                 :where [:= :session-id (core/session-id->str session-id)]})]
+      (when (pos? (core/affected-row-count result))
+        (log/debug "Session deleted"
+                   {:session-id session-id}))
+      true)))
 
 ;; -----------------------------------------------------------------------------
 ;; WorkingMemoryStore Implementation

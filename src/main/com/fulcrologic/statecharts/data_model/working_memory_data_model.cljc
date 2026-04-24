@@ -147,6 +147,23 @@
    all-data
    paths))
 
+(def ^:private legacy-flat-data-model-key
+  "Pre-9330ee6 (2026-01-11), `FlatWorkingMemoryDataModel` wrote its map
+   under this namespace-local key. Sessions persisted before that commit
+   still have their data there; post-upgrade reads must fall through to
+   it so rolling upgrades and restart recovery don't lose state. `update!`
+   migrates the data to `::sc/data-model` on first write and drops the
+   legacy key so subsequent reads/updates see only the new shape."
+  :com.fulcrologic.statecharts.data-model.working-memory-data-model/data-model)
+
+(defn- effective-flat-data
+  "Merge of legacy-key and new-key data, with the new key winning on
+   collisions. Used by `current-data` and `update!` so pre-9330ee6
+   sessions keep working after upgrade."
+  [wmem]
+  (merge (get wmem legacy-flat-data-model-key)
+         (get wmem ::sc/data-model)))
+
 (deftype FlatWorkingMemoryDataModel []
   sp/DataModel
   (load-data [provider {::sc/keys [vwmem] :as env} src]
@@ -160,7 +177,7 @@
               (catch #?(:clj Throwable :cljs :default) e
                 (log/error e "Unable to load data from" src)))
        :cljs (log/error "src not supported.")))
-  (current-data [_ {::sc/keys [vwmem]}] (some-> vwmem deref ::sc/data-model))
+  (current-data [_ {::sc/keys [vwmem]}] (some-> vwmem deref effective-flat-data))
   (get-at [provider env path]
     (let [data (sp/current-data provider env)]
       (cond
@@ -172,9 +189,15 @@
   (update! [provider {::sc/keys [statechart vwmem] :as env} {:keys [ops] :as args}]
     (when-not (map? args)
       (log/error "You forgot to wrap your operations in a map!" args))
-    (let [all-data (some-> vwmem deref ::sc/data-model)
+    ;; Start from the merged view so pre-9330ee6 legacy data survives,
+    ;; then write the result under the new key and drop the legacy key
+    ;; so subsequent passes don't resurrect stale values after a `delete`.
+    (let [all-data (some-> vwmem deref effective-flat-data)
           new-data (reduce (fn [acc op] (run-flat-op acc op)) all-data ops)]
-      (vswap! vwmem assoc ::sc/data-model new-data))))
+      (vswap! vwmem (fn [m]
+                      (-> m
+                          (assoc ::sc/data-model new-data)
+                          (dissoc legacy-flat-data-model-key)))))))
 
 (defn new-flat-model
   "Creates a data model where data is stored in the working memory of the state machine.

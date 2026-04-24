@@ -9,6 +9,7 @@
    [com.fulcrologic.statecharts.algorithms.v20150901-async-impl :as async-impl]
    [com.fulcrologic.statecharts.algorithms.v20150901-impl :as impl]
    [com.fulcrologic.statecharts.chart :as chart]
+   [com.fulcrologic.statecharts.data-model.operations :as ops]
    [com.fulcrologic.statecharts.data-model.working-memory-data-model :as wmdm]
    [com.fulcrologic.statecharts.elements :refer [state]]
    [com.fulcrologic.statecharts.invocation.durable-job :as durable-job]
@@ -1419,3 +1420,237 @@
   (testing "nil input returns nil"
     (is (nil? (core/decode-id nil {:legacy-fallback :string})))
     (is (nil? (core/decode-id nil {:legacy-fallback :keyword})))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AA (P1) — child-session saves must not run parent's ACK hooks
+;; -----------------------------------------------------------------------------
+;;
+;; When the JDBC event queue processes a parent event it adds
+;; `::sc/on-save-hooks` to env so the parent event is ACKed atomically with
+;; the parent WM save. `start-invocation!` reuses the same env to save the
+;; CHILD session's WM — so entering a `:statechart` invoke marks the parent
+;; event processed as soon as the child's first save commits, BEFORE the
+;; parent actually saves. If the parent save later fails (e.g. optimistic
+;; lock conflict), the claim is released but the row is already acked →
+;; parent event is lost while the child chart has been started.
+
+(deftest statechart-invocation-strips-parent-ack-hooks-from-child-save-test
+  (let [hook-calls (atom [])
+        saved-wms  (atom {})
+        event-queue (reify sp/EventQueue
+                      (send! [_ _env _req] true)
+                      (cancel! [_ _env _sid _sendid] true)
+                      (receive-events! [_ _env _h] nil)
+                      (receive-events! [_ _env _h _opts] nil))
+        registry    (mem-reg/new-registry)
+        _           (sp/register-statechart! registry :child-chart
+                      (chart/statechart {:initial :c1} (state {:id :c1})))
+        wm-store    (reify sp/WorkingMemoryStore
+                      (get-working-memory [_ _env sid] (get @saved-wms sid))
+                      (save-working-memory! [_ env sid wmem]
+                        ;; Capture any on-save hooks that would fire during this save.
+                        (when-let [hooks (:com.fulcrologic.statecharts/on-save-hooks env)]
+                          (doseq [h hooks] (h :fake-tx))
+                          (swap! hook-calls conj {:session-id sid :count (count hooks)}))
+                        (swap! saved-wms assoc sid wmem)
+                        true)
+                      (delete-working-memory! [_ _env sid]
+                        (swap! saved-wms dissoc sid)
+                        true))
+        processor   (reify sp/Processor
+                      (start! [_ _env _src {::sc/keys [session-id]}]
+                        {::sc/session-id session-id ::sc/configuration #{:c1}})
+                      (process-event! [_ _env wmem _event] wmem)
+                      (exit! [_ _env _wmem _terminal?] nil))
+        inv-proc    (i.statechart/new-invocation-processor)
+        parent-sid  :parent-session
+        parent-hook-calls (atom 0)
+        parent-hook (fn [_tx] (swap! parent-hook-calls inc))
+        ;; Simulate the env the JDBC event queue hands to the parent handler:
+        ;; it includes the parent-event ACK hook.
+        env         {::sc/session-id            parent-sid
+                     ::sc/vwmem                 (volatile! {::sc/session-id parent-sid})
+                     ::sc/event-queue           event-queue
+                     ::sc/working-memory-store  wm-store
+                     ::sc/processor             processor
+                     ::sc/statechart-registry   registry
+                     ::sc/on-save-hooks         [parent-hook]}]
+
+    (sp/start-invocation! inv-proc env
+      {:invokeid :my-child
+       :src      :child-chart
+       :params   {}})
+
+    (testing "the parent's ACK hook MUST NOT fire when the child session saves"
+      (is (zero? @parent-hook-calls)
+          "parent on-save hook must not fire during child save — if it does, the parent event is ACKed before the parent save commits, so a later parent save failure silently loses the event")
+      (let [child-session-id (str parent-sid "." (str :my-child))
+            child-hook-calls (filter #(= (:session-id %) child-session-id) @hook-calls)]
+        (is (empty? child-hook-calls)
+            "child save must not carry parent's on-save hooks into its env at all")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AB (P1) — FlatWorkingMemoryDataModel must read legacy key after upgrade
+;; -----------------------------------------------------------------------------
+;;
+;; Commit 9330ee6 (2026-01-11) moved the flat data-model storage key from
+;; `::wmdm/data-model` (namespace-local) to `::sc/data-model`. Working memory
+;; persisted before that commit has its flat map under the legacy key; after
+;; upgrade, `current-data` returns nil and `update!` starts a fresh map, so
+;; any existing session on a JDBC backend looks blank until it is recreated.
+;; Because pg-env uses the flat model by default, this breaks rolling upgrades
+;; and restart recovery for any pre-fix deployment.
+
+(deftest flat-data-model-reads-legacy-data-model-key-test
+  (let [legacy-key :com.fulcrologic.statecharts.data-model.working-memory-data-model/data-model
+        model      (wmdm/new-flat-model)]
+
+    (testing "current-data returns data stored under the legacy key"
+      (let [vwmem (volatile! {::sc/session-id :s1
+                              legacy-key       {:counter 42 :label "legacy"}})
+            env   {::sc/vwmem vwmem}]
+        (is (= {:counter 42 :label "legacy"} (sp/current-data model env))
+            "pre-9330ee6 flat-model rows must still surface their data post-upgrade")))
+
+    (testing "new-key data takes precedence when both keys are present"
+      (let [vwmem (volatile! {::sc/session-id   :s1
+                              legacy-key        {:counter 1 :legacy-only :L}
+                              ::sc/data-model   {:counter 2 :new-only :N}})
+            env   {::sc/vwmem vwmem}]
+        (is (= {:counter 2 :legacy-only :L :new-only :N} (sp/current-data model env))
+            "new-key values win on collision; legacy-only keys still visible")))
+
+    (testing "update! migrates legacy data to the new key and drops the legacy key"
+      (let [vwmem (volatile! {::sc/session-id :s1
+                              legacy-key       {:counter 42}})
+            env   {::sc/vwmem vwmem}]
+        (sp/update! model env {:ops [(ops/assign :new-field :new-value)]})
+        (let [wmem @vwmem]
+          (is (= {:counter 42 :new-field :new-value} (::sc/data-model wmem))
+              "new-key now contains both legacy data AND the assigned op's value")
+          (is (nil? (legacy-key wmem))
+              "legacy key is dropped on first update! so repeated updates don't re-merge stale data"))))
+
+    (testing "update! on a session with no data at all still works"
+      (let [vwmem (volatile! {::sc/session-id :fresh})
+            env   {::sc/vwmem vwmem}]
+        (sp/update! model env {:ops [(ops/assign :a 1)]})
+        (is (= {:a 1} (::sc/data-model @vwmem))
+            "no legacy, no new → fresh assignment lands at new key")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AC (P1) — deleting a JDBC session must cancel its durable jobs
+;; -----------------------------------------------------------------------------
+;;
+;; `StatechartInvocationProcessor/stop-invocation!` calls
+;; `delete-working-memory!` on a child session when its invoke state exits.
+;; The JDBC store currently only drops the `statechart_sessions` row —
+;; any pending/running durable jobs for that session stay active. Workers
+;; keep executing side-effects for a session that no longer exists, and
+;; later emit `done.invoke.*` / `error.invoke.*` events that have nowhere
+;; valid to go.
+
+(deftest ^:integration delete-working-memory-cancels-durable-jobs-test
+  (let [store      (pg-wms/new-store *pool*)
+        session-id :deletion-test-session
+        _          (sp/save-working-memory! store {} session-id
+                     {::sc/session-id session-id
+                      ::sc/configuration #{:s1}})
+        job-id     (UUID/randomUUID)
+        _          (job-store/create-job! *pool*
+                     {:id           job-id
+                      :session-id   session-id
+                      :invokeid     :the-invoke
+                      :job-type     "http"
+                      :payload      {}
+                      :max-attempts 3})]
+
+    (testing "pre-condition: job is pending"
+      (let [row (job-store/get-active-job *pool* session-id :the-invoke)]
+        (is (some? row) "job exists before session delete")
+        (is (= "pending" (:status row))
+            "job is in a non-terminal state before session delete")))
+
+    (sp/delete-working-memory! store {} session-id)
+
+    (testing "session row is gone"
+      (is (nil? (sp/get-working-memory store {} session-id))
+          "WM row deleted"))
+
+    (testing "durable job for the deleted session must be cancelled"
+      (let [active (job-store/get-active-job *pool* session-id :the-invoke)]
+        (is (nil? active)
+            "no active (pending/running) job remains for the deleted session — otherwise the worker would keep running side effects")))
+
+    (testing "cancelled job has terminal event recorded for reconciliation"
+      ;; cancel-by-session! writes terminal_event_name on each cancelled
+      ;; row so the reconciler can still dispatch error.invoke.<invokeid>
+      ;; to whoever was listening. This is load-bearing even though the
+      ;; parent session is gone — other charts may have been observing.
+      (let [rows (core/execute-sql! *pool*
+                   "SELECT status, terminal_event_name FROM statechart_jobs WHERE id = ?"
+                   [job-id])
+            row  (first rows)]
+        (is (= "cancelled" (:status row))
+            "job marked cancelled, not left pending/running")
+        (is (some? (:terminal-event-name row))
+            "terminal_event_name set so reconciliation can dispatch error.invoke.*")))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #AD (P2) — terminal job dispatch must atomically claim
+;; -----------------------------------------------------------------------------
+;;
+;; The reconciler fetches undispatched terminal jobs with a plain SELECT,
+;; then dispatches, then writes `terminal_event_dispatched_at`. Two
+;; reconciler passes (across workers, or after a crash between `send!`
+;; and the mark) can see the same row and enqueue `done.invoke.*` /
+;; `error.invoke.*` twice. Because `get-session-state-fn` is optional
+;; and the parent may not have consumed the first event yet, this can
+;; drive duplicate transitions.
+;;
+;; Fix: `claim-terminal-dispatch!` is an atomic conditional UPDATE
+;; (`WHERE terminal_event_dispatched_at IS NULL`) — the first caller
+;; wins, the second gets 0 affected rows and skips. Trade-off: a crash
+;; between the claim commit and `send!` commit now loses the event
+;; (previously it was double-fired). Single-event loss is auditable
+;; (dispatched_at set with no corresponding event row); duplicate
+;; dispatch caused divergent parent state.
+
+(deftest ^:integration claim-terminal-dispatch-is-atomic-test
+  (let [session-id :terminal-dispatch-claim-session
+        job-id     (UUID/randomUUID)
+        _          (job-store/create-job! *pool*
+                     {:id           job-id
+                      :session-id   session-id
+                      :invokeid     :inv-1
+                      :job-type     "http"
+                      :payload      {}
+                      :max-attempts 3})
+        ;; Put the row in terminal state so the reconciler considers it.
+        _ (core/execute-sql! *pool*
+            (str "UPDATE statechart_jobs"
+                 " SET status = 'succeeded',"
+                 "     terminal_event_name = 'done.invoke.inv-1',"
+                 "     terminal_event_data = ?,"
+                 "     lease_owner = NULL,"
+                 "     updated_at = now()"
+                 " WHERE id = ?")
+            [(core/freeze {}) job-id])]
+
+    (testing "the first claim wins; the second sees the row already claimed and returns false"
+      (is (true? (job-store/claim-terminal-dispatch! *pool* job-id))
+          "first caller atomically claims the dispatch slot")
+      (is (false? (job-store/claim-terminal-dispatch! *pool* job-id))
+          "second concurrent caller must NOT also dispatch — dispatched_at is already set"))
+
+    (testing "row reflects the claim"
+      (let [row (first (core/execute-sql! *pool*
+                         "SELECT terminal_event_dispatched_at FROM statechart_jobs WHERE id = ?"
+                         [job-id]))]
+        (is (some? (:terminal-event-dispatched-at row))
+            "terminal_event_dispatched_at is set after a successful claim")))
+
+    (testing "an already-dispatched job is not returned by get-undispatched-terminal-jobs"
+      (let [undispatched (job-store/get-undispatched-terminal-jobs *pool* 10)]
+        (is (not-any? #(= job-id (:id %)) undispatched)
+            "claimed+dispatched jobs are not re-surfaced")))))

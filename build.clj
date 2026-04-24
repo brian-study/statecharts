@@ -8,7 +8,7 @@
    [clojure.tools.build.api :as b]))
 
 (def lib 'com.fulcrologic/statecharts)
-(def version "2.0.18")
+(def version "2.0.19")
 (def class-dir "target/classes")
 (def jar-file (format "target/%s-%s.jar" (name lib) version))
 (def basis (delay (b/create-basis {:project "deps.edn"})))
