@@ -48,6 +48,24 @@
       (edn/read-string s)
       (keyword s))))
 
+(defn- parse-invoke-id
+  "Read an invoke-id from the DB back to its original type.
+
+   New rows (2.0.4+) store `(pr-str invoke-id)` — keywords, UUIDs, numbers,
+   and strings all round-trip through EDN. Legacy rows (pre-2.0.4) stored
+   `(name invoke-id)` as a bare string, which EDN would parse as a SYMBOL —
+   not what callers expect. We only EDN-read shapes that start with a
+   recognisable new-format marker; anything else is treated as a legacy bare
+   string and returned as-is."
+  [s]
+  (when s
+    (if (or (str/starts-with? s ":")                ; keyword (incl. namespaced)
+            (str/starts-with? s "\"")               ; quoted string
+            (str/starts-with? s "#")                ; tagged literal, e.g. #uuid "..."
+            (re-matches #"-?\d+(?:\.\d+)?" s))      ; number
+      (try (edn/read-string s) (catch Exception _ s))
+      s)))
+
 (defn- event->row
   "Convert a send-request to a database row."
   [{:keys [event data type target source-session-id send-id invoke-id delay]}]
@@ -82,13 +100,7 @@
        (:send-id row)
        (assoc :sendid (:send-id row) ::sc/send-id (:send-id row))
        (:invoke-id row)
-       (assoc :invokeid (let [s (:invoke-id row)]
-                          ;; EDN round-trip for types written via pr-str
-                          ;; (keyword/UUID/number). Legacy rows stored via
-                          ;; `name` lack the leading tag and are read as
-                          ;; bare strings.
-                          (try (edn/read-string s)
-                               (catch Exception _ s))))))))
+       (assoc :invokeid (parse-invoke-id (:invoke-id row)))))))
 
 (defn- insert-event!
   "Insert an event into the queue."

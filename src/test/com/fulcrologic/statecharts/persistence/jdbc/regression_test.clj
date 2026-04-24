@@ -427,3 +427,36 @@
                             (swap! received conj (:invokeid event))))
       (is (= [kw-id uuid-id number-id] @received)
           ":invoke-id must come back with its original type after the queue round-trip"))))
+
+;; -----------------------------------------------------------------------------
+;; Finding #F follow-up — legacy invoke-id rows must decode as bare strings
+;; -----------------------------------------------------------------------------
+;;
+;; Pre-2.0.4 rows stored invoke-id via `(name x)` — e.g. a keyword :my-invoke
+;; ended up as the bare string "my-invoke". The 2.0.4 decoder's
+;; `(try (edn/read-string s) (catch Exception _ s))` doesn't fall back for bare
+;; strings: `(edn/read-string "my-invoke")` returns the SYMBOL `my-invoke`, not
+;; a string, so no exception fires. The pre-2.0.4 behaviour was to hand back
+;; the raw string. A legacy-shaped row must still decode to the string.
+(deftest ^:integration legacy-invoke-id-decodes-as-string-test
+  (testing "rows written pre-2.0.4 with bare-string invoke-id still decode as strings"
+    (let [queue     (pg-eq/new-queue *pool* "legacy-invoke-id")
+          target-id :legacy-invoke-id-session
+          received  (atom nil)]
+      ;; Directly insert a row shaped like pre-2.0.4: invoke_id stored via
+      ;; `(name x)` — no leading ':' or '"' or '#'. Bypass the queue's writer.
+      (core/execute! *pool*
+        {:insert-into :statechart-events
+         :values [{:target-session-id (core/session-id->str target-id)
+                   :source-session-id nil
+                   :send-id           nil
+                   :invoke-id         "legacy-bare-id"
+                   :event-name        (pr-str :legacy-event)
+                   :event-type        "external"
+                   :event-data        (core/freeze {})}]})
+      (sp/receive-events! queue {}
+                          (fn [_env event] (reset! received event)))
+      (is (string? (:invokeid @received))
+          "legacy bare-string invoke-id must decode to a string, not a symbol")
+      (is (= "legacy-bare-id" (:invokeid @received))
+          "legacy invoke-id value must be preserved unchanged"))))

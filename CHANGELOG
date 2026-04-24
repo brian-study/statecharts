@@ -1,3 +1,16 @@
+2.0.5
+-----
+
+* Fix a backwards-compatibility regression introduced in 2.0.4's `:invoke-id`
+  decoder: `(try (edn/read-string s) (catch Exception _ s))` coerced legacy
+  bare-string rows (e.g. `"my-invoke"` written by pre-2.0.4 code via
+  `(name invoke-id)`) to **symbols** rather than the strings pre-2.0.4 code
+  returned, because `edn/read-string` of a bare token yields a symbol without
+  throwing. Replaced with a shape-inspecting `parse-invoke-id` helper
+  (mirrors `parse-event-type`): only EDN-read shapes starting with `:`, `"`,
+  `#`, or a digit/`-`; legacy bare strings pass through unchanged.
+  Regression test: `legacy-invoke-id-decodes-as-string-test`.
+
 2.0.4
 -----
 
