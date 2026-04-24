@@ -28,7 +28,8 @@
    [com.fulcrologic.statecharts.protocols :as sp]
    [next.jdbc.connection :as jdbc.connection])
   (:import
-   [com.zaxxer.hikari HikariDataSource]))
+   [com.zaxxer.hikari HikariDataSource]
+   [java.time OffsetDateTime]))
 
 ;; -----------------------------------------------------------------------------
 ;; Test Configuration
@@ -66,6 +67,32 @@
 
 (use-fixtures :once with-pool)
 (use-fixtures :each with-clean-tables)
+
+;; -----------------------------------------------------------------------------
+;; Column Conversion Tests
+;; -----------------------------------------------------------------------------
+
+(deftest ^:integration timestamptz-reads-as-offset-date-time-test
+  (testing "TIMESTAMPTZ columns are read as OffsetDateTime, not java.sql.Timestamp"
+    ;; Ensure this behaviour is scoped to this library's queries (via a
+    ;; `builder-adapter`) rather than a global `ReadableColumn` extension, so
+    ;; consumers with their own protocol extensions aren't affected.
+    (let [store (pg-wms/new-store *pool*)
+          session-id :ts-conversion-session
+          wmem {::sc/session-id session-id
+                ::sc/statechart-src :my-chart
+                ::sc/configuration #{:s1}
+                ::sc/initialized-states #{:s1}
+                ::sc/history-value {}
+                ::sc/running? true}]
+      (sp/save-working-memory! store {} session-id wmem)
+      (let [row (core/execute-one!
+                 *pool*
+                 {:select [:created-at :updated-at]
+                  :from [:statechart-sessions]
+                  :where [:= :session-id (core/session-id->str session-id)]})]
+        (is (instance? OffsetDateTime (:created-at row)))
+        (is (instance? OffsetDateTime (:updated-at row)))))))
 
 ;; -----------------------------------------------------------------------------
 ;; Working Memory Store Tests

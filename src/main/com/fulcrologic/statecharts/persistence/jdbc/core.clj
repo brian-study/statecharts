@@ -16,22 +16,12 @@
    [taoensso.nippy :as nippy]
    [taoensso.timbre :as log])
   (:import
+   [java.sql ResultSet]
    [java.time ZoneOffset]))
 
 ;; Loading `next.jdbc.date-time` registers parameter-binding extensions for
 ;; java.time types (OffsetDateTime/Instant/etc.) so call sites can pass them
 ;; through without manual conversion.
-;;
-;; For reads, pgjdbc returns `TIMESTAMPTZ` columns as `java.sql.Timestamp` by
-;; default. The persistence layer and its callers work in `OffsetDateTime`, so
-;; we extend ReadableColumn to convert. PostgreSQL stores TIMESTAMPTZ as UTC;
-;; returning an OffsetDateTime at UTC preserves the wall-clock value.
-(extend-protocol rs/ReadableColumn
-  java.sql.Timestamp
-  (read-column-by-label [^java.sql.Timestamp v _]
-    (.atOffset (.toInstant v) ZoneOffset/UTC))
-  (read-column-by-index [^java.sql.Timestamp v _ _]
-    (.atOffset (.toInstant v) ZoneOffset/UTC)))
 
 ;; -----------------------------------------------------------------------------
 ;; Session ID Serialization
@@ -86,10 +76,28 @@
 ;; -----------------------------------------------------------------------------
 ;; Result Set Builder
 ;; -----------------------------------------------------------------------------
+;;
+;; Column values go through a scoped builder so `TIMESTAMPTZ` columns (returned
+;; by pgjdbc as `java.sql.Timestamp`) are converted to `java.time.OffsetDateTime`
+;; — matching the shape the prior pg2 backend returned. Scoping via
+;; `builder-adapter` avoids globally extending `rs/ReadableColumn`, which would
+;; otherwise conflict with consumers (e.g. Brian) that install their own
+;; `Timestamp` extensions on the same JVM.
+
+(defn- column-by-index
+  [builder ^ResultSet rs ^Integer i]
+  (let [v (.getObject rs i)]
+    (if (instance? java.sql.Timestamp v)
+      (.atOffset (.toInstant ^java.sql.Timestamp v) ZoneOffset/UTC)
+      (rs/read-column-by-index v (:rsmeta builder) i))))
+
+(def ^:private kebab-odt-builder
+  (rs/builder-adapter rs/as-unqualified-kebab-maps column-by-index))
 
 (def ^:private result-opts
-  "Produce unqualified kebab-case result-set keys (e.g. :session-id, :event-name)."
-  {:builder-fn rs/as-unqualified-kebab-maps})
+  "Produce unqualified kebab-case result-set keys (e.g. :session-id, :event-name)
+   with `TIMESTAMPTZ` columns read as `OffsetDateTime` (not `java.sql.Timestamp`)."
+  {:builder-fn kebab-odt-builder})
 
 ;; -----------------------------------------------------------------------------
 ;; Query Execution

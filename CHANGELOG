@@ -1,3 +1,14 @@
+2.0.1
+-----
+
+* `TIMESTAMPTZ → OffsetDateTime` conversion is now scoped to this library's
+  queries via a `next.jdbc` `builder-adapter`, rather than a global
+  `next.jdbc.result-set/ReadableColumn` extension. Fixes a conflict with
+  consumers (notably Brian) that install their own `java.sql.Timestamp`
+  extensions on the same JVM.
+* Added an integration test asserting `TIMESTAMPTZ` columns from lib queries
+  come back as `OffsetDateTime`.
+
 2.0.0
 -----
 
