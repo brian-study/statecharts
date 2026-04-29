@@ -79,8 +79,17 @@
                         via `(name x)`.
    - `:symbol-shape`  — same split as `:keyword-shape` (symbols aren't in
                         `::sc/id` but some callers pass them through).
+   - `:string-shape`  — `:marked` (default — `pr-str`, yields `\"\\\"foo\\\"\"`)
+                        or `:bare` (just the string itself, yields `\"foo\"`).
+                        Sessions opt for `:bare` so consumers whose sids
+                        are always strings (the common case) avoid the
+                        encoding-as-content tax. The decoder's
+                        `:legacy-fallback :string` path handles bare
+                        strings via the same code path that supports
+                        pre-2.0.11 legacy rows, so reads stay
+                        backward-compatible.
 
-   Strings, numbers, and anything else valid go through `pr-str`.
+   Numbers and anything else valid go through `pr-str`.
    BigInt/BigDecimal/Ratio round-trip because `pr-str` preserves their
    `N` / `M` / ratio markers; plain Long/Double pr-str to the same text
    as `(str n)` so on-disk shape is unchanged for them.
@@ -93,13 +102,16 @@
    **Public API since 2.0.17.** The option set is stable; new options
    may be added (with defaults that preserve current behaviour) but
    existing ones will not be removed."
-  [x {:keys [uuid-shape keyword-shape symbol-shape]
+  [x {:keys [uuid-shape keyword-shape symbol-shape string-shape]
       :or {uuid-shape    :bare
            keyword-shape :marked
-           symbol-shape  :marked}}]
+           symbol-shape  :marked
+           string-shape  :marked}}]
   (when x
     (cond
-      (string? x)  (pr-str x)
+      (string? x)  (case string-shape
+                     :marked (pr-str x)
+                     :bare   x)
       (keyword? x) (case keyword-shape
                      :marked              (pr-str x)
                      :bare-unless-numeric (let [bare (subs (str x) 1)]
@@ -186,9 +198,22 @@
             :string  s)))))
 
 (defn session-id->str
-  "Serialize a session-id for DB storage. See `encode-id` for the scheme."
+  "Serialize a session-id for DB storage. See `encode-id` for the scheme.
+
+   Strings are stored bare (no surrounding quote markers) since 2.0.24.
+   Pre-2.0.24 rows that stored strings via `pr-str` (with surrounding
+   `\"`) read back as strings via the decoder's `\"`-prefix branch, so
+   reads remain backward-compatible — but lookups on a logical sid
+   `\"foo\"` now produce the bare WHERE value `foo`, which won't match
+   the pre-2.0.24 stored form `\"foo\"`. Consumers upgrading from
+   2.0.17–2.0.23 must either (a) deploy with no in-flight quoted-form
+   rows, or (b) run a one-shot UPDATE to strip the surrounding quotes
+   before bumping the lib."
   [session-id]
-  (encode-id session-id {:uuid-shape :bare :keyword-shape :marked :symbol-shape :marked}))
+  (encode-id session-id {:uuid-shape :bare
+                         :keyword-shape :marked
+                         :symbol-shape :marked
+                         :string-shape :bare}))
 
 (defn str->session-id
   "Deserialize a DB session-id string. See `decode-id` for the scheme.
@@ -196,7 +221,13 @@
    Migration note (2.0.13): legacy pre-2.0.11 rows that stored a *string*
    session-id whose contents were digit-only (e.g. `\"12345\"`) will now
    decode as the number `12345`. Post-2.0.11 rows are unaffected because
-   strings carry the pr-str quote marker."
+   strings carry the pr-str quote marker.
+
+   Migration note (2.0.24): the writer reverted to bare-string storage
+   (matching pre-2.0.11) so consumers using string sids no longer pay
+   the encoding-as-content tax. Pre-2.0.24 rows whose `\"`-marker was
+   produced by `pr-str` continue to read correctly via the
+   `\"`-prefix branch."
   [s]
   (decode-id s {:legacy-fallback :string}))
 

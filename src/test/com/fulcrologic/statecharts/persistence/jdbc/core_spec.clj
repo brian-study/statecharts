@@ -12,14 +12,14 @@
   (component "session-id->str"
     (behavior "handles string session IDs"
       (assertions
-        "strings are quoted via pr-str so the decoder can distinguish them from UUID/keyword bare forms"
-        (core/session-id->str "my-session") => "\"my-session\""
+        "strings are stored bare (since 2.0.24) — same shape as pre-2.0.11"
+        (core/session-id->str "my-session") => "my-session"
         "handles empty string"
-        (core/session-id->str "") => "\"\""
+        (core/session-id->str "") => ""
         "handles strings with special characters"
-        (core/session-id->str "session/with/slashes") => "\"session/with/slashes\""
+        (core/session-id->str "session/with/slashes") => "session/with/slashes"
         "handles strings with spaces"
-        (core/session-id->str "session with spaces") => "\"session with spaces\""))
+        (core/session-id->str "session with spaces") => "session with spaces"))
 
     (behavior "handles keyword session IDs"
       (assertions
@@ -86,10 +86,10 @@
 
     (behavior "handles plain strings"
       (assertions
-        "quoted string form (the new write shape) round-trips"
-        (core/str->session-id "\"my-session\"") => "my-session"
-        "legacy bare non-UUID non-keyword strings still decode as strings"
+        "bare strings (the 2.0.24 write shape) decode to the same string"
         (core/str->session-id "my-session") => "my-session"
+        "legacy quoted-string form (2.0.17–2.0.23) still round-trips via the `\"`-prefix branch"
+        (core/str->session-id "\"my-session\"") => "my-session"
         "handles empty string (legacy bare)"
         (core/str->session-id "") => ""))
 
@@ -103,7 +103,7 @@
         (core/str->session-id "-1") => -1
         "bare double → double"
         (core/str->session-id "3.14") => 3.14
-        "strings that need to stay as strings must be written via pr-str (quoted)"
+        "legacy quoted-string form (`\"42\"`) still round-trips to the string \"42\""
         (core/str->session-id "\"42\"") => "42"))
 
     (behavior "handles tagged numeric subtypes (BigInt / BigDecimal / Ratio)"
@@ -137,8 +137,26 @@
     (behavior "preserves string identity"
       (assertions
         (-> "plain-string" core/session-id->str core/str->session-id) => "plain-string"
-        "string that looks like a number stays a string via pr-str marker"
-        (-> "42" core/session-id->str core/str->session-id) => "42"))
+        "colon-delimited string sids (the common shape) round-trip"
+        (-> "dialogue:6421:495" core/session-id->str core/str->session-id) => "dialogue:6421:495"))
+
+    (behavior "known limitation: number-shaped or UUID-shaped string sids
+               (since 2.0.24)"
+      ;; 2.0.24 dropped the string marker so the on-disk form for the common
+      ;; case (Brian-style colon-delimited string sids) is bare. The
+      ;; trade-off is that a string whose content happens to parse as a
+      ;; number or UUID is indistinguishable from a real number/UUID sid
+      ;; on read, and decodes to the parsed type. Consumers who pass sids
+      ;; that look like numbers or UUIDs should use keyword sids
+      ;; (e.g. `:42` instead of `\"42\"`) to keep the string semantics.
+      (assertions
+        "a digit-only string sid decodes as a number, not a string"
+        (-> "42" core/session-id->str core/str->session-id) => 42
+        "a UUID-shaped string sid decodes as a UUID, not a string"
+        (-> "550e8400-e29b-41d4-a716-446655440000"
+            core/session-id->str
+            core/str->session-id)
+        => (java.util.UUID/fromString "550e8400-e29b-41d4-a716-446655440000")))
 
     (behavior "preserves numeric identity"
       (assertions

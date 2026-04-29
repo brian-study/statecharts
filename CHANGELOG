@@ -1,3 +1,42 @@
+2.0.24
+------
+
+* **[P1]** `session-id->str` now stores string sids **bare** (no
+  surrounding pr-str quotes). The 2.0.17 self-describing encoding
+  pushed the type discriminator into the column's byte content,
+  forcing every consumer that wanted to filter, join, migrate, or
+  group by `session_id` to import the encoder's grammar. For the
+  common case where consumers use only string sids, the resulting
+  bookkeeping (boundary helpers, lookup-time wrap/unwrap, on-deploy
+  data migrations, custom kondo hooks) was pure accidental
+  complexity — Moseley/Marks §3.
+
+  The change adds a `:string-shape` option to `encode-id` (defaults
+  to `:marked` to preserve back-compat for `invokeid->str` and
+  any external callers); `session-id->str` opts for `:bare`. The
+  decoder is unchanged — its `:legacy-fallback :string` branch
+  already handles bare strings via the same code path that supports
+  pre-2.0.11 legacy rows.
+
+  **Migration:** consumers upgrading from 2.0.17–2.0.23 must
+  reconcile the on-disk format. Three options:
+  1. Deploy with no in-flight quoted-form rows (truncate
+     `statechart_sessions` if dev/staging-only).
+  2. Run a one-shot `UPDATE statechart_sessions SET session_id =
+     substring(session_id, 2, length(session_id) - 2)
+     WHERE session_id LIKE '"%"'` (analogous UPDATEs for
+     `statechart_events.target_session_id` /
+     `source_session_id` and `statechart_jobs.session_id`).
+  3. Stay on 2.0.23 and live with the encoding tax.
+
+  Consumers who never bumped past 2.0.16 are unaffected — pre-2.0.17
+  rows were already bare, and the new encoder writes bare. So a
+  fork that skipped 2.0.17–2.0.23 entirely sees no on-disk change.
+
+  Non-string sids (keywords, UUIDs, numbers, namespaced keys)
+  remain marked as before. Reads of legacy quoted-string rows
+  continue to decode correctly via `decode-id`'s `"`-prefix branch.
+
 2.0.23
 ------
 
